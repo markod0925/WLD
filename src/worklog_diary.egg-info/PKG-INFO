@@ -1,3 +1,20 @@
+Metadata-Version: 2.4
+Name: worklog-diary
+Version: 0.1.0
+Summary: Local-first Windows desktop activity diary with privacy-aware summarization
+Author: WorkLog Diary
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: PySide6>=6.7
+Requires-Dist: mss>=9.0.1
+Requires-Dist: requests>=2.32.0
+Requires-Dist: pynput>=1.7.7
+Requires-Dist: typing-extensions>=4.12.0
+Requires-Dist: pywin32>=306; sys_platform == "win32"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+
 # WorkLog Diary (Windows MVP)
 
 WorkLog Diary is a local-first Windows desktop tray app that captures work context and periodically generates local summaries via LM Studio.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 
@@ -15,6 +16,9 @@ def configure_logging(log_dir: str, level: int = logging.INFO) -> None:
     )
 
     root = logging.getLogger()
+    level_name = os.environ.get("WORKLOG_DIARY_LOG_LEVEL", "").strip().upper()
+    if level_name:
+        level = getattr(logging, level_name, level)
     root.setLevel(level)
 
     if not any(isinstance(handler, logging.StreamHandler) for handler in root.handlers):

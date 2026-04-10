@@ -79,6 +79,18 @@ class BatchBuilder:
         text_segments = self.storage.fetch_unsummarized_text_segments(limit=self.max_text_segments)
         screenshots = self.storage.fetch_unsummarized_screenshots(limit=self.max_screenshots)
 
+        safe_end = _compute_safe_end_boundary(
+            text_segments=text_segments,
+            screenshots=screenshots,
+            max_text_segments=self.max_text_segments,
+            max_screenshots=self.max_screenshots,
+        )
+        if safe_end is not None:
+            intervals = [item for item in intervals if (item.end_ts or item.start_ts) <= safe_end]
+            blocked_intervals = [item for item in blocked_intervals if (item.end_ts or item.start_ts) <= safe_end]
+            text_segments = [item for item in text_segments if item.end_ts <= safe_end]
+            screenshots = [item for item in screenshots if item.ts <= safe_end]
+
         return build_batch_from_pending(
             intervals=intervals,
             blocked_intervals=blocked_intervals,
@@ -127,3 +139,19 @@ def build_batch_from_pending(
         text_segments=sorted(text_segments, key=lambda item: item.start_ts),
         screenshots=sorted(screenshots, key=lambda item: item.ts),
     )
+
+
+def _compute_safe_end_boundary(
+    text_segments: list[TextSegment],
+    screenshots: list[ScreenshotRecord],
+    max_text_segments: int,
+    max_screenshots: int,
+) -> float | None:
+    boundaries: list[float] = []
+    if max_text_segments > 0 and len(text_segments) >= max_text_segments and text_segments:
+        boundaries.append(max(item.end_ts for item in text_segments))
+    if max_screenshots > 0 and len(screenshots) >= max_screenshots and screenshots:
+        boundaries.append(max(item.ts for item in screenshots))
+    if not boundaries:
+        return None
+    return min(boundaries)

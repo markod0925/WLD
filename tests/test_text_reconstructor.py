@@ -110,3 +110,47 @@ def test_segmentation_on_window_change() -> None:
     assert len(segments) == 2
     assert segments[0].text == "ab"
     assert segments[1].text == "c"
+
+
+def test_segmentation_on_inactivity_gap() -> None:
+    reconstructor = TextReconstructor(inactivity_gap_seconds=1.0)
+    events = [
+        _event(1.0, "a"),
+        _event(1.4, "b"),
+        _event(3.0, "c"),
+    ]
+
+    segments = reconstructor.reconstruct_events(events, force_flush=True)
+
+    assert len(segments) == 2
+    assert segments[0].text == "ab"
+    assert segments[1].text == "c"
+
+
+def test_mixed_text_and_hotkey_sequence() -> None:
+    reconstructor = TextReconstructor()
+    events = [
+        _event(1.0, "h", modifiers=["shift"]),
+        _event(1.1, "e"),
+        _event(1.2, "Key.backspace"),
+        _event(1.3, "e"),
+        _event(1.4, "s", modifiers=["ctrl"]),
+        _event(1.5, "y"),
+    ]
+
+    segments = reconstructor.reconstruct_events(events, force_flush=True)
+
+    assert len(segments) == 3
+    assert segments[0].text == "He"
+    assert segments[1].hotkeys == ["CTRL+S"]
+    assert segments[2].text == "y"
+
+
+def test_inactivity_flush_without_followup_event() -> None:
+    reconstructor = TextReconstructor(inactivity_gap_seconds=1.0)
+    reconstructor.feed([_event(1.0, "a"), _event(1.2, "b")], force_flush=False)
+
+    segment = reconstructor.flush_if_inactive(now_ts=3.0)
+
+    assert segment is not None
+    assert segment.text == "ab"

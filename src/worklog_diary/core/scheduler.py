@@ -45,10 +45,11 @@ class FlushScheduler:
 
             if now >= next_run:
                 try:
+                    self.logger.info("event=summary_flush_triggered reason=scheduled")
                     self.flush_callback("scheduled")
-                    self.state.set_flush_times(last_flush_ts=time.time(), next_flush_ts=now + self.interval_seconds)
                 except Exception as exc:
                     self.logger.exception("Scheduled flush failed: %s", exc)
                 next_run = time.time() + self.interval_seconds
+                self.state.set_flush_times(last_flush_ts=self.state.snapshot().last_flush_ts, next_flush_ts=next_run)
 
             self._stop_event.wait(1)

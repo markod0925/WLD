@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 from .batching import BatchBuilder
@@ -36,10 +37,15 @@ class MonitoringServices:
             state=self.state,
             poll_interval_seconds=self.config.foreground_poll_interval_seconds,
         )
-        self.keyboard_capture = KeyboardCaptureService(storage=self.storage, state=self.state)
+        self.keyboard_capture = KeyboardCaptureService(
+            storage=self.storage,
+            state=self.state,
+            privacy=self.privacy,
+        )
         self.screenshot_capture = ScreenshotCaptureService(
             storage=self.storage,
             state=self.state,
+            privacy=self.privacy,
             screenshot_dir=self.config.screenshot_dir,
             interval_seconds=self.config.screenshot_interval_seconds,
         )
@@ -75,8 +81,10 @@ class MonitoringServices:
         )
 
         self._services_running = False
+        self._flush_lock = threading.Lock()
 
     def start_monitoring(self) -> None:
+        self.state.set_monitoring_active(True)
         if not self._services_running:
             self.window_tracker.start()
             self.keyboard_capture.start()
@@ -85,13 +93,12 @@ class MonitoringServices:
             self.scheduler.start()
             self._services_running = True
 
-        self.state.set_monitoring_active(True)
-        self.logger.info("Monitoring started")
+        self.logger.info("event=monitoring_state_change active=true")
 
     def pause_monitoring(self) -> None:
         self.state.set_monitoring_active(False)
         self.window_tracker.pause()
-        self.logger.info("Monitoring paused")
+        self.logger.info("event=monitoring_state_change active=false mode=pause")
 
     def stop_monitoring(self) -> None:
         self.state.set_monitoring_active(False)
@@ -105,14 +112,24 @@ class MonitoringServices:
             self.window_tracker.stop()
             self._services_running = False
 
-        self.logger.info("Monitoring stopped")
+        self.logger.info("event=monitoring_state_change active=false mode=stop")
 
     def flush_now(self, reason: str = "manual") -> int | None:
-        self.text_service.process_once(force_flush=True)
-        summary_id = self.summarizer.flush_pending(reason=reason)
-        now = time.time()
-        self.state.set_flush_times(last_flush_ts=now, next_flush_ts=now + self.config.flush_interval_seconds)
-        return summary_id
+        if not self._flush_lock.acquire(blocking=False):
+            self.logger.info("event=summary_flush_skipped reason=already_running request_reason=%s", reason)
+            return None
+
+        try:
+            for _ in range(5):
+                self.text_service.process_once(force_flush=True)
+                if self.storage.count_unprocessed_key_events() == 0:
+                    break
+            summary_id = self.summarizer.flush_pending(reason=reason)
+            now = time.time()
+            self.state.set_flush_times(last_flush_ts=now, next_flush_ts=now + self.config.flush_interval_seconds)
+            return summary_id
+        finally:
+            self._flush_lock.release()
 
     def apply_config(self, config: AppConfig) -> None:
         was_monitoring = self.state.snapshot().monitoring_active

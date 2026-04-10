@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 
 from .models import KeyEvent, TextSegment
@@ -112,6 +113,14 @@ class TextReconstructor:
     def reconstruct_events(self, events: list[KeyEvent], force_flush: bool = True) -> list[TextSegment]:
         return self.feed(events, force_flush=force_flush)
 
+    def flush_if_inactive(self, now_ts: float | None = None) -> TextSegment | None:
+        if self._current is None:
+            return None
+        current_time = now_ts if now_ts is not None else time.time()
+        if current_time - self._current.end_ts <= self.inactivity_gap_seconds:
+            return None
+        return self._finalize_current()
+
     def _needs_split(self, event: KeyEvent) -> bool:
         if self._current is None:
             return False
@@ -172,21 +181,32 @@ class TextReconstructionService:
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
+        try:
+            self.process_once(force_flush=True)
+        except Exception as exc:
+            self.logger.exception("Text reconstruction final flush failed: %s", exc)
         self.logger.info("Text reconstruction service stopped")
 
-    def process_once(self, force_flush: bool = True) -> int:
+    def process_once(self, force_flush: bool = False) -> int:
         events = self.storage.fetch_unprocessed_key_events()
         if not events:
             if force_flush:
                 segments = self.reconstructor.feed([], force_flush=True)
                 if segments:
                     self.storage.insert_text_segments(segments)
+                    self._log_segments(segments)
                     return len(segments)
+            stale_segment = self.reconstructor.flush_if_inactive()
+            if stale_segment:
+                self.storage.insert_text_segments([stale_segment])
+                self._log_segments([stale_segment])
+                return 1
             return 0
 
         segments = self.reconstructor.reconstruct_events(events, force_flush=force_flush)
         if segments:
             self.storage.insert_text_segments(segments)
+            self._log_segments(segments)
 
         event_ids = [event.id for event in events if event.id is not None]
         self.storage.mark_key_events_processed([event_id for event_id in event_ids if event_id is not None])
@@ -195,11 +215,30 @@ class TextReconstructionService:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                self.process_once(force_flush=True)
+                self.process_once(force_flush=False)
             except Exception as exc:
                 self.logger.exception("Text reconstruction failed: %s", exc)
             finally:
                 self._stop_event.wait(self.poll_interval_seconds)
+
+    def _log_segments(self, segments: list[TextSegment]) -> None:
+        for segment in segments:
+            text_preview = segment.text.replace("\n", "\\n")
+            if len(text_preview) > 80:
+                text_preview = text_preview[:80] + "..."
+            self.logger.info(
+                (
+                    "event=text_segment_finalized start_ts=%.3f end_ts=%.3f process=%s "
+                    "title=%s raw_keys=%s hotkeys=%s text_preview=%r"
+                ),
+                segment.start_ts,
+                segment.end_ts,
+                segment.process_name,
+                segment.window_title,
+                segment.raw_key_count,
+                ",".join(segment.hotkeys),
+                text_preview,
+            )
 
 
 

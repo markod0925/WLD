@@ -1,0 +1,3 @@
+[console_scripts]
+worklog-diary = worklog_diary.main:main
+worklog-diary-debug = worklog_diary.tools.debug_cli:main

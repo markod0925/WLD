@@ -33,6 +33,7 @@ class ForegroundWindowTrackerService:
         self._thread: threading.Thread | None = None
         self._current_signature: tuple[int, int, str, str] | None = None
         self._current_interval_id: int | None = None
+        self._current_blocked: bool | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -63,10 +64,43 @@ class ForegroundWindowTrackerService:
                 blocked = self.privacy.is_blocked(info.process_name)
                 signature = (info.hwnd, info.pid, info.process_name, info.window_title)
 
-                if signature != self._current_signature:
+                signature_changed = signature != self._current_signature
+                blocked_changed = self._current_blocked is not None and blocked != self._current_blocked
+                needs_new_interval = signature_changed or blocked_changed or self._current_interval_id is None
+
+                if needs_new_interval:
+                    previous_signature = self._current_signature
+                    previous_blocked = self._current_blocked
                     self._close_current_interval_if_needed(end_ts=info.timestamp)
                     self._current_interval_id = self.storage.start_interval(info, blocked)
                     self._current_signature = signature
+                    self._current_blocked = blocked
+
+                    if signature_changed:
+                        self.logger.info(
+                            (
+                                "event=foreground_window_change "
+                                "from_process=%s from_title=%s to_process=%s to_title=%s hwnd=%s pid=%s blocked=%s"
+                            ),
+                            previous_signature[2] if previous_signature else "",
+                            previous_signature[3] if previous_signature else "",
+                            info.process_name,
+                            info.window_title,
+                            info.hwnd,
+                            info.pid,
+                            blocked,
+                        )
+                    if blocked_changed:
+                        self.logger.info(
+                            (
+                                "event=privacy_block_transition "
+                                "process=%s title=%s blocked=%s previous_blocked=%s"
+                            ),
+                            info.process_name,
+                            info.window_title,
+                            blocked,
+                            previous_blocked,
+                        )
 
                 self.state.update_foreground(info, blocked, self._current_interval_id)
             except Exception as exc:
@@ -83,6 +117,7 @@ class ForegroundWindowTrackerService:
         finally:
             self._current_signature = None
             self._current_interval_id = None
+            self._current_blocked = None
             self.state.update_foreground(None, False, None)
 
 

@@ -4,15 +4,26 @@ import logging
 import threading
 import time
 from typing import Any
+from collections.abc import Callable
 
 from .models import KeyEvent, SharedState
+from .privacy import PrivacyPolicyEngine
 from .storage import SQLiteStorage
+from .window_tracker import get_foreground_window_info
 
 
 class KeyboardCaptureService:
-    def __init__(self, storage: SQLiteStorage, state: SharedState) -> None:
+    def __init__(
+        self,
+        storage: SQLiteStorage,
+        state: SharedState,
+        privacy: PrivacyPolicyEngine,
+        foreground_provider: Callable[[], Any] = get_foreground_window_info,
+    ) -> None:
         self.storage = storage
         self.state = state
+        self.privacy = privacy
+        self.foreground_provider = foreground_provider
         self.logger = logging.getLogger(__name__)
 
         self._listener: Any | None = None
@@ -57,11 +68,27 @@ class KeyboardCaptureService:
             modifiers = sorted(self._pressed_modifiers)
 
             snapshot = self.state.snapshot()
-            should_record = (
+            if not (
                 snapshot.monitoring_active
-                and not snapshot.blocked
                 and snapshot.foreground_info is not None
+                and snapshot.active_interval_id is not None
+            ):
+                self.logger.debug(
+                    "event=key_capture_skipped reason=inactive_or_missing_context key=%s event_type=%s",
+                    key_name,
+                    event_type,
+                )
+                if event_type == "up" and modifier:
+                    self._pressed_modifiers.discard(modifier)
+                return
+
+            current_info = self.foreground_provider()
+            blocked_now = self.privacy.is_blocked(current_info.process_name)
+            matches_state = (
+                snapshot.foreground_info.hwnd == current_info.hwnd
+                and snapshot.foreground_info.pid == current_info.pid
             )
+            should_record = not blocked_now and matches_state
 
             if should_record:
                 event = KeyEvent(
@@ -77,6 +104,33 @@ class KeyboardCaptureService:
                     processed=False,
                 )
                 self.storage.insert_key_event(event)
+                self.logger.debug(
+                    (
+                        "event=key_capture_accepted key=%s event_type=%s modifiers=%s "
+                        "process=%s title=%s interval_id=%s"
+                    ),
+                    key_name,
+                    event_type,
+                    ",".join(modifiers),
+                    snapshot.foreground_info.process_name,
+                    snapshot.foreground_info.window_title,
+                    snapshot.active_interval_id,
+                )
+            else:
+                reason = "blocked_process" if blocked_now else "foreground_mismatch"
+                self.logger.debug(
+                    (
+                        "event=key_capture_skipped reason=%s key=%s event_type=%s "
+                        "state_process=%s state_hwnd=%s current_process=%s current_hwnd=%s"
+                    ),
+                    reason,
+                    key_name,
+                    event_type,
+                    snapshot.foreground_info.process_name,
+                    snapshot.foreground_info.hwnd,
+                    current_info.process_name,
+                    current_info.hwnd,
+                )
 
             if event_type == "up" and modifier:
                 self._pressed_modifiers.discard(modifier)

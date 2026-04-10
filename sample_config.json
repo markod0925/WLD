@@ -18,5 +18,5 @@
   "start_monitoring_on_launch": false,
   "max_screenshots_per_summary": 3,
   "max_text_segments_per_summary": 200,
-  "request_timeout_seconds": 60
+  "request_timeout_seconds": 600
 }

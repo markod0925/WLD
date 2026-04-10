@@ -5,7 +5,7 @@ import threading
 from datetime import datetime
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QStyle, QSystemTrayIcon
 
 from ..core.services import MonitoringServices
 from .settings_window import SettingsWindow
@@ -43,6 +43,9 @@ class TrayController:
         action_flush = self.menu.addAction("Flush Now")
         action_flush.triggered.connect(self._flush)
 
+        action_diagnostics = self.menu.addAction("Diagnostics Snapshot")
+        action_diagnostics.triggered.connect(self._show_diagnostics)
+
         action_settings = self.menu.addAction("Settings")
         action_settings.triggered.connect(self._open_settings)
 
@@ -79,13 +82,52 @@ class TrayController:
     def _flush(self) -> None:
         def task() -> None:
             summary_id = self.services.flush_now(reason="manual")
-            if summary_id is None:
-                self.tray.showMessage("WorkLog Diary", "Flush completed: no pending data.")
-            else:
-                self.tray.showMessage("WorkLog Diary", f"Flush completed: summary #{summary_id} created.")
-            self._refresh_status()
+            message = (
+                "Flush completed: no pending data or flush already in progress."
+                if summary_id is None
+                else f"Flush completed: summary #{summary_id} created."
+            )
+            QTimer.singleShot(
+                0,
+                lambda: self._on_flush_finished(message),
+            )
 
         threading.Thread(target=task, name="ManualFlush", daemon=True).start()
+
+    def _on_flush_finished(self, message: str) -> None:
+        self.tray.showMessage("WorkLog Diary", message)
+        self._refresh_status()
+
+    def _show_diagnostics(self) -> None:
+        diagnostics = self.services.storage.get_diagnostics_snapshot()
+        pending = diagnostics["pending_counts"]
+        jobs = diagnostics["summary_jobs"]
+        ranges = diagnostics["pending_ranges"]
+
+        def _format_range(value: object) -> str:
+            if not isinstance(value, dict):
+                return "-"
+            return f"count={value['count']} start={value['start_ts']:.3f} end={value['end_ts']:.3f}"
+
+        body = (
+            "Pending counts\n"
+            f"- Intervals: {pending['intervals']}\n"
+            f"- Key events (unprocessed): {pending['key_events']}\n"
+            f"- Key events (processed): {pending['processed_key_events']}\n"
+            f"- Text segments: {pending['text_segments']}\n"
+            f"- Screenshots: {pending['screenshots']}\n\n"
+            "Pending ranges\n"
+            f"- Intervals: {_format_range(ranges['active_intervals_unsummarized'])}\n"
+            f"- Blocked intervals: {_format_range(ranges['blocked_intervals_unsummarized'])}\n"
+            f"- Unprocessed key events: {_format_range(ranges['key_events_unprocessed'])}\n"
+            f"- Text segments: {_format_range(ranges['text_segments_pending'])}\n"
+            f"- Screenshots: {_format_range(ranges['screenshots_pending'])}\n\n"
+            "Summary jobs\n"
+            f"- Running: {jobs['running']}\n"
+            f"- Failed: {jobs['failed']}\n"
+            f"- Succeeded: {jobs['succeeded']}"
+        )
+        QMessageBox.information(None, "WorkLog Diagnostics", body)
 
     def _open_settings(self) -> None:
         self.settings_window.load_from_config()

@@ -5,7 +5,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-DEFAULT_BLOCKED_PROCESSES = ["chrome.exe", "msedge.exe", "webex.exe"]
+DEFAULT_BLOCKED_PROCESSES = ["chrome.exe", "msedge.exe", "webex.exe", "lm studio.exe"]
 
 
 @dataclass(slots=True)

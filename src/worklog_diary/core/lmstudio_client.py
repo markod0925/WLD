@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,10 +13,11 @@ from .batching import SummaryBatch
 
 
 class LMStudioClient:
-    def __init__(self, base_url: str, model: str, timeout_seconds: int = 60) -> None:
+    def __init__(self, base_url: str, model: str, timeout_seconds: int = 600) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.logger = logging.getLogger(__name__)
 
     def summarize_batch(self, batch: SummaryBatch) -> tuple[str, dict[str, Any]]:
         prompt_text = _build_summary_prompt(batch)
@@ -24,6 +27,12 @@ class LMStudioClient:
             image_data = _file_to_data_uri(screenshot.file_path)
             if image_data:
                 content.append({"type": "image_url", "image_url": {"url": image_data}})
+
+        user_content: str | list[dict[str, Any]]
+        if len(content) == 1:
+            user_content = prompt_text
+        else:
+            user_content = content
 
         payload = {
             "model": self.model,
@@ -36,9 +45,22 @@ class LMStudioClient:
                         "Respond in JSON with keys: summary_text, key_points, blocked_activity."
                     ),
                 },
-                {"role": "user", "content": content},
+                {"role": "user", "content": user_content},
             ],
         }
+        self.logger.info(
+            (
+                "event=lmstudio_request model=%s base_url=%s start_ts=%.3f end_ts=%.3f "
+                "text_segments=%s screenshots=%s payload_content_type=%s"
+            ),
+            self.model,
+            self.base_url,
+            batch.start_ts,
+            batch.end_ts,
+            len(batch.text_segments),
+            len(batch.screenshots),
+            "multimodal" if isinstance(user_content, list) else "text",
+        )
 
         response = requests.post(
             f"{self.base_url}/chat/completions",
@@ -51,6 +73,8 @@ class LMStudioClient:
         raw_content = data["choices"][0]["message"]["content"]
         if isinstance(raw_content, list):
             text_content = "\n".join(part.get("text", "") for part in raw_content if isinstance(part, dict))
+        elif isinstance(raw_content, dict):
+            text_content = str(raw_content.get("text", ""))
         else:
             text_content = str(raw_content)
 
@@ -86,9 +110,9 @@ def _file_to_data_uri(path: str) -> str | None:
 def _parse_model_response(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:].strip()
+        fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
 
     try:
         parsed = json.loads(cleaned)
