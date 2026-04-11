@@ -12,7 +12,7 @@ class FlushScheduler:
     def __init__(
         self,
         interval_seconds: int,
-        flush_callback: Callable[[str], int | None],
+        flush_callback: Callable[[str], object | None],
         state: SharedState,
     ) -> None:
         self.interval_seconds = max(30, interval_seconds)

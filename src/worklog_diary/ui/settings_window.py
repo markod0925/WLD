@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
@@ -24,7 +25,7 @@ class SettingsWindow(QWidget):
         super().__init__()
         self.services = services
         self.setWindowTitle("WorkLog Diary Settings")
-        self.resize(560, 520)
+        self.resize(560, 560)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -37,6 +38,10 @@ class SettingsWindow(QWidget):
         self.screenshot_interval = QSpinBox()
         self.screenshot_interval.setRange(5, 3600)
         form.addRow("Screenshot interval (s):", self.screenshot_interval)
+
+        self.capture_mode = QComboBox()
+        self.capture_mode.addItems(["full_screen", "active_window"])
+        form.addRow("Screenshot capture mode:", self.capture_mode)
 
         self.foreground_poll_interval = QDoubleSpinBox()
         self.foreground_poll_interval.setRange(0.2, 5.0)
@@ -56,6 +61,10 @@ class SettingsWindow(QWidget):
         self.flush_interval = QSpinBox()
         self.flush_interval.setRange(30, 7200)
         form.addRow("Flush interval (s):", self.flush_interval)
+
+        self.max_parallel_summary_jobs = QSpinBox()
+        self.max_parallel_summary_jobs.setRange(1, 16)
+        form.addRow("Max parallel summary jobs:", self.max_parallel_summary_jobs)
 
         self.max_screenshots = QSpinBox()
         self.max_screenshots.setRange(0, 10)
@@ -109,10 +118,12 @@ class SettingsWindow(QWidget):
         cfg = self.services.config
         self.blocked_processes.setPlainText("\n".join(cfg.blocked_processes))
         self.screenshot_interval.setValue(cfg.screenshot_interval_seconds)
+        self.capture_mode.setCurrentText(cfg.capture_mode)
         self.foreground_poll_interval.setValue(cfg.foreground_poll_interval_seconds)
         self.text_gap_interval.setValue(cfg.text_inactivity_gap_seconds)
         self.reconstruction_interval.setValue(cfg.reconstruction_poll_interval_seconds)
         self.flush_interval.setValue(cfg.flush_interval_seconds)
+        self.max_parallel_summary_jobs.setValue(cfg.max_parallel_summary_jobs)
         self.max_screenshots.setValue(cfg.max_screenshots_per_summary)
         self.max_text_segments.setValue(cfg.max_text_segments_per_summary)
         self.base_url.setText(cfg.lmstudio_base_url)
@@ -136,10 +147,12 @@ class SettingsWindow(QWidget):
         cfg = AppConfig(**data)
         cfg.blocked_processes = blocked
         cfg.screenshot_interval_seconds = int(self.screenshot_interval.value())
+        cfg.capture_mode = self.capture_mode.currentText().strip().lower()
         cfg.foreground_poll_interval_seconds = float(self.foreground_poll_interval.value())
         cfg.text_inactivity_gap_seconds = float(self.text_gap_interval.value())
         cfg.reconstruction_poll_interval_seconds = float(self.reconstruction_interval.value())
         cfg.flush_interval_seconds = int(self.flush_interval.value())
+        cfg.max_parallel_summary_jobs = int(self.max_parallel_summary_jobs.value())
         cfg.max_screenshots_per_summary = int(self.max_screenshots.value())
         cfg.max_text_segments_per_summary = int(self.max_text_segments.value())
         cfg.lmstudio_base_url = self.base_url.text().strip()

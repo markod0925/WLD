@@ -73,11 +73,36 @@ class BatchBuilder:
         self.max_text_segments = max_text_segments
         self.max_screenshots = max_screenshots
 
-    def build_pending_batch(self) -> SummaryBatch | None:
+    def build_pending_batch(self, excluded_ranges: list[tuple[float, float]] | None = None) -> SummaryBatch | None:
         intervals = self.storage.fetch_unsummarized_intervals()
         blocked_intervals = self.storage.fetch_unsummarized_blocked_intervals()
-        text_segments = self.storage.fetch_unsummarized_text_segments(limit=self.max_text_segments)
-        screenshots = self.storage.fetch_unsummarized_screenshots(limit=self.max_screenshots)
+
+        text_limit = self.max_text_segments
+        screenshot_limit = self.max_screenshots
+        if excluded_ranges:
+            if self.max_text_segments > 0:
+                text_limit = max(self.max_text_segments, self.max_text_segments * (len(excluded_ranges) + 1))
+            if self.max_screenshots > 0:
+                screenshot_limit = max(self.max_screenshots, self.max_screenshots * (len(excluded_ranges) + 1))
+
+        text_segments = self.storage.fetch_unsummarized_text_segments(limit=text_limit)
+        screenshots = self.storage.fetch_unsummarized_screenshots(limit=screenshot_limit)
+
+        if excluded_ranges:
+            intervals = [
+                item
+                for item in intervals
+                if not _overlaps_any_range(item.start_ts, item.end_ts or item.start_ts, excluded_ranges)
+            ]
+            blocked_intervals = [
+                item
+                for item in blocked_intervals
+                if not _overlaps_any_range(item.start_ts, item.end_ts or item.start_ts, excluded_ranges)
+            ]
+            text_segments = [
+                item for item in text_segments if not _overlaps_any_range(item.start_ts, item.end_ts, excluded_ranges)
+            ]
+            screenshots = [item for item in screenshots if not _overlaps_any_range(item.ts, item.ts, excluded_ranges)]
 
         safe_end = _compute_safe_end_boundary(
             text_segments=text_segments,
@@ -155,3 +180,14 @@ def _compute_safe_end_boundary(
     if not boundaries:
         return None
     return min(boundaries)
+
+
+def _overlaps_any_range(start_ts: float, end_ts: float, excluded_ranges: list[tuple[float, float]]) -> bool:
+    for range_start, range_end in excluded_ranges:
+        if _ranges_overlap(start_ts, end_ts, range_start, range_end):
+            return True
+    return False
+
+
+def _ranges_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
+    return not (a_end < b_start or a_start > b_end)

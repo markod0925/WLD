@@ -94,6 +94,7 @@ def test_successful_summary_purges_db_rows_and_screenshot_files(tmp_path: Path) 
     assert diagnostics["table_counts"]["screenshots"] == 0
     assert diagnostics["pending_counts"]["intervals"] == 0
     assert shot_path.exists() is False
+    summarizer.stop()
     storage.close()
 
 
@@ -117,6 +118,7 @@ def test_failed_summary_keeps_raw_data_retryable(tmp_path: Path) -> None:
     assert diagnostics["table_counts"]["screenshots"] == 1
     assert diagnostics["summary_jobs"]["failed"] == 1
     assert shot_path.exists() is True
+    summarizer.stop()
     storage.close()
 
 

@@ -15,6 +15,15 @@ from .storage import SQLiteStorage
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
 class ForegroundWindowTrackerService:
     def __init__(
         self,
@@ -160,6 +169,29 @@ def get_foreground_window_info() -> ForegroundInfo:
         process_name=process_name,
         window_title=window_title,
     )
+
+
+
+def get_window_capture_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    if os.name != "nt" or hwnd <= 0:
+        return None
+
+    user32 = ctypes.windll.user32
+    if bool(user32.IsIconic(hwnd)):
+        return None
+
+    rect = RECT()
+    success = user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    if not success:
+        return None
+
+    left = int(rect.left)
+    top = int(rect.top)
+    right = int(rect.right)
+    bottom = int(rect.bottom)
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
 
 
 

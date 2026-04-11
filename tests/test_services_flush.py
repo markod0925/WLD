@@ -2,70 +2,99 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
-from types import SimpleNamespace
+from pathlib import Path
 
+from worklog_diary.core.config import AppConfig
+from worklog_diary.core.models import TextSegment
 from worklog_diary.core.services import MonitoringServices
 
 
-class DummyTextService:
-    def process_once(self, force_flush: bool = False) -> int:
-        return 0
+class SuccessfulClient:
+    def summarize_batch(self, _batch: object) -> tuple[str, dict]:
+        return "ok", {"summary_text": "ok", "key_points": [], "blocked_activity": []}
 
 
-class DummyStorage:
-    def count_unprocessed_key_events(self) -> int:
-        return 0
+
+def _config_for_tmp(tmp_path: Path, **overrides: object) -> AppConfig:
+    data = AppConfig().to_dict()
+    data.update(
+        {
+            "app_data_dir": str(tmp_path / "app"),
+            "screenshot_dir": str(tmp_path / "app" / "screenshots"),
+            "db_path": str(tmp_path / "app" / "worklog.db"),
+            "config_path": str(tmp_path / "app" / "config.json"),
+            "max_text_segments_per_summary": 1,
+            "max_screenshots_per_summary": 1,
+            "max_parallel_summary_jobs": 2,
+        }
+    )
+    data.update(overrides)
+    return AppConfig(**data)
 
 
-class DummyState:
-    def __init__(self) -> None:
-        self.last_flush_ts: float | None = None
-        self.next_flush_ts: float | None = None
 
-    def set_flush_times(self, last_flush_ts: float | None, next_flush_ts: float | None) -> None:
-        self.last_flush_ts = last_flush_ts
-        self.next_flush_ts = next_flush_ts
-
-
-class SlowSummarizer:
-    def __init__(self, started: threading.Event, calls: list[str]) -> None:
-        self.started = started
-        self.calls = calls
-
-    def flush_pending(self, reason: str = "manual") -> int | None:
-        self.calls.append(reason)
-        self.started.set()
-        time.sleep(0.15)
-        return 99
-
-
-def test_flush_now_is_effectively_idempotent_when_called_concurrently() -> None:
-    started = threading.Event()
-    calls: list[str] = []
-
+def test_flush_now_returns_none_when_drain_already_running() -> None:
     services = MonitoringServices.__new__(MonitoringServices)
-    services._flush_lock = threading.Lock()
-    services.text_service = DummyTextService()
-    services.storage = DummyStorage()
-    services.summarizer = SlowSummarizer(started=started, calls=calls)
-    services.state = DummyState()
-    services.config = SimpleNamespace(flush_interval_seconds=300)
     services.logger = logging.getLogger("test.services")
+    services._flush_lock = threading.Lock()
+    assert services._flush_lock.acquire(blocking=False)
+    try:
+        assert services.flush_now(reason="manual") is None
+    finally:
+        services._flush_lock.release()
 
-    results: list[int | None] = []
 
-    def _run(reason: str) -> None:
-        results.append(services.flush_now(reason=reason))
 
-    first = threading.Thread(target=_run, args=("scheduled",))
-    second = threading.Thread(target=_run, args=("manual",))
-    first.start()
-    assert started.wait(timeout=1)
-    second.start()
-    first.join(timeout=2)
-    second.join(timeout=2)
+def test_flush_now_drains_until_buffer_is_empty(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    services.summarizer.lm_client = SuccessfulClient()
 
-    assert len(calls) == 1
-    assert sorted(results, key=lambda item: (item is None, item)) == [99, None]
+    try:
+        services.storage.insert_text_segments(
+            [
+                TextSegment(
+                    id=None,
+                    start_ts=1.0,
+                    end_ts=1.1,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="a",
+                    hotkeys=[],
+                    raw_key_count=1,
+                ),
+                TextSegment(
+                    id=None,
+                    start_ts=2.0,
+                    end_ts=2.1,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="b",
+                    hotkeys=[],
+                    raw_key_count=1,
+                ),
+                TextSegment(
+                    id=None,
+                    start_ts=3.0,
+                    end_ts=3.1,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="c",
+                    hotkeys=[],
+                    raw_key_count=1,
+                ),
+            ]
+        )
 
+        result = services.flush_now(reason="test-drain")
+        assert result is not None
+        assert result.stop_reason == "empty"
+        assert result.summaries_created == 3
+
+        pending = services.storage.get_pending_counts()
+        assert pending["text_segments"] == 0
+
+        jobs = services.storage.get_summary_job_status_counts()
+        assert jobs["succeeded"] == 3
+        assert jobs["failed"] == 0
+    finally:
+        services.shutdown()

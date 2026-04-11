@@ -11,7 +11,7 @@ from typing import Any
 from .models import ScreenshotRecord, SharedState
 from .privacy import PrivacyPolicyEngine
 from .storage import SQLiteStorage
-from .window_tracker import get_foreground_window_info
+from .window_tracker import get_foreground_window_info, get_window_capture_rect
 
 
 class ScreenshotCaptureService:
@@ -22,14 +22,18 @@ class ScreenshotCaptureService:
         privacy: PrivacyPolicyEngine,
         screenshot_dir: str,
         interval_seconds: int,
+        capture_mode: str = "full_screen",
         foreground_provider: Callable[[], Any] = get_foreground_window_info,
+        window_rect_provider: Callable[[int], tuple[int, int, int, int] | None] = get_window_capture_rect,
     ) -> None:
         self.storage = storage
         self.state = state
         self.privacy = privacy
         self.screenshot_dir = Path(screenshot_dir)
         self.interval_seconds = max(5, interval_seconds)
+        self.capture_mode = _normalize_capture_mode(capture_mode)
         self.foreground_provider = foreground_provider
+        self.window_rect_provider = window_rect_provider
         self.logger = logging.getLogger(__name__)
         self._capture_backend_missing_logged = False
 
@@ -106,7 +110,19 @@ class ScreenshotCaptureService:
             return False
 
         with mss.mss() as sct:
-            image = sct.grab(sct.monitors[0])
+            full_monitor = _monitor_region(sct.monitors[0])
+            window_rect = self.window_rect_provider(current_info.hwnd) if self.capture_mode == "active_window" else None
+            capture_region = resolve_capture_region(self.capture_mode, full_monitor, window_rect)
+            if capture_region is None:
+                self.logger.info(
+                    "event=screenshot_skipped reason=invalid_capture_region mode=%s process=%s hwnd=%s",
+                    self.capture_mode,
+                    current_info.process_name,
+                    current_info.hwnd,
+                )
+                return False
+
+            image = sct.grab(capture_region)
             mss.tools.to_png(image.rgb, image.size, output=str(file_path))
 
         record = ScreenshotRecord(
@@ -119,11 +135,12 @@ class ScreenshotCaptureService:
         )
         self.storage.insert_screenshot(record)
         self.logger.info(
-            "event=screenshot_captured file=%s process=%s title=%s interval_id=%s",
+            "event=screenshot_captured file=%s process=%s title=%s interval_id=%s mode=%s",
             file_path,
             current_info.process_name,
             current_info.window_title,
             snapshot.active_interval_id,
+            self.capture_mode,
         )
         return True
 
@@ -135,3 +152,59 @@ class ScreenshotCaptureService:
                 self.logger.exception("Screenshot capture failed: %s", exc)
             finally:
                 self._stop_event.wait(self.interval_seconds)
+
+
+
+def resolve_capture_region(
+    capture_mode: str,
+    full_monitor: dict[str, int],
+    window_rect: tuple[int, int, int, int] | None,
+) -> dict[str, int] | None:
+    normalized_mode = _normalize_capture_mode(capture_mode)
+    if normalized_mode == "full_screen":
+        return full_monitor
+
+    if window_rect is None:
+        return None
+
+    left, top, right, bottom = window_rect
+    if right <= left or bottom <= top:
+        return None
+
+    monitor_left = int(full_monitor["left"])
+    monitor_top = int(full_monitor["top"])
+    monitor_right = monitor_left + int(full_monitor["width"])
+    monitor_bottom = monitor_top + int(full_monitor["height"])
+
+    clipped_left = max(left, monitor_left)
+    clipped_top = max(top, monitor_top)
+    clipped_right = min(right, monitor_right)
+    clipped_bottom = min(bottom, monitor_bottom)
+
+    if clipped_right <= clipped_left or clipped_bottom <= clipped_top:
+        return None
+
+    return {
+        "left": clipped_left,
+        "top": clipped_top,
+        "width": clipped_right - clipped_left,
+        "height": clipped_bottom - clipped_top,
+    }
+
+
+
+def _monitor_region(monitor: dict[str, int]) -> dict[str, int]:
+    return {
+        "left": int(monitor["left"]),
+        "top": int(monitor["top"]),
+        "width": int(monitor["width"]),
+        "height": int(monitor["height"]),
+    }
+
+
+
+def _normalize_capture_mode(capture_mode: str) -> str:
+    value = capture_mode.strip().lower()
+    if value == "active_window":
+        return "active_window"
+    return "full_screen"

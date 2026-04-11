@@ -6,12 +6,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 DEFAULT_BLOCKED_PROCESSES = ["chrome.exe", "msedge.exe", "webex.exe", "lm studio.exe"]
+SUPPORTED_CAPTURE_MODES = {"full_screen", "active_window"}
 
 
 @dataclass(slots=True)
 class AppConfig:
     blocked_processes: list[str] = field(default_factory=lambda: DEFAULT_BLOCKED_PROCESSES.copy())
     screenshot_interval_seconds: int = 30
+    capture_mode: str = "full_screen"
     foreground_poll_interval_seconds: float = 1.0
     text_inactivity_gap_seconds: float = 8.0
     reconstruction_poll_interval_seconds: float = 2.0
@@ -25,6 +27,7 @@ class AppConfig:
     start_monitoring_on_launch: bool = False
     max_screenshots_per_summary: int = 3
     max_text_segments_per_summary: int = 200
+    max_parallel_summary_jobs: int = 2
     request_timeout_seconds: int = 60
 
     def normalize(self) -> None:
@@ -40,6 +43,11 @@ class AppConfig:
             self.config_path = str(default_config_path())
 
         self.blocked_processes = [p.strip().lower() for p in self.blocked_processes if p.strip()]
+
+        mode = self.capture_mode.strip().lower()
+        self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "full_screen"
+
+        self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
 
     def ensure_paths(self) -> None:
         self.normalize()

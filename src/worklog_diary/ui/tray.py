@@ -27,6 +27,12 @@ class TrayController:
         self.menu = QMenu()
         self.status_action = self.menu.addAction("Status: idle")
         self.status_action.setEnabled(False)
+        self.buffer_action = self.menu.addAction("Buffer: unknown")
+        self.buffer_action.setEnabled(False)
+        self.jobs_action = self.menu.addAction("Summary jobs: queued=0 running=0")
+        self.jobs_action.setEnabled(False)
+        self.pending_action = self.menu.addAction("Pending: text=0 screenshots=0 summary_jobs=0")
+        self.pending_action.setEnabled(False)
         self.menu.addSeparator()
 
         action_start = self.menu.addAction("Start Monitoring")
@@ -40,8 +46,11 @@ class TrayController:
 
         self.menu.addSeparator()
 
-        action_flush = self.menu.addAction("Flush Now")
+        action_flush = self.menu.addAction("Flush Now (Drain)")
         action_flush.triggered.connect(self._flush)
+
+        action_stop_flush = self.menu.addAction("Stop Flush Drain")
+        action_stop_flush.triggered.connect(self._stop_flush_drain)
 
         action_diagnostics = self.menu.addAction("Diagnostics Snapshot")
         action_diagnostics.triggered.connect(self._show_diagnostics)
@@ -81,18 +90,27 @@ class TrayController:
 
     def _flush(self) -> None:
         def task() -> None:
-            summary_id = self.services.flush_now(reason="manual")
-            message = (
-                "Flush completed: no pending data or flush already in progress."
-                if summary_id is None
-                else f"Flush completed: summary #{summary_id} created."
-            )
+            result = self.services.flush_now(reason="manual")
+            if result is None:
+                message = "Flush drain already running."
+            else:
+                message = (
+                    "Drain finished: "
+                    f"stop={result.stop_reason}, created={result.summaries_created}, "
+                    f"failed={result.failed_jobs}, cancelled={result.cancelled_jobs}."
+                )
             QTimer.singleShot(
                 0,
                 lambda: self._on_flush_finished(message),
             )
 
-        threading.Thread(target=task, name="ManualFlush", daemon=True).start()
+        threading.Thread(target=task, name="ManualFlushDrain", daemon=True).start()
+
+    def _stop_flush_drain(self) -> None:
+        stopped = self.services.cancel_flush_drain()
+        message = "Drain cancel requested." if stopped else "No active drain to cancel."
+        self.tray.showMessage("WorkLog Diary", message)
+        self._refresh_status()
 
     def _on_flush_finished(self, message: str) -> None:
         self.tray.showMessage("WorkLog Diary", message)
@@ -123,9 +141,11 @@ class TrayController:
             f"- Text segments: {_format_range(ranges['text_segments_pending'])}\n"
             f"- Screenshots: {_format_range(ranges['screenshots_pending'])}\n\n"
             "Summary jobs\n"
+            f"- Queued: {jobs['queued']}\n"
             f"- Running: {jobs['running']}\n"
             f"- Failed: {jobs['failed']}\n"
-            f"- Succeeded: {jobs['succeeded']}"
+            f"- Succeeded: {jobs['succeeded']}\n"
+            f"- Cancelled: {jobs['cancelled']}"
         )
         QMessageBox.information(None, "WorkLog Diagnostics", body)
 
@@ -159,6 +179,21 @@ class TrayController:
             context = "No active window"
 
         self.status_action.setText(f"Status: {monitoring} | blocked: {blocked}")
+        self.buffer_action.setText(
+            f"Buffer: {status['buffer_state']} | approx batches: {status['approx_remaining_batches']}"
+        )
+
+        jobs = status["summary_jobs"]
+        self.jobs_action.setText(
+            "Summary jobs: "
+            f"queued={jobs['queued']} running={jobs['running']} completed={jobs['completed']} failed={jobs['failed']}"
+        )
+        self.pending_action.setText(
+            "Pending: "
+            f"text={status['pending_text_segment_count']} "
+            f"screenshots={status['pending_screenshot_count']} "
+            f"summary_jobs={status['pending_summary_job_count']}"
+        )
 
         last_flush = "-"
         if status["last_flush_ts"] is not None:
@@ -169,17 +204,23 @@ class TrayController:
             next_flush = datetime.fromtimestamp(status["next_flush_ts"]).strftime("%H:%M:%S")
 
         pending = status["pending"]
+        drain_state = "active" if status["flush_drain_active"] else "idle"
         tooltip = (
             "WorkLog Diary\n"
             f"Monitoring: {monitoring}\n"
             f"Blocked: {blocked}\n"
             f"Context: {context}\n"
+            f"Buffer state: {status['buffer_state']}\n"
+            f"Approx remaining batches: {status['approx_remaining_batches']}\n"
+            f"Flush drain: {drain_state}\n"
             f"Last flush: {last_flush}\n"
             f"Next flush: {next_flush}\n"
             f"Pending intervals: {pending['intervals']}\n"
             f"Pending keys: {pending['key_events']}\n"
             f"Pending text: {pending['text_segments']}\n"
-            f"Pending screenshots: {pending['screenshots']}"
+            f"Pending screenshots: {pending['screenshots']}\n"
+            f"Summary jobs queued/running/completed/failed: "
+            f"{jobs['queued']}/{jobs['running']}/{jobs['completed']}/{jobs['failed']}"
         )
         self.tray.setToolTip(tooltip)
 

@@ -163,7 +163,7 @@ class SQLiteStorage:
                 )
 
             interrupted_jobs = self._conn.execute(
-                "SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'running'"
+                "SELECT COUNT(1) AS c FROM summary_jobs WHERE status IN ('running', 'queued')"
             ).fetchone()
             interrupted_count = int(interrupted_jobs["c"]) if interrupted_jobs else 0
             if interrupted_count:
@@ -173,7 +173,7 @@ class SQLiteStorage:
                     SET status = 'failed',
                         error = COALESCE(error, 'Interrupted during application shutdown'),
                         updated_ts = ?
-                    WHERE status = 'running'
+                    WHERE status IN ('running', 'queued')
                     """,
                     (now,),
                 )
@@ -482,6 +482,24 @@ class SQLiteStorage:
             )
             self._conn.commit()
 
+    def get_summary_job_status_counts(self) -> dict[str, int]:
+        counts = {
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(1) AS c FROM summary_jobs GROUP BY status"
+            ).fetchall()
+        for row in rows:
+            status = str(row["status"])
+            if status in counts:
+                counts[status] = int(row["c"])
+        return counts
+
     def insert_summary(
         self,
         job_id: int,
@@ -647,6 +665,9 @@ class SQLiteStorage:
                 ),
             }
             summary_jobs = {
+                "queued": int(
+                    self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'queued'").fetchone()["c"]
+                ),
                 "running": int(
                     self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'running'").fetchone()["c"]
                 ),
@@ -655,6 +676,9 @@ class SQLiteStorage:
                 ),
                 "succeeded": int(
                     self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'succeeded'").fetchone()["c"]
+                ),
+                "cancelled": int(
+                    self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'cancelled'").fetchone()["c"]
                 ),
             }
 

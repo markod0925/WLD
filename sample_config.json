@@ -5,6 +5,7 @@
     "webex.exe"
   ],
   "screenshot_interval_seconds": 30,
+  "capture_mode": "full_screen",
   "foreground_poll_interval_seconds": 1.0,
   "text_inactivity_gap_seconds": 8.0,
   "reconstruction_poll_interval_seconds": 2.0,
@@ -18,5 +19,6 @@
   "start_monitoring_on_launch": false,
   "max_screenshots_per_summary": 3,
   "max_text_segments_per_summary": 200,
+  "max_parallel_summary_jobs": 2,
   "request_timeout_seconds": 600
 }

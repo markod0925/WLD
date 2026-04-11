@@ -17,7 +17,7 @@ def main() -> int:
 
     flush_parser = subparsers.add_parser(
         "flush-buffered",
-        help="Run a one-shot flush/summarization against currently buffered data",
+        help="Drain buffered data by running summary batches until completion, failure, or cancel",
     )
     flush_parser.add_argument("--config", dest="config_path", default=None, help="Path to config.json")
     flush_parser.add_argument("--reason", default="debug-cli", help="Summary job reason label")
@@ -86,14 +86,19 @@ def _run_flush(config_path: str | None, reason: str) -> int:
 
     services = create_services(config_path=config_path)
     try:
-        summary_id = services.flush_now(reason=reason)
+        result = services.flush_now(reason=reason)
     finally:
         services.shutdown()
 
-    if summary_id is None:
-        print("No summary created (no pending data or flush already in progress).")
+    if result is None:
+        print("Drain already running; no new flush operation started.")
     else:
-        print(f"Summary created successfully: #{summary_id}")
+        print(
+            "Drain finished: "
+            f"stop={result.stop_reason} created={result.summaries_created} "
+            f"failed={result.failed_jobs} cancelled={result.cancelled_jobs} "
+            f"pending_summary_jobs={result.pending_summary_jobs}"
+        )
     return 0
 
 
