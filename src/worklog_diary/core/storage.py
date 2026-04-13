@@ -6,11 +6,13 @@ import os
 import sqlite3
 import threading
 import time
+from datetime import date as Day, datetime, time as DateTimeTime, timedelta
 from pathlib import Path
 
 from .models import (
     ActiveInterval,
     BlockedInterval,
+    DailySummaryRecord,
     ForegroundInfo,
     KeyEvent,
     ScreenshotRecord,
@@ -115,6 +117,15 @@ class SQLiteStorage:
             FOREIGN KEY(job_id) REFERENCES summary_jobs(id)
         );
 
+        CREATE TABLE IF NOT EXISTS daily_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL UNIQUE,
+            created_ts REAL NOT NULL,
+            recap_text TEXT NOT NULL,
+            recap_json TEXT,
+            source_batch_count INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_active_intervals_time ON active_intervals(start_ts, end_ts);
         CREATE INDEX IF NOT EXISTS idx_active_intervals_summarized ON active_intervals(summarized, end_ts);
         CREATE INDEX IF NOT EXISTS idx_blocked_intervals_time ON blocked_intervals(start_ts, end_ts);
@@ -123,10 +134,29 @@ class SQLiteStorage:
         CREATE INDEX IF NOT EXISTS idx_text_segments_time ON text_segments(start_ts, end_ts);
         CREATE INDEX IF NOT EXISTS idx_screenshots_ts ON screenshots(ts);
         CREATE INDEX IF NOT EXISTS idx_summaries_created ON summaries(created_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_summaries_start ON summaries(start_ts);
+        CREATE INDEX IF NOT EXISTS idx_daily_summaries_day ON daily_summaries(day);
         """
         with self._lock:
             self._conn.executescript(schema)
+            self._ensure_daily_summaries_schema()
             self._conn.commit()
+
+    def _ensure_daily_summaries_schema(self) -> None:
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'daily_summaries'"
+        ).fetchone()
+        if row is None:
+            return
+
+        columns = {
+            str(item["name"])
+            for item in self._conn.execute("PRAGMA table_info(daily_summaries)").fetchall()
+        }
+        if "source_batch_count" not in columns:
+            self._conn.execute(
+                "ALTER TABLE daily_summaries ADD COLUMN source_batch_count INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _recover_incomplete_state(self) -> None:
         now = time.time()
@@ -544,6 +574,111 @@ class SQLiteStorage:
             for row in rows
         ]
 
+    def list_summary_days(self, limit: int = 366) -> list[Day]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT date(start_ts, 'unixepoch', 'localtime') AS day
+                FROM summaries
+                ORDER BY day DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            datetime.strptime(str(row["day"]), "%Y-%m-%d").date()
+            for row in rows
+            if row["day"] is not None
+        ]
+
+    def list_summaries_for_day(self, day: Day, limit: int = 500) -> list[SummaryRecord]:
+        start_ts, end_ts = _day_epoch_bounds(day)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, job_id, start_ts, end_ts, summary_text, summary_json, created_ts
+                FROM summaries
+                WHERE start_ts >= ? AND start_ts < ?
+                ORDER BY start_ts ASC, id ASC
+                LIMIT ?
+                """,
+                (start_ts, end_ts, limit),
+            ).fetchall()
+        return [
+            SummaryRecord(
+                id=int(row["id"]),
+                job_id=int(row["job_id"]),
+                start_ts=float(row["start_ts"]),
+                end_ts=float(row["end_ts"]),
+                summary_text=str(row["summary_text"]),
+                summary_json=json.loads(str(row["summary_json"])),
+                created_ts=float(row["created_ts"]),
+            )
+            for row in rows
+        ]
+
+    def count_batch_summaries_for_day(self, day: Day) -> int:
+        start_ts, end_ts = _day_epoch_bounds(day)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(1) AS c FROM summaries WHERE start_ts >= ? AND start_ts < ?",
+                (start_ts, end_ts),
+            ).fetchone()
+        return int(row["c"])
+
+    def create_daily_summary(
+        self,
+        day: Day,
+        recap_text: str,
+        recap_json: dict | None,
+        source_batch_count: int,
+    ) -> tuple[DailySummaryRecord, bool]:
+        day_key = day.isoformat()
+        now = time.time()
+        recap_json_str = json.dumps(recap_json) if recap_json is not None else None
+        with self._lock:
+            existing = self._conn.execute("SELECT id FROM daily_summaries WHERE day = ?", (day_key,)).fetchone()
+            self._conn.execute(
+                """
+                INSERT INTO daily_summaries(day, created_ts, recap_text, recap_json, source_batch_count)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day) DO UPDATE SET
+                    created_ts = excluded.created_ts,
+                    recap_text = excluded.recap_text,
+                    recap_json = excluded.recap_json,
+                    source_batch_count = excluded.source_batch_count
+                """,
+                (day_key, now, recap_text, recap_json_str, int(source_batch_count)),
+            )
+            row = self._conn.execute(
+                """
+                SELECT id, day, created_ts, recap_text, recap_json, source_batch_count
+                FROM daily_summaries
+                WHERE day = ?
+                """,
+                (day_key,),
+            ).fetchone()
+            self._conn.commit()
+
+        if row is None:
+            raise RuntimeError(f"Failed to create daily summary for {day_key}")
+        return _row_to_daily_summary_record(row), existing is not None
+
+    def get_daily_summary_for_day(self, day: Day) -> DailySummaryRecord | None:
+        day_key = day.isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, day, created_ts, recap_text, recap_json, source_batch_count
+                FROM daily_summaries
+                WHERE day = ?
+                """,
+                (day_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_daily_summary_record(row)
+
     def purge_raw_data(self, start_ts: float, end_ts: float) -> list[str]:
         screenshot_paths: list[str] = []
         with self._lock:
@@ -637,6 +772,7 @@ class SQLiteStorage:
                 "screenshots": int(self._conn.execute("SELECT COUNT(1) AS c FROM screenshots").fetchone()["c"]),
                 "summary_jobs": int(self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs").fetchone()["c"]),
                 "summaries": int(self._conn.execute("SELECT COUNT(1) AS c FROM summaries").fetchone()["c"]),
+                "daily_summaries": int(self._conn.execute("SELECT COUNT(1) AS c FROM daily_summaries").fetchone()["c"]),
             }
             pending_ranges = {
                 "active_intervals_unsummarized": _query_range(
@@ -730,3 +866,22 @@ def _query_range(
         "start_ts": float(row["start_ts"]),
         "end_ts": float(row["end_ts"]),
     }
+
+
+def _row_to_daily_summary_record(row: sqlite3.Row) -> DailySummaryRecord:
+    raw_json = row["recap_json"]
+    parsed_json = json.loads(str(raw_json)) if raw_json else None
+    return DailySummaryRecord(
+        id=int(row["id"]),
+        day=datetime.strptime(str(row["day"]), "%Y-%m-%d").date(),
+        recap_text=str(row["recap_text"]),
+        recap_json=parsed_json if isinstance(parsed_json, dict) else None,
+        source_batch_count=int(row["source_batch_count"]),
+        created_ts=float(row["created_ts"]),
+    )
+
+
+def _day_epoch_bounds(day: Day) -> tuple[float, float]:
+    start_dt = datetime.combine(day, DateTimeTime.min)
+    end_dt = start_dt + timedelta(days=1)
+    return start_dt.timestamp(), end_dt.timestamp()

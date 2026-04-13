@@ -5,6 +5,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import date
 
 from .batching import BatchBuilder, SummaryBatch
 from .lmstudio_client import LMStudioClient
@@ -150,6 +151,20 @@ class Summarizer:
 
         job_id = self.storage.create_summary_job(batch.start_ts, batch.end_ts, status="running")
         return self._run_summary_job(job_id=job_id, batch=batch, reason=reason)
+
+    def generate_daily_recap_for_day(self, day: date) -> tuple[int, bool]:
+        summaries = self.storage.list_summaries_for_day(day)
+        if not summaries:
+            raise ValueError(f"No summaries available for day {day.isoformat()}")
+
+        recap_text, recap_json = self.lm_client.summarize_daily_recap(day=day, summaries=summaries)
+        daily_summary, replaced = self.storage.create_daily_summary(
+            day=day,
+            recap_text=recap_text,
+            recap_json=recap_json if isinstance(recap_json, dict) else None,
+            source_batch_count=len(summaries),
+        )
+        return int(daily_summary.id or 0), replaced
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():

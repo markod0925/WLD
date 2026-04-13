@@ -9,8 +9,11 @@ WorkLog Diary is a local-first Windows desktop tray app that captures work conte
 - Supports `full_screen` and `active_window` screenshot capture modes.
 - Captures raw global keyboard events.
 - Reconstructs useful text segments from key events.
+- Automatically pauses monitoring when the Windows session is locked, then resumes after unlock.
 - Builds summary batches and sends them to a local LM Studio OpenAI-compatible endpoint.
 - Stores summary output in SQLite.
+- Provides a calendar-based summaries viewer with per-day summary highlighting.
+- Supports manual daily recap generation ("summary of summaries") from existing batch summaries.
 - Purges raw key/text/screenshot data per successful batch.
 
 ## Windows-only scope
@@ -29,6 +32,12 @@ If the foreground process is blocked, WorkLog Diary will:
 - Not capture raw keyboard input.
 - Not reconstruct text.
 - Only store minimal blocked interval metadata.
+
+When the Windows session is locked, WorkLog Diary enters `Paused (PC locked)` mode:
+
+- no screenshots are captured,
+- no raw keyboard events are recorded,
+- no non-forced text reconstruction loop work proceeds.
 
 Default blocked processes:
 
@@ -79,11 +88,60 @@ Custom config path:
 worklog-diary --config C:\path\to\config.json
 ```
 
+## Portable packaging with PyInstaller
+
+The project is set up for a Windows `onedir` bundle built with PyInstaller.
+
+Install PyInstaller into the active Python environment first if it is not already available:
+
+```powershell
+pip install pyinstaller
+```
+
+Build the portable app from the repository root:
+
+```powershell
+pyinstaller --noconfirm --clean WLD.spec
+```
+
+If PyInstaller cannot clean `build/WLD/` because Windows has a file lock on `localpycs`, close any running `WLD.exe` instance and retry. If the folder still cannot be removed, use a fresh work directory for that build:
+
+```powershell
+pyinstaller --noconfirm --clean --workpath build-pyi --distpath dist-pyi WLD.spec
+```
+
+That creates `dist/WLD/` with the executable and bundled runtime files. The main items are:
+
+- `WLD.exe`
+- `_internal/`
+- bundled `README.md`
+- bundled `sample_config.json`
+
+On first launch, the frozen app creates a portable `data/` directory next to `WLD.exe` if it does not already exist:
+
+- `data/config.json`
+- `data/worklog_diary.db`
+- `data/screenshots/`
+- `data/logs/worklog_diary.log`
+
+To test on another Windows PC, copy the entire `dist/WLD/` folder to the target machine and launch `WLD.exe` from that folder. Keep the full folder structure intact so the executable stays adjacent to its `data/` directory.
+
+The bundled app still uses the same LM Studio settings as the dev build. LM Studio must be installed and running on the target PC, and the local OpenAI-compatible endpoint must match the configured `lmstudio_base_url` and `lmstudio_model`.
+
+Because the executable is not code-signed by default, Windows SmartScreen or Defender may show a warning on first launch. That is expected for unsigned local builds. Signing the binary with a trusted code-signing certificate is the standard way to reduce those prompts.
+
 ## Configuration
 
-On first launch, a default config is created at:
+On first launch, a default config is created automatically.
+
+Portable frozen builds use:
+
+- `.\data\config.json`
+
+The app keeps the existing dev fallback for normal runs:
 
 - `%LOCALAPPDATA%\WorkLogDiary\config.json` (Windows)
+- `~/.worklog_diary/config.json` (non-Windows fallback used by the code)
 
 Use `sample_config.json` as a reference.
 
@@ -99,6 +157,7 @@ Important fields:
 - `max_screenshots_per_summary`
 - `lmstudio_base_url`
 - `lmstudio_model`
+- `log_dir`
 - `db_path`
 - `screenshot_dir`
 
@@ -140,6 +199,10 @@ Summary processing uses a bounded queue/worker dispatcher:
 
 The tray menu and tooltip expose:
 
+- monitoring state:
+  - `Monitoring`
+  - `Paused`
+  - `Paused (PC locked)`
 - pending screenshot count,
 - pending text segment count,
 - pending summary job count,
@@ -151,6 +214,30 @@ The tray menu and tooltip expose:
   - `Summarizing`
   - `Summarizing, backlog remaining`
 - approximate remaining batch count.
+
+## Summaries viewer and daily recap
+
+The summaries window is day-centric:
+
+- left pane: calendar day selector,
+- highlighted days (light blue) when one or more summaries exist,
+- right pane: structured summary cards for the selected day.
+
+Each summary card includes:
+
+- time range,
+- summary text,
+- major activities (when present),
+- blocked/unanalyzed notes (when present),
+- uncertainty/notes (when present).
+
+Daily recap generation is manual:
+
+- select a day in the summaries window,
+- click `Generate Daily Recap`,
+- the app aggregates that day's batch summaries and asks LM Studio for a concise recap,
+- the recap is stored separately from batch summaries,
+- regenerating the same day replaces the existing daily recap for that day.
 
 ## LM Studio setup
 
@@ -171,6 +258,7 @@ SQLite DB stores:
 - Temporary reconstructed text segments.
 - Temporary screenshot records.
 - Summary jobs and final summaries.
+- Daily recap rows (`daily_summaries`) keyed by calendar day.
 
 After a successful summary batch:
 
@@ -202,6 +290,9 @@ Included tests cover:
 - Flush drain-until-empty behavior.
 - Summary concurrency limit behavior.
 - Active-window screenshot region selection logic.
+- Session lock/unlock monitoring pause/resume logic.
+- Summary day queries and daily recap persistence behavior.
+- Summaries day-view model preparation (calendar/day data shaping).
 
 ## Diagnostics and validation tooling
 
@@ -240,6 +331,11 @@ Important structured events include:
 - `text_segment_finalized`
 - `summary_job_queued` / `summary_job_started` / `summary_job_completed` / `summary_job_failed`
 - `summary_drain_started` / `summary_drain_tick` / `summary_drain_finished`
+- `session_locked` / `session_unlocked`
+- `monitoring_paused_by_lock` / `monitoring_resumed_after_unlock`
+- `calendar_summary_load`
+- `daily_recap_generation_started` / `daily_recap_generation_succeeded` / `daily_recap_generation_failed`
+- `daily_recap_replaced`
 - `purge_actions`
 
 To enable debug-level capture logs:
@@ -269,18 +365,22 @@ set WORKLOG_DIARY_LOG_LEVEL=DEBUG
    - `privacy_block_transition ... blocked=false`
    - `key_capture_accepted` resumes
    - `screenshot_captured` resumes
-7. Trigger **Flush Now (Drain)** from tray or run:
+7. Lock the Windows session, then unlock it, and confirm:
+   - `session_locked` / `session_unlocked`
+   - `monitoring_paused_by_lock` then `monitoring_resumed_after_unlock`
+   - no new key/screenshot capture events during the lock period
+8. Trigger **Flush Now (Drain)** from tray or run:
    - `worklog-diary-debug flush-buffered --reason manual-validation`
-8. Confirm summary lifecycle logs:
+9. Confirm summary lifecycle logs:
    - `summary_drain_started`
    - `summary_job_queued`
    - `summary_job_started`
    - `summary_job_completed` (or `summary_job_failed`)
    - `summary_drain_finished`
-9. Inspect DB state:
+10. Inspect DB state:
    - `worklog-diary-debug pending`
    - Verify pending raw counts drop after successful summaries
-10. Verify screenshot purge:
+11. Verify screenshot purge:
    - files referenced in summarized ranges are removed from screenshot directory
    - no stale screenshot records remain in `screenshots` table for purged ranges
 

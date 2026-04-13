@@ -25,7 +25,7 @@ class SettingsWindow(QWidget):
         super().__init__()
         self.services = services
         self.setWindowTitle("WorkLog Diary Settings")
-        self.resize(560, 560)
+        self.resize(560, 600)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -92,6 +92,10 @@ class SettingsWindow(QWidget):
         self.db_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         form.addRow("SQLite database:", self.db_path_label)
 
+        self.log_dir_label = QLabel()
+        self.log_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Logs folder:", self.log_dir_label)
+
         self.screenshot_dir_label = QLabel()
         self.screenshot_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         form.addRow("Screenshot folder:", self.screenshot_dir_label)
@@ -132,6 +136,7 @@ class SettingsWindow(QWidget):
 
         self.data_dir_label.setText(cfg.app_data_dir)
         self.db_path_label.setText(cfg.db_path)
+        self.log_dir_label.setText(cfg.log_dir)
         self.screenshot_dir_label.setText(cfg.screenshot_dir)
         self.status_label.setText("")
 

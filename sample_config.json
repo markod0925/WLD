@@ -14,6 +14,7 @@
   "lmstudio_model": "local-model",
   "app_data_dir": "C:/Users/<you>/AppData/Local/WorkLogDiary",
   "screenshot_dir": "C:/Users/<you>/AppData/Local/WorkLogDiary/screenshots",
+  "log_dir": "C:/Users/<you>/AppData/Local/WorkLogDiary/logs",
   "db_path": "C:/Users/<you>/AppData/Local/WorkLogDiary/worklog_diary.db",
   "config_path": "C:/Users/<you>/AppData/Local/WorkLogDiary/config.json",
   "start_monitoring_on_launch": false,

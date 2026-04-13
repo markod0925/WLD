@@ -169,7 +169,7 @@ class TrayController:
 
     def _refresh_status(self) -> None:
         status = self.services.get_status()
-        monitoring = "running" if status["monitoring_active"] else "paused"
+        monitoring = str(status["monitoring_state"])
         blocked = "yes" if status["blocked"] else "no"
 
         foreground = status["foreground"]

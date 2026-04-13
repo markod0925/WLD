@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ..core.config import load_config
+from ..core.config import AppConfig, load_config
 from ..core.storage import SQLiteStorage
 
 
@@ -32,6 +32,7 @@ def main() -> int:
 
 def _run_pending(config_path: str | None, db_path: str | None) -> int:
     resolved_db_path = _resolve_db_path(config_path=config_path, db_path=db_path)
+    config = _load_config_for_reporting(config_path=config_path, db_path=db_path)
     storage = SQLiteStorage(resolved_db_path)
     try:
         diagnostics = storage.get_diagnostics_snapshot()
@@ -43,6 +44,13 @@ def _run_pending(config_path: str | None, db_path: str | None) -> int:
     pending_ranges: dict[str, dict | None] = diagnostics["pending_ranges"]
     summary_jobs: dict[str, int] = diagnostics["summary_jobs"]
 
+    if config is not None:
+        print(f"Config: {config.config_path}")
+        print(f"Data: {config.app_data_dir}")
+        print(f"Logs: {config.log_dir}")
+        print(f"Screenshots: {config.screenshot_dir}")
+    else:
+        print("Config: (not loaded; explicit --db override in use)")
     print(f"DB: {resolved_db_path}")
     print("")
     print("Table counts:")
@@ -54,6 +62,7 @@ def _run_pending(config_path: str | None, db_path: str | None) -> int:
         "screenshots",
         "summary_jobs",
         "summaries",
+        "daily_summaries",
     ):
         print(f"  - {name}: {table_counts.get(name, 0)}")
 
@@ -107,6 +116,12 @@ def _resolve_db_path(config_path: str | None, db_path: str | None) -> str:
         return str(Path(db_path))
     config = load_config(Path(config_path) if config_path else None)
     return config.db_path
+
+
+def _load_config_for_reporting(config_path: str | None, db_path: str | None) -> AppConfig | None:
+    if db_path and not config_path:
+        return None
+    return load_config(Path(config_path) if config_path else None)
 
 
 def _print_range(name: str, value: dict | None) -> None:

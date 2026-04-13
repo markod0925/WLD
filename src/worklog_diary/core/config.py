@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -22,6 +23,7 @@ class AppConfig:
     lmstudio_model: str = "local-model"
     app_data_dir: str = ""
     screenshot_dir: str = ""
+    log_dir: str = ""
     db_path: str = ""
     config_path: str = ""
     start_monitoring_on_launch: bool = False
@@ -37,6 +39,8 @@ class AppConfig:
 
         if not self.screenshot_dir:
             self.screenshot_dir = str(app_data_path / "screenshots")
+        if not self.log_dir:
+            self.log_dir = str(app_data_path / "logs")
         if not self.db_path:
             self.db_path = str(app_data_path / "worklog_diary.db")
         if not self.config_path:
@@ -53,6 +57,7 @@ class AppConfig:
         self.normalize()
         Path(self.app_data_dir).mkdir(parents=True, exist_ok=True)
         Path(self.screenshot_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
     def to_dict(self) -> dict:
@@ -61,11 +66,28 @@ class AppConfig:
 
 
 def default_app_data_dir() -> Path:
+    override = os.environ.get("WORKLOG_DIARY_APP_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    if is_frozen_executable():
+        return Path(sys.executable).resolve().parent / "data"
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
         if base:
             return Path(base) / "WorkLogDiary"
     return Path.home() / ".worklog_diary"
+
+
+def is_frozen_executable() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_data_dir_source() -> str:
+    if os.environ.get("WORKLOG_DIARY_APP_DATA_DIR"):
+        return "WORKLOG_DIARY_APP_DATA_DIR"
+    if is_frozen_executable():
+        return "frozen-executable"
+    return "local-appdata"
 
 
 

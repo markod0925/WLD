@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from threading import Lock
 from typing import Any
 
@@ -93,6 +94,16 @@ class SummaryRecord:
     end_ts: float
     summary_text: str
     summary_json: dict[str, Any]
+    created_ts: float
+
+
+@dataclass(slots=True)
+class DailySummaryRecord:
+    id: int | None
+    day: date
+    recap_text: str
+    recap_json: dict[str, Any] | None
+    source_batch_count: int
     created_ts: float
 
 

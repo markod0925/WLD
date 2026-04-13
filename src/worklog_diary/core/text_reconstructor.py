@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .models import KeyEvent, TextSegment
+from .models import KeyEvent, SharedState, TextSegment
 from .storage import SQLiteStorage
 
 SHIFTED_CHAR_MAP = {
@@ -160,10 +160,12 @@ class TextReconstructionService:
         storage: SQLiteStorage,
         reconstructor: TextReconstructor,
         poll_interval_seconds: float = 2.0,
+        state: SharedState | None = None,
     ) -> None:
         self.storage = storage
         self.reconstructor = reconstructor
         self.poll_interval_seconds = max(0.5, poll_interval_seconds)
+        self.state = state
         self.logger = logging.getLogger(__name__)
 
         self._stop_event = threading.Event()
@@ -188,6 +190,9 @@ class TextReconstructionService:
         self.logger.info("Text reconstruction service stopped")
 
     def process_once(self, force_flush: bool = False) -> int:
+        if not force_flush and self.state is not None and not self.state.snapshot().monitoring_active:
+            return 0
+
         events = self.storage.fetch_unprocessed_key_events()
         if not events:
             if force_flush:

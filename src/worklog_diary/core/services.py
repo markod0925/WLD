@@ -5,15 +5,17 @@ import math
 import threading
 import time
 from dataclasses import dataclass
+from datetime import date
 
 from .batching import BatchBuilder
-from .config import AppConfig, save_config
+from .config import AppConfig, app_data_dir_source, is_frozen_executable, save_config
 from .keyboard_capture import KeyboardCaptureService
 from .lmstudio_client import LMStudioClient
 from .logging_setup import configure_logging
 from .models import SharedState
 from .privacy import PrivacyPolicyEngine
 from .scheduler import FlushScheduler
+from .session_monitor import SessionMonitor
 from .screenshot_capture import ScreenshotCaptureService
 from .storage import SQLiteStorage
 from .summarizer import Summarizer
@@ -35,8 +37,21 @@ class MonitoringServices:
         self.config = config
         self.config.ensure_paths()
 
-        configure_logging(self.config.app_data_dir)
+        configure_logging(self.config.log_dir)
         self.logger = logging.getLogger(__name__)
+        self.logger.info(
+            (
+                "event=runtime_paths mode=%s app_data_dir=%s log_dir=%s screenshot_dir=%s "
+                "db_path=%s config_path=%s"
+            ),
+            "portable" if is_frozen_executable() else "dev",
+            self.config.app_data_dir,
+            self.config.log_dir,
+            self.config.screenshot_dir,
+            self.config.db_path,
+            self.config.config_path,
+        )
+        self.logger.info("event=runtime_paths_source source=%s", app_data_dir_source())
 
         self.state = SharedState()
         self.storage = SQLiteStorage(self.config.db_path)
@@ -69,6 +84,7 @@ class MonitoringServices:
             storage=self.storage,
             reconstructor=self.text_reconstructor,
             poll_interval_seconds=self.config.reconstruction_poll_interval_seconds,
+            state=self.state,
         )
 
         self.batch_builder = BatchBuilder(
@@ -92,6 +108,10 @@ class MonitoringServices:
             flush_callback=self.flush_now,
             state=self.state,
         )
+        self.session_monitor = SessionMonitor(
+            on_locked=self.handle_session_locked,
+            on_unlocked=self.handle_session_unlocked,
+        )
 
         self._services_running = False
         self._flush_lock = threading.Lock()
@@ -99,27 +119,46 @@ class MonitoringServices:
         self._status_lock = threading.Lock()
         self._drain_active = False
         self._drain_reason: str | None = None
+        self._monitoring_requested = False
+        self._manual_pause = False
+        self._paused_by_lock = False
 
     def start_monitoring(self) -> None:
-        self.state.set_monitoring_active(True)
+        with self._status_lock:
+            self._monitoring_requested = True
+            self._manual_pause = False
+
         if not self._services_running:
             self.window_tracker.start()
             self.keyboard_capture.start()
             self.screenshot_capture.start()
             self.text_service.start()
             self.scheduler.start()
+            self.session_monitor.start()
             self._services_running = True
 
-        self.logger.info("event=monitoring_state_change active=true")
+        active = self._apply_effective_monitoring_state()
+        self.logger.info(
+            "event=monitoring_state_change active=%s mode=start paused_by_lock=%s",
+            active,
+            self._paused_by_lock,
+        )
 
     def pause_monitoring(self) -> None:
-        self.state.set_monitoring_active(False)
-        self.window_tracker.pause()
+        with self._status_lock:
+            self._manual_pause = True
+            self._monitoring_requested = True
+            self._paused_by_lock = False
+        self._apply_effective_monitoring_state()
         self.logger.info("event=monitoring_state_change active=false mode=pause")
 
     def stop_monitoring(self) -> None:
-        self.state.set_monitoring_active(False)
-        self.window_tracker.pause()
+        with self._status_lock:
+            self._monitoring_requested = False
+            self._manual_pause = False
+            self._paused_by_lock = False
+
+        self._apply_effective_monitoring_state()
 
         if self._services_running:
             self.scheduler.stop()
@@ -127,9 +166,36 @@ class MonitoringServices:
             self.keyboard_capture.stop()
             self.text_service.stop()
             self.window_tracker.stop()
+            self.session_monitor.stop()
             self._services_running = False
 
         self.logger.info("event=monitoring_state_change active=false mode=stop")
+
+    def handle_session_locked(self) -> None:
+        with self._status_lock:
+            was_paused_by_lock = self._paused_by_lock
+            self._paused_by_lock = True
+            should_log_pause = self._monitoring_requested and not self._manual_pause and not was_paused_by_lock
+        self._apply_effective_monitoring_state()
+        if should_log_pause:
+            self.logger.info("event=monitoring_paused_by_lock")
+
+    def handle_session_unlocked(self) -> None:
+        with self._status_lock:
+            was_paused_by_lock = self._paused_by_lock
+            self._paused_by_lock = False
+            should_log_resume = was_paused_by_lock and self._monitoring_requested and not self._manual_pause
+        active = self._apply_effective_monitoring_state()
+        if should_log_resume and active:
+            self.logger.info("event=monitoring_resumed_after_unlock")
+
+    def _apply_effective_monitoring_state(self) -> bool:
+        with self._status_lock:
+            target_active = self._monitoring_requested and not self._manual_pause and not self._paused_by_lock
+        self.state.set_monitoring_active(target_active)
+        if not target_active:
+            self.window_tracker.pause()
+        return target_active
 
     def cancel_flush_drain(self) -> bool:
         if not self.is_drain_active:
@@ -146,6 +212,16 @@ class MonitoringServices:
     def flush_now(self, reason: str = "manual") -> FlushDrainResult | None:
         if not self._flush_lock.acquire(blocking=False):
             self.logger.info("event=summary_flush_skipped reason=already_running request_reason=%s", reason)
+            return None
+        status_lock = getattr(self, "_status_lock", None)
+        if status_lock is None:
+            paused_by_lock = False
+        else:
+            with status_lock:
+                paused_by_lock = bool(getattr(self, "_paused_by_lock", False))
+        if paused_by_lock:
+            self.logger.info("event=summary_flush_skipped reason=paused_by_lock request_reason=%s", reason)
+            self._flush_lock.release()
             return None
 
         self._drain_cancel_event.clear()
@@ -243,7 +319,8 @@ class MonitoringServices:
             self._flush_lock.release()
 
     def apply_config(self, config: AppConfig) -> None:
-        was_monitoring = self.state.snapshot().monitoring_active
+        with self._status_lock:
+            was_monitoring_requested = self._monitoring_requested
 
         if self._services_running:
             self.stop_monitoring()
@@ -266,7 +343,7 @@ class MonitoringServices:
         self.summarizer.update_max_parallel_jobs(self.config.max_parallel_summary_jobs)
         self.scheduler.interval_seconds = max(30, self.config.flush_interval_seconds)
 
-        if was_monitoring:
+        if was_monitoring_requested:
             self.start_monitoring()
 
     def get_status(self) -> dict:
@@ -276,6 +353,13 @@ class MonitoringServices:
         with self._status_lock:
             drain_active = self._drain_active
             drain_reason = self._drain_reason
+            paused_by_lock = self._paused_by_lock
+            manual_pause = self._manual_pause
+            monitoring_requested = self._monitoring_requested
+
+        monitoring_state = "Monitoring"
+        if not snapshot.monitoring_active:
+            monitoring_state = "Paused (PC locked)" if paused_by_lock else "Paused"
 
         buffer_state = _synthesize_buffer_state(
             pending_counts=pending,
@@ -290,6 +374,10 @@ class MonitoringServices:
 
         return {
             "monitoring_active": snapshot.monitoring_active,
+            "monitoring_requested": monitoring_requested,
+            "monitoring_state": monitoring_state,
+            "paused_by_lock": paused_by_lock,
+            "manual_pause": manual_pause,
             "blocked": snapshot.blocked,
             "foreground": snapshot.foreground_info,
             "active_interval_id": snapshot.active_interval_id,
@@ -315,6 +403,34 @@ class MonitoringServices:
             "max_parallel_summary_jobs": int(summary_runtime["max_parallel_summary_jobs"]),
             "unrecoverable_summary_error": summary_runtime["unrecoverable_error"],
         }
+
+    def generate_daily_recap(self, day: date) -> dict[str, int | str | bool]:
+        day_key = day.isoformat()
+        self.logger.info("event=daily_recap_generation_started day=%s", day_key)
+        try:
+            summary_id, replaced = self.summarizer.generate_daily_recap_for_day(day)
+            stored = self.storage.get_daily_summary_for_day(day)
+            source_batch_count = (
+                stored.source_batch_count if stored is not None else self.storage.count_batch_summaries_for_day(day)
+            )
+            self.logger.info(
+                "event=daily_recap_generation_succeeded day=%s daily_summary_id=%s source_batch_count=%s replaced=%s",
+                day_key,
+                summary_id,
+                source_batch_count,
+                replaced,
+            )
+            if replaced:
+                self.logger.info("event=daily_recap_replaced day=%s", day_key)
+            return {
+                "day": day_key,
+                "daily_summary_id": summary_id,
+                "source_batch_count": int(source_batch_count),
+                "replaced": bool(replaced),
+            }
+        except Exception as exc:
+            self.logger.exception("event=daily_recap_generation_failed day=%s error=%s", day_key, exc)
+            raise
 
     def shutdown(self) -> None:
         self.cancel_flush_drain()
