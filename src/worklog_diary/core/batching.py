@@ -66,7 +66,7 @@ class BatchBuilder:
     def __init__(
         self,
         storage: SQLiteStorage,
-        max_text_segments: int = 200,
+        max_text_segments: int = 400,
         max_screenshots: int = 3,
     ) -> None:
         self.storage = storage

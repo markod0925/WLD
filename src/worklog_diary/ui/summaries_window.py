@@ -4,7 +4,7 @@ import logging
 import threading
 from datetime import date
 
-from PySide6.QtCore import QDate, QTimer
+from PySide6.QtCore import QDate, QTimer, Signal
 from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (
     QCalendarWidget,
@@ -24,6 +24,9 @@ from .summaries_view_model import DaySummaryView, SummaryCardView, build_calenda
 
 
 class SummariesWindow(QWidget):
+    daily_recap_finished = Signal(object, object)
+    flush_finished = Signal(object, object)
+
     def __init__(self, services: MonitoringServices) -> None:
         super().__init__()
         self.services = services
@@ -34,6 +37,14 @@ class SummariesWindow(QWidget):
         self._highlighted_days: set[date] = set()
         self._selected_day = date.today()
         self._daily_recap_inflight = False
+        self._flush_inflight = False
+        self._last_refresh_signature: tuple[object, ...] | None = None
+        self.daily_recap_finished.connect(self._on_daily_recap_finished)
+        self.flush_finished.connect(self._on_flush_finished)
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(3000)
+        self._refresh_timer.timeout.connect(self._maybe_refresh)
 
         root = QVBoxLayout(self)
         tools = QHBoxLayout()
@@ -42,6 +53,10 @@ class SummariesWindow(QWidget):
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh)
         tools.addWidget(self.refresh_button)
+
+        self.flush_button = QPushButton("Start Flush")
+        self.flush_button.clicked.connect(self._toggle_flush)
+        tools.addWidget(self.flush_button)
 
         self.generate_recap_button = QPushButton("Generate Daily Recap")
         self.generate_recap_button.clicked.connect(self._generate_daily_recap)
@@ -89,9 +104,21 @@ class SummariesWindow(QWidget):
         self.summary_scroll.setWidget(self.summary_cards_host)
 
     def refresh(self) -> None:
-        selected_day = _qdate_to_day(self.calendar.selectedDate())
+        selected_day = self._selected_day
         self._refresh_calendar_highlights()
         self._load_day(selected_day)
+        self._sync_flush_button_state()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+        self._maybe_refresh()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        if self._refresh_timer.isActive():
+            self._refresh_timer.stop()
+        super().hideEvent(event)
 
     def _refresh_calendar_highlights(self) -> None:
         default_format = QTextCharFormat()
@@ -124,6 +151,7 @@ class SummariesWindow(QWidget):
             view.has_daily_recap,
         )
         self._render_day_view(view=view)
+        self._last_refresh_signature = self._build_refresh_signature(day)
 
     def _render_day_view(self, view: DaySummaryView) -> None:
         self.selected_date_label.setText(f"Selected date: {view.day.isoformat()}")
@@ -145,6 +173,7 @@ class SummariesWindow(QWidget):
         self.summary_cards_layout.addStretch(1)
 
         self.generate_recap_button.setEnabled(not self._daily_recap_inflight and len(view.cards) > 0)
+        self._sync_flush_button_state()
 
     def _clear_summary_cards(self) -> None:
         while self.summary_cards_layout.count():
@@ -152,6 +181,28 @@ class SummariesWindow(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+
+    def _build_refresh_signature(self, day: date) -> tuple[object, ...]:
+        summary_days = tuple(self.services.storage.list_summary_days(limit=3660))
+        summaries = self.services.storage.list_summaries_for_day(day, limit=1000)
+        daily_summary = self.services.storage.get_daily_summary_for_day(day)
+        daily_signature = (
+            None
+            if daily_summary is None
+            else (daily_summary.id, daily_summary.created_ts, daily_summary.source_batch_count)
+        )
+        summary_signature = tuple((item.id, item.start_ts, item.end_ts, item.created_ts) for item in summaries)
+        return (day, summary_days, summary_signature, daily_signature)
+
+    def _maybe_refresh(self) -> None:
+        if not self.isVisible():
+            return
+        selected_day = self._selected_day
+        signature = self._build_refresh_signature(selected_day)
+        if signature != self._last_refresh_signature:
+            self.refresh()
+        else:
+            self._sync_flush_button_state()
 
     def _generate_daily_recap(self) -> None:
         selected_day = self._selected_day
@@ -165,28 +216,58 @@ class SummariesWindow(QWidget):
         self.generate_recap_button.setText("Generating...")
 
         def task() -> None:
-            error_message: str | None = None
             try:
                 self.services.generate_daily_recap(selected_day)
             except Exception as exc:
-                error_message = str(exc)
-            QTimer.singleShot(
-                0,
-                lambda: self._on_daily_recap_finished(selected_day, error_message),
-            )
+                self.logger.exception("event=daily_recap_generation_failed day=%s error=%s", selected_day.isoformat(), exc)
+            finally:
+                self.daily_recap_finished.emit(selected_day, None)
 
         threading.Thread(target=task, name="DailyRecapGeneration", daemon=True).start()
 
     def _on_daily_recap_finished(self, day: date, error_message: str | None) -> None:
         self._daily_recap_inflight = False
         self.generate_recap_button.setText("Generate Daily Recap")
-        if error_message:
-            QMessageBox.warning(self, "Daily Recap Failed", error_message)
         self._refresh_calendar_highlights()
         if self._selected_day == day:
             self._load_day(day)
         else:
             self.generate_recap_button.setEnabled(True)
+        self._sync_flush_button_state()
+
+    def _toggle_flush(self) -> None:
+        if self._flush_inflight or self.services.is_drain_active:
+            if self.services.cancel_flush_drain():
+                self._sync_flush_button_state()
+            return
+
+        self._flush_inflight = True
+        self._sync_flush_button_state()
+
+        def task() -> None:
+            result = None
+            try:
+                result = self.services.flush_now(reason="summary-window")
+            except Exception as exc:
+                self.logger.exception("event=summary_window_flush_failed error=%s", exc)
+            finally:
+                self.flush_finished.emit(result, None)
+
+        threading.Thread(target=task, name="SummaryWindowFlush", daemon=True).start()
+
+    def _on_flush_finished(self, result: object, error_message: object) -> None:
+        self._flush_inflight = False
+        if hasattr(result, "stop_reason") and getattr(result, "stop_reason") == "error":
+            self.logger.info("event=summary_window_flush_finished result=error")
+        elif result is not None:
+            self.logger.info("event=summary_window_flush_finished result=%s", type(result).__name__)
+        self._sync_flush_button_state()
+        self.refresh()
+
+    def _sync_flush_button_state(self) -> None:
+        active = self._flush_inflight or self.services.is_drain_active
+        self.flush_button.setText("Stop Flush" if active else "Start Flush")
+        self.flush_button.setEnabled(True)
 
 
 def _build_summary_card_widget(card: SummaryCardView) -> QFrame:

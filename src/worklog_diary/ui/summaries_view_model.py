@@ -37,7 +37,8 @@ def build_day_summary_view(
     summaries: list[SummaryRecord],
     daily_summary: DailySummaryRecord | None,
 ) -> DaySummaryView:
-    cards = [build_summary_card_view(item) for item in sorted(summaries, key=lambda entry: entry.start_ts)]
+    # Sort by the time range the summary covers, not by when the row was generated.
+    cards = [build_summary_card_view(item) for item in sorted(summaries, key=_summary_sort_key, reverse=True)]
     recap_created_label: str | None = None
     if daily_summary is not None:
         recap_created_label = datetime.fromtimestamp(daily_summary.created_ts).strftime("%Y-%m-%d %H:%M:%S")
@@ -71,6 +72,11 @@ def build_summary_card_view(summary: SummaryRecord) -> SummaryCardView:
         blocked_notes=blocked_notes,
         uncertainty_notes=uncertainty_notes,
     )
+
+
+def _summary_sort_key(summary: SummaryRecord) -> tuple[float, float, int]:
+    summary_id = int(summary.id or 0)
+    return (summary.end_ts, summary.start_ts, summary_id)
 
 
 def _extract_string_list(payload: dict[str, Any], keys: list[str]) -> list[str]:

@@ -6,9 +6,12 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import date
+from collections.abc import Callable
 
 from .batching import BatchBuilder
 from .config import AppConfig, app_data_dir_source, is_frozen_executable, save_config
+from .error_notifications import ErrorNotificationManager
+from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .keyboard_capture import KeyboardCaptureService
 from .lmstudio_client import LMStudioClient
 from .logging_setup import configure_logging
@@ -56,6 +59,7 @@ class MonitoringServices:
         self.state = SharedState()
         self.storage = SQLiteStorage(self.config.db_path)
         self.privacy = PrivacyPolicyEngine(set(self.config.blocked_processes))
+        self.error_notifier = ErrorNotificationManager()
 
         self.window_tracker = ForegroundWindowTrackerService(
             storage=self.storage,
@@ -102,6 +106,7 @@ class MonitoringServices:
             batch_builder=self.batch_builder,
             lm_client=self.lmstudio_client,
             max_parallel_jobs=self.config.max_parallel_summary_jobs,
+            error_notifier=self.error_notifier,
         )
         self.scheduler = FlushScheduler(
             interval_seconds=self.config.flush_interval_seconds,
@@ -122,6 +127,12 @@ class MonitoringServices:
         self._monitoring_requested = False
         self._manual_pause = False
         self._paused_by_lock = False
+
+    def set_error_notification_sink(self, sink: Callable[[str, str], None] | None) -> None:
+        self.error_notifier.set_sink(sink)
+
+    def notify_user_error(self, category: str, message: str, *, key: str | None = None) -> bool:
+        return self.error_notifier.notify(category, message, key=key)
 
     def start_monitoring(self) -> None:
         with self._status_lock:
@@ -242,76 +253,93 @@ class MonitoringServices:
         summaries_created = 0
 
         try:
-            while True:
-                if self._drain_cancel_event.is_set():
-                    cancelled = self.summarizer.cancel_queued_jobs(reason="cancelled_by_user")
-                    self.logger.info("event=summary_drain_stopped reason=cancelled cancelled_queued_jobs=%s", cancelled)
-                    stop_reason = "cancelled"
-                    break
-
-                for _ in range(5):
-                    self.text_service.process_once(force_flush=True)
-                    if self.storage.count_unprocessed_key_events() == 0:
+            try:
+                while True:
+                    if self._drain_cancel_event.is_set():
+                        cancelled = self.summarizer.cancel_queued_jobs(reason="cancelled_by_user")
+                        self.logger.info("event=summary_drain_stopped reason=cancelled cancelled_queued_jobs=%s", cancelled)
+                        stop_reason = "cancelled"
                         break
 
-                dispatched = self.summarizer.dispatch_pending_jobs(reason=reason)
-                summaries_created += dispatched
+                    for _ in range(5):
+                        self.text_service.process_once(force_flush=True)
+                        if self.storage.count_unprocessed_key_events() == 0:
+                            break
 
-                pending = self.storage.get_pending_counts()
-                runtime = self.summarizer.get_runtime_status()
+                    dispatched = self.summarizer.dispatch_pending_jobs(reason=reason)
+                    summaries_created += dispatched
 
+                    pending = self.storage.get_pending_counts()
+                    runtime = self.summarizer.get_runtime_status()
+
+                    self.logger.info(
+                        (
+                            "event=summary_drain_tick reason=%s dispatched=%s queued=%s running=%s "
+                            "pending_text_segments=%s pending_screenshots=%s pending_intervals=%s"
+                        ),
+                        reason,
+                        dispatched,
+                        runtime["queued_jobs"],
+                        runtime["running_jobs"],
+                        pending["text_segments"],
+                        pending["screenshots"],
+                        pending["intervals"],
+                    )
+
+                    if bool(runtime["has_unrecoverable_error"]):
+                        self.summarizer.cancel_queued_jobs(reason="cancelled_after_failure")
+                        stop_reason = "error"
+                        break
+
+                    backlog_remaining = _has_pending_backlog(pending)
+                    if not backlog_remaining and int(runtime["pending_summary_jobs"]) == 0:
+                        stop_reason = "empty"
+                        break
+
+                    self.summarizer.wait_for_activity(timeout_seconds=0.4)
+
+                self.summarizer.wait_for_idle(timeout_seconds=30.0)
+
+                now = time.time()
+                self.state.set_flush_times(last_flush_ts=now, next_flush_ts=now + self.config.flush_interval_seconds)
+
+                end_counts = self.storage.get_summary_job_status_counts()
+                result = FlushDrainResult(
+                    stop_reason=stop_reason,
+                    summaries_created=max(0, end_counts.get("succeeded", 0) - start_counts.get("succeeded", 0)),
+                    failed_jobs=max(0, end_counts.get("failed", 0) - start_counts.get("failed", 0)),
+                    cancelled_jobs=max(0, end_counts.get("cancelled", 0) - start_counts.get("cancelled", 0)),
+                    pending_summary_jobs=int(self.summarizer.get_runtime_status()["pending_summary_jobs"]),
+                )
+                if result.stop_reason != "error":
+                    self.error_notifier.resolve("flush_failure")
                 self.logger.info(
                     (
-                        "event=summary_drain_tick reason=%s dispatched=%s queued=%s running=%s "
-                        "pending_text_segments=%s pending_screenshots=%s pending_intervals=%s"
+                        "event=summary_drain_finished reason=%s stop_reason=%s created=%s failed=%s cancelled=%s "
+                        "pending_summary_jobs=%s"
                     ),
                     reason,
-                    dispatched,
-                    runtime["queued_jobs"],
-                    runtime["running_jobs"],
-                    pending["text_segments"],
-                    pending["screenshots"],
-                    pending["intervals"],
+                    result.stop_reason,
+                    result.summaries_created,
+                    result.failed_jobs,
+                    result.cancelled_jobs,
+                    result.pending_summary_jobs,
                 )
-
-                if bool(runtime["has_unrecoverable_error"]):
-                    self.summarizer.cancel_queued_jobs(reason="cancelled_after_failure")
-                    stop_reason = "error"
-                    break
-
-                backlog_remaining = _has_pending_backlog(pending)
-                if not backlog_remaining and int(runtime["pending_summary_jobs"]) == 0:
-                    stop_reason = "empty"
-                    break
-
-                self.summarizer.wait_for_activity(timeout_seconds=0.4)
-
-            self.summarizer.wait_for_idle(timeout_seconds=30.0)
-
-            now = time.time()
-            self.state.set_flush_times(last_flush_ts=now, next_flush_ts=now + self.config.flush_interval_seconds)
-
-            end_counts = self.storage.get_summary_job_status_counts()
-            result = FlushDrainResult(
-                stop_reason=stop_reason,
-                summaries_created=max(0, end_counts.get("succeeded", 0) - start_counts.get("succeeded", 0)),
-                failed_jobs=max(0, end_counts.get("failed", 0) - start_counts.get("failed", 0)),
-                cancelled_jobs=max(0, end_counts.get("cancelled", 0) - start_counts.get("cancelled", 0)),
-                pending_summary_jobs=int(self.summarizer.get_runtime_status()["pending_summary_jobs"]),
-            )
-            self.logger.info(
-                (
-                    "event=summary_drain_finished reason=%s stop_reason=%s created=%s failed=%s cancelled=%s "
-                    "pending_summary_jobs=%s"
-                ),
-                reason,
-                result.stop_reason,
-                result.summaries_created,
-                result.failed_jobs,
-                result.cancelled_jobs,
-                result.pending_summary_jobs,
-            )
-            return result
+                return result
+            except Exception as exc:
+                self.error_notifier.notify(
+                    "flush_failure",
+                    "Flush failed: Unable to complete the flush. Check LM Studio and try again.",
+                    key=f"{reason}|{exc.__class__.__name__}",
+                )
+                self.logger.exception("event=summary_drain_failed reason=%s error=%s", reason, exc)
+                return FlushDrainResult(
+                    stop_reason="error",
+                    summaries_created=0,
+                    failed_jobs=0,
+                    cancelled_jobs=0,
+                    pending_summary_jobs=int(self.summarizer.get_runtime_status()["pending_summary_jobs"]),
+                )
         finally:
             with self._status_lock:
                 self._drain_active = False
@@ -422,13 +450,29 @@ class MonitoringServices:
             )
             if replaced:
                 self.logger.info("event=daily_recap_replaced day=%s", day_key)
+            self.error_notifier.resolve_many(
+                "summary_generation_failure",
+                "lmstudio_connection",
+                "lmstudio_service_unavailable",
+            )
             return {
                 "day": day_key,
                 "daily_summary_id": summary_id,
                 "source_batch_count": int(source_batch_count),
                 "replaced": bool(replaced),
             }
+        except ValueError:
+            raise
+        except LMStudioConnectionError:
+            raise
+        except LMStudioServiceUnavailableError:
+            raise
         except Exception as exc:
+            self.error_notifier.notify(
+                "summary_generation_failure",
+                "Summary generation failed. The daily recap could not be created.",
+                key=f"{day_key}|{exc.__class__.__name__}",
+            )
             self.logger.exception("event=daily_recap_generation_failed day=%s error=%s", day_key, exc)
             raise
 

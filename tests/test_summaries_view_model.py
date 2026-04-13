@@ -46,10 +46,19 @@ def test_build_day_summary_view_combines_day_cards_and_recap_state() -> None:
             job_id=1,
             start_ts=100.0,
             end_ts=120.0,
-            summary_text="a",
+            summary_text="older",
             summary_json={"key_points": ["x"]},
             created_ts=130.0,
-        )
+        ),
+        SummaryRecord(
+            id=11,
+            job_id=1,
+            start_ts=200.0,
+            end_ts=220.0,
+            summary_text="newer",
+            summary_json={"key_points": ["y"]},
+            created_ts=230.0,
+        ),
     ]
     daily = DailySummaryRecord(
         id=5,
@@ -62,7 +71,8 @@ def test_build_day_summary_view_combines_day_cards_and_recap_state() -> None:
     view = build_day_summary_view(day=target_day, summaries=summaries, daily_summary=daily)
 
     assert view.day == target_day
-    assert len(view.cards) == 1
+    assert len(view.cards) == 2
+    assert [card.summary_text for card in view.cards] == ["newer", "older"]
     assert view.has_daily_recap is True
     assert view.daily_recap_text == "- did x"
     assert view.daily_recap_created_label is not None

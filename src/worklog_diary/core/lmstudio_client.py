@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from .batching import SummaryBatch
+from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .models import SummaryRecord
 
 
@@ -64,21 +65,8 @@ class LMStudioClient:
             "multimodal" if isinstance(user_content, list) else "text",
         )
 
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        raw_content = data["choices"][0]["message"]["content"]
-        if isinstance(raw_content, list):
-            text_content = "\n".join(part.get("text", "") for part in raw_content if isinstance(part, dict))
-        elif isinstance(raw_content, dict):
-            text_content = str(raw_content.get("text", ""))
-        else:
-            text_content = str(raw_content)
+        data = self._post_chat_completion(payload)
+        text_content = self._extract_message_content(data)
 
         parsed = _parse_model_response(text_content)
         summary_text = parsed.get("summary_text") or parsed.get("summary") or text_content
@@ -108,25 +96,56 @@ class LMStudioClient:
             day.isoformat(),
             len(summaries),
         )
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
+        data = self._post_chat_completion(payload)
+        text_content = self._extract_message_content(data)
 
-        data = response.json()
-        raw_content = data["choices"][0]["message"]["content"]
+        parsed = _parse_model_response(text_content)
+        recap_text = parsed.get("recap_text") or parsed.get("summary_text") or text_content
+        return str(recap_text), parsed
+
+    def _post_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.Timeout as exc:
+            raise LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running.") from exc
+        except requests.ConnectionError as exc:
+            raise LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running.") from exc
+        except requests.HTTPError as exc:
+            raise LMStudioServiceUnavailableError(
+                "Service unavailable: LM Studio could not generate a response. Check that the selected model is loaded."
+            ) from exc
+        except requests.RequestException as exc:
+            raise LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check the configured address.") from exc
+        except ValueError as exc:
+            raise LMStudioServiceUnavailableError(
+                "Service unavailable: LM Studio returned an unexpected response."
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise LMStudioServiceUnavailableError("Service unavailable: LM Studio returned an unexpected response.")
+        return data
+
+    def _extract_message_content(self, data: dict[str, Any]) -> str:
+        try:
+            raw_content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LMStudioServiceUnavailableError(
+                "Service unavailable: LM Studio returned an unexpected response."
+            ) from exc
+
         if isinstance(raw_content, list):
             text_content = "\n".join(part.get("text", "") for part in raw_content if isinstance(part, dict))
         elif isinstance(raw_content, dict):
             text_content = str(raw_content.get("text", ""))
         else:
             text_content = str(raw_content)
-
-        parsed = _parse_model_response(text_content)
-        recap_text = parsed.get("recap_text") or parsed.get("summary_text") or text_content
-        return str(recap_text), parsed
+        return text_content
 
 
 

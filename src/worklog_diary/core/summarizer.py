@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import date
 
 from .batching import BatchBuilder, SummaryBatch
+from .error_notifications import ErrorNotificationManager
+from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .lmstudio_client import LMStudioClient
 from .storage import SQLiteStorage
 
@@ -26,11 +28,13 @@ class Summarizer:
         batch_builder: BatchBuilder,
         lm_client: LMStudioClient,
         max_parallel_jobs: int = 2,
+        error_notifier: ErrorNotificationManager | None = None,
     ) -> None:
         self.storage = storage
         self.batch_builder = batch_builder
         self.lm_client = lm_client
         self.logger = logging.getLogger(__name__)
+        self.error_notifier = error_notifier or ErrorNotificationManager()
 
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -157,7 +161,21 @@ class Summarizer:
         if not summaries:
             raise ValueError(f"No summaries available for day {day.isoformat()}")
 
-        recap_text, recap_json = self.lm_client.summarize_daily_recap(day=day, summaries=summaries)
+        try:
+            recap_text, recap_json = self.lm_client.summarize_daily_recap(day=day, summaries=summaries)
+        except LMStudioConnectionError as exc:
+            self._notify_lmstudio_error("lmstudio_connection", str(exc), key=f"{self._lmstudio_identity()}|connection")
+            raise
+        except LMStudioServiceUnavailableError as exc:
+            self._notify_lmstudio_error(
+                "lmstudio_service_unavailable",
+                str(exc),
+                key=f"{self._lmstudio_identity()}|unavailable",
+            )
+            raise
+        else:
+            self.error_notifier.resolve_many("lmstudio_connection", "lmstudio_service_unavailable")
+
         daily_summary, replaced = self.storage.create_daily_summary(
             day=day,
             recap_text=recap_text,
@@ -217,6 +235,11 @@ class Summarizer:
             self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
             self.storage.purge_raw_data(batch.start_ts, batch.end_ts)
             self.storage.update_summary_job(job_id, status="succeeded")
+            self.error_notifier.resolve_many(
+                "summary_generation_failure",
+                "lmstudio_connection",
+                "lmstudio_service_unavailable",
+            )
             self.logger.info(
                 "event=summary_job_completed job_id=%s summary_id=%s start_ts=%.3f end_ts=%.3f",
                 job_id,
@@ -225,10 +248,39 @@ class Summarizer:
                 batch.end_ts,
             )
             return summary_id
+        except LMStudioConnectionError as exc:
+            self.storage.update_summary_job(job_id, status="failed", error="LM Studio is unreachable.")
+            self._unrecoverable_error = "Connection error: Unable to reach LM Studio. Check that it is running."
+            self._notify_lmstudio_error(
+                "lmstudio_connection",
+                str(exc),
+                key=f"{self._lmstudio_identity()}|connection",
+            )
+            self.logger.exception("event=summary_job_failed job_id=%s reason=%s error=%s", job_id, reason, exc)
+            return None
+        except LMStudioServiceUnavailableError as exc:
+            self.storage.update_summary_job(
+                job_id,
+                status="failed",
+                error="LM Studio returned an unavailable response.",
+            )
+            self._unrecoverable_error = "Service unavailable: LM Studio could not generate a response."
+            self._notify_lmstudio_error(
+                "lmstudio_service_unavailable",
+                str(exc),
+                key=f"{self._lmstudio_identity()}|unavailable",
+            )
+            self.logger.exception("event=summary_job_failed job_id=%s reason=%s error=%s", job_id, reason, exc)
+            return None
         except Exception as exc:
-            self.storage.update_summary_job(job_id, status="failed", error=str(exc))
+            self.storage.update_summary_job(job_id, status="failed", error="Summary generation failed.")
             with self._lock:
-                self._unrecoverable_error = str(exc)
+                self._unrecoverable_error = "Summary generation failed."
+            self.error_notifier.notify(
+                "summary_generation_failure",
+                "Summary generation failed. Check that LM Studio is running and the configured model is available.",
+                key=f"{self._lmstudio_identity()}|{exc.__class__.__name__}",
+            )
             self.logger.exception("event=summary_job_failed job_id=%s reason=%s error=%s", job_id, reason, exc)
             return None
 
@@ -248,3 +300,13 @@ class Summarizer:
                     return False
                 self._condition.wait(timeout=remaining)
             return True
+
+    def _notify_lmstudio_error(self, category: str, message: str, *, key: str) -> None:
+        with self._lock:
+            self._unrecoverable_error = message
+        self.error_notifier.notify(category, message, key=key)
+
+    def _lmstudio_identity(self) -> str:
+        base_url = getattr(self.lm_client, "base_url", "lmstudio")
+        model = getattr(self.lm_client, "model", "unknown-model")
+        return f"{base_url}|{model}"

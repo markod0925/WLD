@@ -4,22 +4,36 @@ import sys
 import threading
 from datetime import datetime
 
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QStyle, QSystemTrayIcon
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from ..core.services import MonitoringServices
 from .settings_window import SettingsWindow
 from .summaries_window import SummariesWindow
 
 
+class NotificationBridge(QObject):
+    user_error = Signal(str, str)
+
+
 class TrayController:
     def __init__(self, app: QApplication, services: MonitoringServices) -> None:
         self.app = app
         self.services = services
+        self._notification_bridge = NotificationBridge()
+        self._notification_bridge.user_error.connect(self._show_user_error)
+        self.services.set_error_notification_sink(self._notification_bridge.user_error.emit)
 
-        icon = self.app.style().standardIcon(QStyle.SP_ComputerIcon)
-        self.tray = QSystemTrayIcon(icon, self.app)
+        self._tray_icons = {
+            "green": _build_tray_icon(QColor("#2ecc71")),
+            "yellow": _build_tray_icon(QColor("#f1c40f")),
+            "red": _build_tray_icon(QColor("#e74c3c")),
+        }
+
+        self.tray = QSystemTrayIcon(self._tray_icons["red"], self.app)
         self.tray.setToolTip("WorkLog Diary")
+        self.tray.activated.connect(self._on_tray_activated)
 
         self.settings_window = SettingsWindow(services)
         self.summaries_window = SummariesWindow(services)
@@ -93,6 +107,8 @@ class TrayController:
             result = self.services.flush_now(reason="manual")
             if result is None:
                 message = "Flush drain already running."
+            elif result.stop_reason == "error":
+                message = None
             else:
                 message = (
                     "Drain finished: "
@@ -112,9 +128,20 @@ class TrayController:
         self.tray.showMessage("WorkLog Diary", message)
         self._refresh_status()
 
-    def _on_flush_finished(self, message: str) -> None:
-        self.tray.showMessage("WorkLog Diary", message)
+    def _on_flush_finished(self, message: str | None) -> None:
+        if message:
+            self.tray.showMessage("WorkLog Diary", message)
         self._refresh_status()
+
+    def _show_user_error(self, category: str, message: str) -> None:
+        titles = {
+            "lmstudio_connection": "Connection error",
+            "lmstudio_service_unavailable": "Service unavailable",
+            "summary_generation_failure": "Summary generation failed",
+            "flush_failure": "Flush failed",
+        }
+        title = titles.get(category, "WorkLog Diary")
+        self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 5000)
 
     def _show_diagnostics(self) -> None:
         diagnostics = self.services.storage.get_diagnostics_snapshot()
@@ -161,6 +188,13 @@ class TrayController:
         self.summaries_window.raise_()
         self.summaries_window.activateWindow()
 
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._open_summaries()
+
     def _exit(self) -> None:
         self.status_timer.stop()
         self.services.shutdown()
@@ -171,6 +205,7 @@ class TrayController:
         status = self.services.get_status()
         monitoring = str(status["monitoring_state"])
         blocked = "yes" if status["blocked"] else "no"
+        self.tray.setIcon(self._select_tray_icon(status))
 
         foreground = status["foreground"]
         if foreground is not None:
@@ -224,6 +259,13 @@ class TrayController:
         )
         self.tray.setToolTip(tooltip)
 
+    def _select_tray_icon(self, status: dict) -> QIcon:
+        if not bool(status["monitoring_active"]):
+            return self._tray_icons["yellow"] if bool(status["monitoring_requested"]) else self._tray_icons["red"]
+        if bool(status["blocked"]):
+            return self._tray_icons["red"]
+        return self._tray_icons["green"]
+
 
 
 def run_tray_app(services: MonitoringServices) -> int:
@@ -237,3 +279,19 @@ def run_tray_app(services: MonitoringServices) -> int:
         services.start_monitoring()
 
     return app.exec()
+
+
+def _build_tray_icon(color: QColor) -> QIcon:
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        margin = 10
+        painter.drawEllipse(margin, margin, 64 - margin * 2, 64 - margin * 2)
+    finally:
+        painter.end()
+    return QIcon(pixmap)

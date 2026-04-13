@@ -22,7 +22,7 @@ class ScreenshotCaptureService:
         privacy: PrivacyPolicyEngine,
         screenshot_dir: str,
         interval_seconds: int,
-        capture_mode: str = "full_screen",
+        capture_mode: str = "active_window",
         foreground_provider: Callable[[], Any] = get_foreground_window_info,
         window_rect_provider: Callable[[int], tuple[int, int, int, int] | None] = get_window_capture_rect,
     ) -> None:
@@ -207,4 +207,6 @@ def _normalize_capture_mode(capture_mode: str) -> str:
     value = capture_mode.strip().lower()
     if value == "active_window":
         return "active_window"
-    return "full_screen"
+    if value == "full_screen":
+        return "full_screen"
+    return "active_window"

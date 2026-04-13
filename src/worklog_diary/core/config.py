@@ -13,8 +13,8 @@ SUPPORTED_CAPTURE_MODES = {"full_screen", "active_window"}
 @dataclass(slots=True)
 class AppConfig:
     blocked_processes: list[str] = field(default_factory=lambda: DEFAULT_BLOCKED_PROCESSES.copy())
-    screenshot_interval_seconds: int = 30
-    capture_mode: str = "full_screen"
+    screenshot_interval_seconds: int = 60
+    capture_mode: str = "active_window"
     foreground_poll_interval_seconds: float = 1.0
     text_inactivity_gap_seconds: float = 8.0
     reconstruction_poll_interval_seconds: float = 2.0
@@ -28,9 +28,9 @@ class AppConfig:
     config_path: str = ""
     start_monitoring_on_launch: bool = False
     max_screenshots_per_summary: int = 3
-    max_text_segments_per_summary: int = 200
+    max_text_segments_per_summary: int = 400
     max_parallel_summary_jobs: int = 2
-    request_timeout_seconds: int = 60
+    request_timeout_seconds: int = 600
 
     def normalize(self) -> None:
         if not self.app_data_dir:
@@ -49,7 +49,7 @@ class AppConfig:
         self.blocked_processes = [p.strip().lower() for p in self.blocked_processes if p.strip()]
 
         mode = self.capture_mode.strip().lower()
-        self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "full_screen"
+        self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "active_window"
 
         self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
 
