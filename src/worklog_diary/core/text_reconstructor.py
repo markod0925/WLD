@@ -223,13 +223,15 @@ class TextReconstructionService:
 
     def _run(self) -> None:
         while not self._stop_event.is_set() and not self._shutdown_event.is_set():
+            should_stop = False
             try:
                 self.process_once(force_flush=False)
             except Exception as exc:
                 self.logger.exception("Text reconstruction failed: %s", exc)
             finally:
-                if self._stop_event.wait(self.poll_interval_seconds) or self._shutdown_event.is_set():
-                    break
+                should_stop = self._stop_event.wait(self.poll_interval_seconds) or self._shutdown_event.is_set()
+            if should_stop:
+                break
 
     def _log_segments(self, segments: list[TextSegment]) -> None:
         for segment in segments:

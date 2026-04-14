@@ -100,6 +100,9 @@ class ServiceRegistry:
             storage=storage,
             max_text_segments=self.config.max_text_segments_per_summary,
             max_screenshots=self.config.max_screenshots_per_summary,
+            dedup_enabled=self.config.screenshot_dedup_enabled,
+            dedup_threshold=self.config.screenshot_dedup_threshold,
+            min_keep_interval_seconds=self.config.screenshot_min_keep_interval_seconds,
         )
         lmstudio_client = LMStudioClient(
             base_url=self.config.lmstudio_base_url,

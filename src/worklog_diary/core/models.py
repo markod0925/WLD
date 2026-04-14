@@ -73,6 +73,8 @@ class ScreenshotRecord:
     process_name: str
     window_title: str
     active_interval_id: int | None
+    window_hwnd: int | None = None
+    fingerprint: str | None = None
 
 
 @dataclass(slots=True)

@@ -19,6 +19,7 @@ else:  # pragma: no cover - import success depends on environment
 
 from .models import ScreenshotRecord, SharedState
 from .privacy import PrivacyPolicyEngine
+from .screenshot_dedup import compute_screenshot_fingerprint
 from .storage import SQLiteStorage
 from .window_tracker import get_foreground_window_info, get_window_capture_rect
 
@@ -133,6 +134,7 @@ class ScreenshotCaptureService:
                 return False
 
             image = sct.grab(capture_region)
+            fingerprint = compute_screenshot_fingerprint(image.rgb, image.size)
             mss.tools.to_png(image.rgb, image.size, output=str(file_path))
 
         record = ScreenshotRecord(
@@ -142,6 +144,8 @@ class ScreenshotCaptureService:
             process_name=current_info.process_name,
             window_title=current_info.window_title,
             active_interval_id=snapshot.active_interval_id,
+            window_hwnd=current_info.hwnd,
+            fingerprint=fingerprint,
         )
         self.storage.insert_screenshot(record)
         self.logger.info(
@@ -156,13 +160,15 @@ class ScreenshotCaptureService:
 
     def _run(self) -> None:
         while not self._stop_event.is_set() and not self._shutdown_event.is_set():
+            should_stop = False
             try:
                 self.capture_once()
             except Exception as exc:
                 self.logger.exception("Screenshot capture failed: %s", exc)
             finally:
-                if self._stop_event.wait(self.interval_seconds) or self._shutdown_event.is_set():
-                    break
+                should_stop = self._stop_event.wait(self.interval_seconds) or self._shutdown_event.is_set()
+            if should_stop:
+                break
 
 
 

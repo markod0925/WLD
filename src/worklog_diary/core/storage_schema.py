@@ -69,6 +69,8 @@ class StorageSchemaManager:
             process_name TEXT NOT NULL,
             window_title TEXT NOT NULL,
             active_interval_id INTEGER,
+            window_hwnd INTEGER,
+            fingerprint TEXT,
             FOREIGN KEY(active_interval_id) REFERENCES active_intervals(id)
         );
 
@@ -117,6 +119,7 @@ class StorageSchemaManager:
             journal_mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
             self._conn.executescript(schema)
             self.ensure_daily_summaries_schema()
+            self.ensure_screenshots_schema()
             self._conn.commit()
 
         if journal_mode is not None:
@@ -198,6 +201,22 @@ class StorageSchemaManager:
             self._conn.execute(
                 "ALTER TABLE daily_summaries ADD COLUMN source_batch_count INTEGER NOT NULL DEFAULT 0"
             )
+
+    def ensure_screenshots_schema(self) -> None:
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'screenshots'"
+        ).fetchone()
+        if row is None:
+            return
+
+        columns = {
+            str(item["name"])
+            for item in self._conn.execute("PRAGMA table_info(screenshots)").fetchall()
+        }
+        if "window_hwnd" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN window_hwnd INTEGER")
+        if "fingerprint" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN fingerprint TEXT")
 
     def _log_db_query_timing(self, operation: str, started_at: float, *, rows: int | None = None) -> None:
         duration_ms = (time.perf_counter() - started_at) * 1000.0

@@ -64,6 +64,7 @@ class ForegroundWindowTrackerService:
 
     def _run(self) -> None:
         while not self._stop_event.is_set() and not self._shutdown_event.is_set():
+            should_stop = False
             try:
                 snapshot = self.state.snapshot()
                 if not snapshot.monitoring_active:
@@ -115,8 +116,9 @@ class ForegroundWindowTrackerService:
             except Exception as exc:
                 self.logger.exception("Foreground tracker loop error: %s", exc)
             finally:
-                if self._stop_event.wait(self.poll_interval_seconds) or self._shutdown_event.is_set():
-                    break
+                should_stop = self._stop_event.wait(self.poll_interval_seconds) or self._shutdown_event.is_set()
+            if should_stop:
+                break
 
     def _close_current_interval_if_needed(self, end_ts: float | None = None) -> None:
         if self._current_interval_id is None:

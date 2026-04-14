@@ -11,7 +11,7 @@ from typing import Any
 
 DEFAULT_BLOCKED_PROCESSES = ["chrome.exe", "msedge.exe", "webex.exe", "lm studio.exe"]
 SUPPORTED_CAPTURE_MODES = {"full_screen", "active_window"}
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +40,9 @@ class AppConfig:
     max_text_segments_per_summary: int = 400
     max_parallel_summary_jobs: int = 2
     request_timeout_seconds: int = 600
+    screenshot_dedup_enabled: bool = True
+    screenshot_dedup_threshold: int = 6
+    screenshot_min_keep_interval_seconds: int = 120
 
     def normalize(self) -> None:
         if not self.app_data_dir:
@@ -61,6 +64,9 @@ class AppConfig:
         self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "active_window"
 
         self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
+        self.screenshot_dedup_enabled = bool(self.screenshot_dedup_enabled)
+        self.screenshot_dedup_threshold = max(0, min(64, int(self.screenshot_dedup_threshold)))
+        self.screenshot_min_keep_interval_seconds = max(0, int(self.screenshot_min_keep_interval_seconds))
         self.config_version = CONFIG_VERSION
 
     @classmethod
@@ -193,6 +199,9 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "max_text_segments_per_summary": _coerce_int,
         "max_parallel_summary_jobs": _coerce_int,
         "request_timeout_seconds": _coerce_int,
+        "screenshot_dedup_enabled": _coerce_bool,
+        "screenshot_dedup_threshold": _coerce_int,
+        "screenshot_min_keep_interval_seconds": _coerce_int,
     }
 
     for field_name, converter in converters.items():

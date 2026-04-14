@@ -133,6 +133,9 @@ class MonitoringServices:
         self.text_reconstructor.inactivity_gap_seconds = self.config.text_inactivity_gap_seconds
         self.batch_builder.max_text_segments = self.config.max_text_segments_per_summary
         self.batch_builder.max_screenshots = self.config.max_screenshots_per_summary
+        self.batch_builder.dedup_enabled = self.config.screenshot_dedup_enabled
+        self.batch_builder.dedup_threshold = self.config.screenshot_dedup_threshold
+        self.batch_builder.min_keep_interval_seconds = self.config.screenshot_min_keep_interval_seconds
         self.lmstudio_client.base_url = self.config.lmstudio_base_url.rstrip("/")
         self.lmstudio_client.model = self.config.lmstudio_model
         self.lmstudio_client.timeout_seconds = self.config.request_timeout_seconds

@@ -11,6 +11,7 @@ WorkLog Diary is a local-first Windows desktop tray app that captures work conte
 - Tracks the active foreground window and process over time intervals.
 - Captures screenshots on a configurable interval.
 - Supports `full_screen` and `active_window` screenshot capture modes.
+- Filters near-duplicate screenshots before summary generation so batches stay more informative.
 - Captures raw global keyboard events.
 - Reconstructs useful text segments from key events.
 - Automatically pauses monitoring when the Windows session is locked, then resumes after unlock.
@@ -159,6 +160,9 @@ Important fields:
 - `max_parallel_summary_jobs`: concurrent summary worker limit (default `2`)
 - `max_text_segments_per_summary`
 - `max_screenshots_per_summary`
+- `screenshot_dedup_enabled`
+- `screenshot_dedup_threshold`
+- `screenshot_min_keep_interval_seconds`
 - `lmstudio_base_url`
 - `lmstudio_model`
 - `log_dir`
@@ -176,6 +180,25 @@ Active-window mode handles common edge cases:
 - Minimized window: skip screenshot.
 - Partially off-screen window: crop to visible region.
 - Blocked app: still skips screenshot entirely.
+
+### Screenshot deduplication
+
+Screenshot capture still runs on the normal interval, but summary batches prefer visually distinct images.
+
+The default behavior is conservative:
+
+- `screenshot_dedup_enabled`: `true`
+- `screenshot_dedup_threshold`: `6`
+- `screenshot_min_keep_interval_seconds`: `120`
+
+The batch builder keeps a screenshot when:
+
+- the active window changes,
+- the window title changes,
+- the visual fingerprint differs enough,
+- enough time has passed since the last kept screenshot.
+
+This is a selection-time filter only. Screenshots are still captured normally and stored in SQLite.
 
 ## Flush behavior and backlog draining
 

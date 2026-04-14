@@ -21,5 +21,8 @@
   "max_screenshots_per_summary": 3,
   "max_text_segments_per_summary": 400,
   "max_parallel_summary_jobs": 2,
-  "request_timeout_seconds": 600
+  "request_timeout_seconds": 600,
+  "screenshot_dedup_enabled": true,
+  "screenshot_dedup_threshold": 6,
+  "screenshot_min_keep_interval_seconds": 120
 }

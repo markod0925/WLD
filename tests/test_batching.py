@@ -36,6 +36,27 @@ class FakeActivityRepository:
         return self._summaries[:limit]
 
 
+def _screenshot(
+    *,
+    ts: float,
+    fingerprint: str,
+    window_title: str = "A",
+    process_name: str = "a.exe",
+    window_hwnd: int = 1,
+    active_interval_id: int | None = 1,
+) -> ScreenshotRecord:
+    return ScreenshotRecord(
+        id=None,
+        ts=ts,
+        file_path=f"shot-{ts}.png",
+        process_name=process_name,
+        window_title=window_title,
+        active_interval_id=active_interval_id,
+        window_hwnd=window_hwnd,
+        fingerprint=fingerprint,
+    )
+
+
 
 def test_pending_data_grouped_correctly() -> None:
     intervals = [
@@ -161,3 +182,74 @@ def test_batch_builder_expands_text_limit_after_excluding_ranges() -> None:
     assert batch is not None
     assert len(batch.text_segments) == 1
     assert batch.text_segments[0].id == 2
+
+
+def test_batch_builder_filters_consecutive_identical_screenshots() -> None:
+    repo = FakeActivityRepository(
+        intervals=[],
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[
+            _screenshot(ts=10.0, fingerprint="ffffffffffffffff"),
+            _screenshot(ts=20.0, fingerprint="ffffffffffffffff"),
+            _screenshot(ts=30.0, fingerprint="ffffffffffffffff"),
+        ],
+    )
+
+    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+
+    assert batch is not None
+    assert len(batch.screenshots) == 1
+    assert batch.screenshots[0].ts == 10.0
+
+
+def test_batch_builder_keeps_visually_distinct_screenshots() -> None:
+    repo = FakeActivityRepository(
+        intervals=[],
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[
+            _screenshot(ts=10.0, fingerprint="0000000000000000"),
+            _screenshot(ts=11.0, fingerprint="ffffffffffffffff"),
+        ],
+    )
+
+    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+
+    assert batch is not None
+    assert len(batch.screenshots) == 2
+
+
+def test_batch_builder_keeps_screenshots_when_window_title_changes() -> None:
+    repo = FakeActivityRepository(
+        intervals=[],
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[
+            _screenshot(ts=10.0, fingerprint="1234567890abcdef", window_title="Editor"),
+            _screenshot(ts=11.0, fingerprint="1234567890abcdef", window_title="Settings"),
+        ],
+    )
+
+    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+
+    assert batch is not None
+    assert len(batch.screenshots) == 2
+    assert [item.window_title for item in batch.screenshots] == ["Editor", "Settings"]
+
+
+def test_batch_builder_respects_max_screenshot_count_after_dedup() -> None:
+    repo = FakeActivityRepository(
+        intervals=[],
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[
+            _screenshot(ts=float(index), fingerprint=f"{index:016x}", window_hwnd=index)
+            for index in range(10)
+        ],
+    )
+
+    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+
+    assert batch is not None
+    assert len(batch.screenshots) == 3

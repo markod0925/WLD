@@ -296,8 +296,10 @@ class SQLiteStorage(ActivityRepository):
         with self._lock:
             cursor = self._conn.execute(
                 """
-                INSERT INTO screenshots(ts, file_path, process_name, window_title, active_interval_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO screenshots(
+                    ts, file_path, process_name, window_title, active_interval_id, window_hwnd, fingerprint
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     screenshot.ts,
@@ -305,6 +307,8 @@ class SQLiteStorage(ActivityRepository):
                     screenshot.process_name,
                     screenshot.window_title,
                     screenshot.active_interval_id,
+                    screenshot.window_hwnd,
+                    screenshot.fingerprint,
                 ),
             )
             self._conn.commit()
@@ -318,7 +322,7 @@ class SQLiteStorage(ActivityRepository):
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, ts, file_path, process_name, window_title, active_interval_id
+                SELECT id, ts, file_path, process_name, window_title, active_interval_id, window_hwnd, fingerprint
                 FROM screenshots
                 ORDER BY ts ASC
                 LIMIT ?
@@ -334,6 +338,8 @@ class SQLiteStorage(ActivityRepository):
                 process_name=str(row["process_name"]),
                 window_title=str(row["window_title"]),
                 active_interval_id=int(row["active_interval_id"]) if row["active_interval_id"] is not None else None,
+                window_hwnd=int(row["window_hwnd"]) if row["window_hwnd"] is not None else None,
+                fingerprint=str(row["fingerprint"]) if row["fingerprint"] is not None else None,
             )
             for row in rows
         ]

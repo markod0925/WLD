@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .activity_repository import ActivityRepository
 from .models import ActiveInterval, BlockedInterval, ScreenshotRecord, TextSegment
+from .screenshot_dedup import select_representative_screenshots
 
 
 @dataclass(slots=True)
@@ -72,17 +73,27 @@ class BatchBuilder:
         storage: ActivityRepository,
         max_text_segments: int = 400,
         max_screenshots: int = 3,
+        dedup_enabled: bool = True,
+        dedup_threshold: int = 6,
+        min_keep_interval_seconds: float = 120.0,
     ) -> None:
         self.storage = storage
         self.max_text_segments = max_text_segments
         self.max_screenshots = max_screenshots
+        self.dedup_enabled = bool(dedup_enabled)
+        self.dedup_threshold = max(0, int(dedup_threshold))
+        self.min_keep_interval_seconds = max(0.0, float(min_keep_interval_seconds))
 
     def build_pending_batch(self, excluded_ranges: list[tuple[float, float]] | None = None) -> SummaryBatch | None:
         intervals = self.storage.fetch_unsummarized_intervals()
         blocked_intervals = self.storage.fetch_unsummarized_blocked_intervals()
 
         text_limit = self._expanded_fetch_limit(self.max_text_segments, excluded_ranges)
-        screenshot_limit = self._expanded_fetch_limit(self.max_screenshots, excluded_ranges)
+        screenshot_limit = self._expanded_fetch_limit(
+            self.max_screenshots,
+            excluded_ranges,
+            multiplier=self._screenshot_fetch_multiplier(),
+        )
 
         text_segments = self.storage.fetch_unsummarized_text_segments(limit=text_limit)
         screenshots = self.storage.fetch_unsummarized_screenshots(limit=screenshot_limit)
@@ -102,6 +113,14 @@ class BatchBuilder:
                 item for item in text_segments if not _overlaps_any_range(item.start_ts, item.end_ts, excluded_ranges)
             ]
             screenshots = [item for item in screenshots if not _overlaps_any_range(item.ts, item.ts, excluded_ranges)]
+
+        screenshots = select_representative_screenshots(
+            screenshots,
+            max_screenshots=self.max_screenshots,
+            dedup_enabled=self.dedup_enabled,
+            dedup_threshold=self.dedup_threshold,
+            min_keep_interval_seconds=self.min_keep_interval_seconds,
+        )
 
         safe_end = _compute_safe_end_boundary(
             text_segments=text_segments,
@@ -123,12 +142,20 @@ class BatchBuilder:
         )
 
     @staticmethod
-    def _expanded_fetch_limit(base_limit: int, excluded_ranges: list[tuple[float, float]] | None) -> int:
+    def _expanded_fetch_limit(
+        base_limit: int,
+        excluded_ranges: list[tuple[float, float]] | None,
+        *,
+        multiplier: int = 1,
+    ) -> int:
         if base_limit <= 0:
             return 0
         if not excluded_ranges:
-            return base_limit
-        return base_limit * (len(excluded_ranges) + 1)
+            return base_limit * max(1, multiplier)
+        return base_limit * (len(excluded_ranges) + 1) * max(1, multiplier)
+
+    def _screenshot_fetch_multiplier(self) -> int:
+        return 5 if self.dedup_enabled else 1
 
 
 

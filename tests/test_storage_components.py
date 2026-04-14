@@ -52,6 +52,32 @@ def test_storage_cleanup_service_purges_screenshot_files(tmp_path: Path) -> None
         storage.close()
 
 
+def test_storage_roundtrip_persists_screenshot_metadata(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    try:
+        screenshot_id = storage.insert_screenshot(
+            ScreenshotRecord(
+                id=None,
+                ts=10.0,
+                file_path="shot.png",
+                process_name="code.exe",
+                window_title="Editor",
+                active_interval_id=42,
+                window_hwnd=100,
+                fingerprint="0123456789abcdef",
+            )
+        )
+
+        screenshots = storage.fetch_unsummarized_screenshots()
+
+        assert screenshot_id > 0
+        assert len(screenshots) == 1
+        assert screenshots[0].window_hwnd == 100
+        assert screenshots[0].fingerprint == "0123456789abcdef"
+    finally:
+        storage.close()
+
+
 def test_storage_cleanup_service_compares_paths_case_insensitively(
     tmp_path: Path, monkeypatch
 ) -> None:
