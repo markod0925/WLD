@@ -82,6 +82,12 @@ def is_frozen_executable() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def native_hooks_disabled() -> bool:
+    if os.environ.get("WORKLOG_DIARY_DISABLE_NATIVE_HOOKS") == "1":
+        return True
+    return "PYTEST_CURRENT_TEST" in os.environ
+
+
 def app_data_dir_source() -> str:
     if os.environ.get("WORKLOG_DIARY_APP_DATA_DIR"):
         return "WORKLOG_DIARY_APP_DATA_DIR"

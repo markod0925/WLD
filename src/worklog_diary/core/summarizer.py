@@ -95,7 +95,7 @@ class Summarizer:
                 self.logger.info(
                     (
                         "event=summary_job_queued job_id=%s reason=%s start_ts=%.3f end_ts=%.3f "
-                        "intervals=%s blocked_intervals=%s text_segments=%s screenshots=%s"
+                        "intervals=%s blocked_intervals=%s text_segments=%s screenshots=%s queue_size=%s"
                     ),
                     job_id,
                     reason,
@@ -105,6 +105,7 @@ class Summarizer:
                     len(batch.blocked_intervals),
                     len(batch.text_segments),
                     len(batch.screenshots),
+                    len(self._queue),
                 )
 
             if created:
@@ -195,6 +196,12 @@ class Summarizer:
                 if self._queue:
                     queued_job = self._queue.popleft()
                     self._running_jobs.add(queued_job.job_id)
+                    self.logger.info(
+                        "event=summary_job_dequeued job_id=%s queue_size=%s running_jobs=%s",
+                        queued_job.job_id,
+                        len(self._queue),
+                        len(self._running_jobs),
+                    )
 
             if queued_job is None:
                 continue
@@ -211,7 +218,7 @@ class Summarizer:
         self.logger.info(
             (
                 "event=summary_job_started job_id=%s reason=%s start_ts=%.3f end_ts=%.3f "
-                "intervals=%s blocked_intervals=%s text_segments=%s screenshots=%s"
+                "intervals=%s blocked_intervals=%s text_segments=%s screenshots=%s queue_size=%s"
             ),
             job_id,
             reason,
@@ -221,6 +228,7 @@ class Summarizer:
             len(batch.blocked_intervals),
             len(batch.text_segments),
             len(batch.screenshots),
+            len(self._queue),
         )
         try:
             summary_text, summary_json = self.lm_client.summarize_batch(batch)

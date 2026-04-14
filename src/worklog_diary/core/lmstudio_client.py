@@ -24,6 +24,7 @@ class LMStudioClient:
 
     def summarize_batch(self, batch: SummaryBatch) -> tuple[str, dict[str, Any]]:
         prompt_text = _build_summary_prompt(batch)
+        prompt_size_bytes = len(prompt_text.encode("utf-8"))
 
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
         for screenshot in batch.screenshots:
@@ -51,10 +52,11 @@ class LMStudioClient:
                 {"role": "user", "content": user_content},
             ],
         }
+        payload_size_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         self.logger.info(
             (
                 "event=lmstudio_request model=%s base_url=%s start_ts=%.3f end_ts=%.3f "
-                "text_segments=%s screenshots=%s payload_content_type=%s"
+                "text_segments=%s screenshots=%s payload_content_type=%s prompt_size_bytes=%s payload_size_bytes=%s"
             ),
             self.model,
             self.base_url,
@@ -63,6 +65,8 @@ class LMStudioClient:
             len(batch.text_segments),
             len(batch.screenshots),
             "multimodal" if isinstance(user_content, list) else "text",
+            prompt_size_bytes,
+            payload_size_bytes,
         )
 
         data = self._post_chat_completion(payload)
@@ -74,6 +78,7 @@ class LMStudioClient:
 
     def summarize_daily_recap(self, day: date, summaries: list[SummaryRecord]) -> tuple[str, dict[str, Any]]:
         prompt_text = _build_daily_recap_prompt(day=day, summaries=summaries)
+        prompt_size_bytes = len(prompt_text.encode("utf-8"))
         payload = {
             "model": self.model,
             "temperature": 0.2,
@@ -88,13 +93,16 @@ class LMStudioClient:
                 {"role": "user", "content": prompt_text},
             ],
         }
+        payload_size_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
         self.logger.info(
-            "event=lmstudio_daily_recap_request model=%s base_url=%s day=%s source_summaries=%s",
+            "event=lmstudio_daily_recap_request model=%s base_url=%s day=%s source_summaries=%s prompt_size_bytes=%s payload_size_bytes=%s",
             self.model,
             self.base_url,
             day.isoformat(),
             len(summaries),
+            prompt_size_bytes,
+            payload_size_bytes,
         )
         data = self._post_chat_completion(payload)
         text_content = self._extract_message_content(data)

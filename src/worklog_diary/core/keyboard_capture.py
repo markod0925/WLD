@@ -6,6 +6,7 @@ import time
 from typing import Any
 from collections.abc import Callable
 
+from .config import native_hooks_disabled
 from .models import KeyEvent, SharedState
 from .privacy import PrivacyPolicyEngine
 from .storage import SQLiteStorage
@@ -32,6 +33,9 @@ class KeyboardCaptureService:
 
     def start(self) -> None:
         if self._listener is not None:
+            return
+        if native_hooks_disabled():
+            self.logger.info("Keyboard capture disabled in test/native-hook-off mode")
             return
         try:
             from pynput import keyboard

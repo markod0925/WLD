@@ -6,6 +6,8 @@ import threading
 import uuid
 from collections.abc import Callable
 
+from .config import native_hooks_disabled
+
 
 class SessionMonitor:
     def __init__(
@@ -30,6 +32,9 @@ class SessionMonitor:
         if os.name != "nt":
             return
         if self._thread and self._thread.is_alive():
+            return
+        if native_hooks_disabled():
+            self.logger.info("Session monitor disabled in test/native-hook-off mode")
             return
 
         self._startup_event.clear()

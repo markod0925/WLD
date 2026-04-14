@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from worklog_diary.core.config import native_hooks_disabled
 from worklog_diary.core.keyboard_capture import KeyboardCaptureService
 from worklog_diary.core.models import ForegroundInfo, SharedState
 from worklog_diary.core.privacy import PrivacyPolicyEngine
+from worklog_diary.core.session_monitor import SessionMonitor
 from worklog_diary.core.screenshot_capture import ScreenshotCaptureService
 from worklog_diary.core.storage import SQLiteStorage
 
@@ -58,3 +60,23 @@ def test_blocked_app_never_creates_screenshots_even_if_state_is_stale(tmp_path: 
     assert storage.get_diagnostics_snapshot()["table_counts"]["screenshots"] == 0
     storage.close()
 
+
+def test_native_hooks_can_be_disabled_explicitly(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("WORKLOG_DIARY_DISABLE_NATIVE_HOOKS", "1")
+
+    storage = SQLiteStorage(str(tmp_path / "test.db"))
+    state = SharedState()
+    service = KeyboardCaptureService(
+        storage=storage,
+        state=state,
+        privacy=PrivacyPolicyEngine(set()),
+    )
+
+    monitor = SessionMonitor(on_locked=lambda: None, on_unlocked=lambda: None)
+
+    assert native_hooks_disabled() is True
+    service.start()
+    monitor.start()
+    assert service._listener is None
+    assert monitor._thread is None
+    storage.close()

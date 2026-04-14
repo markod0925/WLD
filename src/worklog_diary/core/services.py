@@ -235,6 +235,7 @@ class MonitoringServices:
             self._flush_lock.release()
             return None
 
+        flush_started_at = time.perf_counter()
         self._drain_cancel_event.clear()
         self.summarizer.clear_unrecoverable_error()
         start_counts = self.storage.get_summary_job_status_counts()
@@ -313,13 +314,15 @@ class MonitoringServices:
                 )
                 if result.stop_reason != "error":
                     self.error_notifier.resolve("flush_failure")
+                duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
                 self.logger.info(
                     (
-                        "event=summary_drain_finished reason=%s stop_reason=%s created=%s failed=%s cancelled=%s "
-                        "pending_summary_jobs=%s"
+                        "event=summary_drain_finished reason=%s stop_reason=%s duration_ms=%.3f created=%s failed=%s "
+                        "cancelled=%s pending_summary_jobs=%s"
                     ),
                     reason,
                     result.stop_reason,
+                    duration_ms,
                     result.summaries_created,
                     result.failed_jobs,
                     result.cancelled_jobs,
@@ -332,7 +335,13 @@ class MonitoringServices:
                     "Flush failed: Unable to complete the flush. Check LM Studio and try again.",
                     key=f"{reason}|{exc.__class__.__name__}",
                 )
+                duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
                 self.logger.exception("event=summary_drain_failed reason=%s error=%s", reason, exc)
+                self.logger.info(
+                    "event=summary_drain_duration reason=%s stop_reason=error duration_ms=%.3f",
+                    reason,
+                    duration_ms,
+                )
                 return FlushDrainResult(
                     stop_reason="error",
                     summaries_created=0,
