@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from worklog_diary.core.models import ForegroundInfo, TextSegment
 from worklog_diary.core.storage import SQLiteStorage
 from worklog_diary.core.models import ScreenshotRecord
 import worklog_diary.core.storage_cleanup as storage_cleanup_module
@@ -78,3 +79,45 @@ def test_storage_cleanup_service_compares_paths_case_insensitively(
         assert actual_path.exists()
     finally:
         storage.close()
+
+
+def test_storage_roundtrip_persists_counts_across_reopen(tmp_path: Path) -> None:
+    db_path = tmp_path / "worklog.db"
+    storage = SQLiteStorage(str(db_path))
+    info = ForegroundInfo(
+        timestamp=10.0,
+        hwnd=50,
+        pid=60,
+        process_name="code.exe",
+        window_title="Editor",
+    )
+    try:
+        interval_id = storage.start_interval(info, blocked=False)
+        storage.close_interval(interval_id, end_ts=20.0)
+        storage.insert_text_segments(
+            [
+                TextSegment(
+                    id=None,
+                    start_ts=12.0,
+                    end_ts=13.0,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="hello",
+                    hotkeys=[],
+                    raw_key_count=1,
+                )
+            ]
+        )
+        storage.create_summary_job(start_ts=10.0, end_ts=20.0, status="running")
+    finally:
+        storage.close()
+
+    reopened = SQLiteStorage(str(db_path))
+    try:
+        diagnostics = reopened.get_diagnostics_snapshot()
+        assert diagnostics["table_counts"]["active_intervals"] == 1
+        assert diagnostics["table_counts"]["text_segments"] == 1
+        assert diagnostics["summary_jobs"]["running"] == 0
+        assert diagnostics["summary_jobs"]["failed"] == 1
+    finally:
+        reopened.close()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from worklog_diary.core.config import AppConfig
-from worklog_diary.core.models import TextSegment
+from worklog_diary.core.models import ForegroundInfo, KeyEvent, ScreenshotRecord, TextSegment
 from worklog_diary.core.services import MonitoringServices
 
 
@@ -93,5 +93,62 @@ def test_flush_now_drains_until_buffer_is_empty(tmp_path: Path) -> None:
         jobs = services.storage.get_summary_job_status_counts()
         assert jobs["succeeded"] == 3
         assert jobs["failed"] == 0
+    finally:
+        services.shutdown()
+
+
+def test_flush_now_runs_full_pipeline_on_real_sqlite(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    services.summarizer.lm_client = SuccessfulClient()
+    shot_path = Path(services.config.screenshot_dir) / "shot.png"
+    shot_path.parent.mkdir(parents=True, exist_ok=True)
+    shot_path.write_bytes(b"fake-image")
+
+    try:
+        info = ForegroundInfo(
+            timestamp=10.0,
+            hwnd=11,
+            pid=12,
+            process_name="code.exe",
+            window_title="Editor",
+        )
+        interval_id = services.storage.start_interval(info, blocked=False)
+        services.state.update_foreground(info, blocked=False, active_interval_id=interval_id)
+        services.storage.insert_key_event(
+            KeyEvent(
+                id=None,
+                ts=11.0,
+                key="a",
+                event_type="down",
+                modifiers=[],
+                process_name="code.exe",
+                window_title="Editor",
+                hwnd=11,
+                active_interval_id=interval_id,
+                processed=False,
+            )
+        )
+        services.storage.insert_screenshot(
+            ScreenshotRecord(
+                id=None,
+                ts=12.0,
+                file_path=str(shot_path),
+                process_name="code.exe",
+                window_title="Editor",
+                active_interval_id=interval_id,
+            )
+        )
+        services.storage.close_interval(interval_id, end_ts=13.0)
+
+        result = services.flush_now(reason="integration")
+
+        assert result is not None
+        assert result.stop_reason == "empty"
+        assert result.summaries_created >= 1
+        assert services.storage.get_pending_counts()["text_segments"] == 0
+        assert services.storage.get_pending_counts()["screenshots"] == 0
+        assert services.storage.get_pending_counts()["intervals"] == 0
+        assert services.storage.get_summary_job_status_counts()["succeeded"] == result.summaries_created
+        assert not shot_path.exists()
     finally:
         services.shutdown()

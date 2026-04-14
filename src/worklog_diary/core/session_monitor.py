@@ -11,6 +11,9 @@ from ctypes import wintypes
 
 from .config import native_hooks_disabled
 
+WTS_SESSION_LOCK = 0x7
+WTS_SESSION_UNLOCK = 0x8
+
 
 class SessionMonitor:
     """Listen for Windows session lock and unlock events on a background thread."""
@@ -78,8 +81,6 @@ class SessionMonitor:
         wtsapi32 = ctypes.windll.wtsapi32
 
         WM_WTSSESSION_CHANGE = 0x02B1
-        WTS_SESSION_LOCK = 0x7
-        WTS_SESSION_UNLOCK = 0x8
         NOTIFY_FOR_THIS_SESSION = 0
         WM_CLOSE = 0x0010
         WM_DESTROY = 0x0002
@@ -126,13 +127,7 @@ class SessionMonitor:
 
         def wnd_proc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
             if msg == WM_WTSSESSION_CHANGE:
-                code = int(wparam)
-                if code == WTS_SESSION_LOCK:
-                    self.logger.info("event=session_locked")
-                    self._safe_invoke(self.on_locked)
-                elif code == WTS_SESSION_UNLOCK:
-                    self.logger.info("event=session_unlocked")
-                    self._safe_invoke(self.on_unlocked)
+                self._handle_session_change_code(int(wparam))
                 return 0
             if msg == WM_CLOSE:
                 user32.DestroyWindow(hwnd)
@@ -218,3 +213,11 @@ class SessionMonitor:
             callback()
         except Exception as exc:
             self.logger.exception("event=session_monitor_callback_failed error=%s", exc)
+
+    def _handle_session_change_code(self, code: int) -> None:
+        if code == WTS_SESSION_LOCK:
+            self.logger.info("event=session_locked")
+            self._safe_invoke(self.on_locked)
+        elif code == WTS_SESSION_UNLOCK:
+            self.logger.info("event=session_unlocked")
+            self._safe_invoke(self.on_unlocked)

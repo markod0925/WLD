@@ -144,6 +144,22 @@ def test_lmstudio_client_falls_back_after_malformed_responses(monkeypatch: pytes
     assert parsed["blocked_activity"] == []
 
 
+def test_lmstudio_client_falls_back_on_non_object_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    responses = iter([FakeResponse("[1, 2, 3]"), FakeResponse("[1, 2, 3]")])
+
+    def fake_post(*_args: object, **_kwargs: object) -> FakeResponse:
+        return next(responses)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    summary_text, parsed = client.summarize_batch(_summary_batch())
+
+    assert summary_text == "[1, 2, 3]"
+    assert parsed["metadata"]["parse_status"] == "fallback"
+    assert "JSON object" in parsed["metadata"]["parse_error"]
+
+
 def test_lmstudio_client_daily_recap_uses_structured_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
     response = FakeResponse('{"summary_text":"daily recap","key_points":["one"],"blocked_activity":[],"metadata":{}}')
