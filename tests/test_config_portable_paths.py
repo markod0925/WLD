@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import worklog_diary.core.config as config_module
@@ -43,3 +44,37 @@ def test_load_config_in_frozen_mode_creates_portable_data_tree(tmp_path: Path, m
     assert Path(cfg.db_path).parent.exists()
     assert Path(cfg.screenshot_dir).exists()
     assert Path(cfg.log_dir).exists()
+
+
+def test_load_config_migrates_version_and_warns_about_unknown_fields(
+    tmp_path: Path, caplog
+) -> None:
+    config_path = tmp_path / "config.json"
+    payload = config_module.AppConfig().to_dict()
+    payload.pop("config_version", None)
+    payload["unexpected_field"] = "ignored"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    caplog.clear()
+    cfg = config_module.load_config(config_path)
+
+    assert cfg.config_version == config_module.CONFIG_VERSION
+    assert any("event=config_unknown_fields" in record.message for record in caplog.records)
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["config_version"] == config_module.CONFIG_VERSION
+    assert "unexpected_field" not in saved
+
+
+def test_load_config_rejects_future_config_version(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    payload = config_module.AppConfig().to_dict()
+    payload["config_version"] = config_module.CONFIG_VERSION + 1
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    try:
+        config_module.load_config(config_path)
+    except ValueError as exc:
+        assert "Unsupported config_version" in str(exc)
+    else:
+        raise AssertionError("load_config() should reject future config versions")

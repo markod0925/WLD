@@ -149,7 +149,7 @@ class SettingsWindow(QWidget):
             return
 
         data = self.services.config.to_dict()
-        cfg = AppConfig(**data)
+        cfg = AppConfig.from_dict(data)
         cfg.blocked_processes = blocked
         cfg.screenshot_interval_seconds = int(self.screenshot_interval.value())
         cfg.capture_mode = self.capture_mode.currentText().strip().lower()

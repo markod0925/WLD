@@ -27,7 +27,7 @@ def _config_for_tmp(tmp_path: Path, **overrides: object) -> AppConfig:
         }
     )
     data.update(overrides)
-    return AppConfig(**data)
+    return AppConfig.from_dict(data)
 
 
 

@@ -22,7 +22,7 @@ def _config_for_tmp(tmp_path: Path, **overrides: object) -> AppConfig:
         }
     )
     data.update(overrides)
-    return AppConfig(**data)
+    return AppConfig.from_dict(data)
 
 
 def test_lock_then_unlock_transitions_back_to_monitoring(tmp_path: Path) -> None:
