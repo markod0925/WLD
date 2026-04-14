@@ -89,3 +89,35 @@ def test_summary_dispatch_respects_max_parallel_jobs(tmp_path: Path) -> None:
     finally:
         summarizer.stop()
         storage.close()
+
+
+def test_summary_worker_pool_shrinks_and_stops_cleanly(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    _seed_segments(storage, count=4)
+
+    client = SlowClient()
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage, max_text_segments=1, max_screenshots=1),
+        lm_client=client,
+        max_parallel_jobs=2,
+    )
+
+    try:
+        assert summarizer.dispatch_pending_jobs(reason="test") == 2
+        _wait_for_running_jobs(summarizer, expected=2)
+
+        summarizer.update_max_parallel_jobs(1)
+        assert summarizer.get_runtime_status()["max_parallel_summary_jobs"] == 1
+        assert len(summarizer._workers) == 1
+
+        client.release.set()
+        assert summarizer.wait_for_idle(timeout_seconds=5.0)
+
+        _seed_segments(storage, count=2)
+        assert summarizer.dispatch_pending_jobs(reason="test") == 1
+        assert summarizer.wait_for_idle(timeout_seconds=5.0)
+    finally:
+        summarizer.stop()
+        assert not any(thread.name.startswith("SummaryWorker-") for thread in threading.enumerate())
+        storage.close()

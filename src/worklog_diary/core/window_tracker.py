@@ -31,6 +31,7 @@ class ForegroundWindowTrackerService:
         privacy: PrivacyPolicyEngine,
         state: SharedState,
         poll_interval_seconds: float,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         self.storage = storage
         self.privacy = privacy
@@ -38,6 +39,7 @@ class ForegroundWindowTrackerService:
         self.poll_interval_seconds = max(0.2, poll_interval_seconds)
         self.logger = logging.getLogger(__name__)
 
+        self._shutdown_event = shutdown_event or threading.Event()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._current_signature: tuple[int, int, str, str] | None = None
@@ -61,61 +63,60 @@ class ForegroundWindowTrackerService:
         self._close_current_interval_if_needed()
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._shutdown_event.is_set():
             try:
                 snapshot = self.state.snapshot()
                 if not snapshot.monitoring_active:
                     self._close_current_interval_if_needed()
-                    time.sleep(self.poll_interval_seconds)
-                    continue
+                else:
+                    info = get_foreground_window_info()
+                    blocked = self.privacy.is_blocked(info.process_name)
+                    signature = (info.hwnd, info.pid, info.process_name, info.window_title)
 
-                info = get_foreground_window_info()
-                blocked = self.privacy.is_blocked(info.process_name)
-                signature = (info.hwnd, info.pid, info.process_name, info.window_title)
+                    signature_changed = signature != self._current_signature
+                    blocked_changed = self._current_blocked is not None and blocked != self._current_blocked
+                    needs_new_interval = signature_changed or blocked_changed or self._current_interval_id is None
 
-                signature_changed = signature != self._current_signature
-                blocked_changed = self._current_blocked is not None and blocked != self._current_blocked
-                needs_new_interval = signature_changed or blocked_changed or self._current_interval_id is None
+                    if needs_new_interval:
+                        previous_signature = self._current_signature
+                        previous_blocked = self._current_blocked
+                        self._close_current_interval_if_needed(end_ts=info.timestamp)
+                        self._current_interval_id = self.storage.start_interval(info, blocked)
+                        self._current_signature = signature
+                        self._current_blocked = blocked
 
-                if needs_new_interval:
-                    previous_signature = self._current_signature
-                    previous_blocked = self._current_blocked
-                    self._close_current_interval_if_needed(end_ts=info.timestamp)
-                    self._current_interval_id = self.storage.start_interval(info, blocked)
-                    self._current_signature = signature
-                    self._current_blocked = blocked
+                        if signature_changed:
+                            self.logger.info(
+                                (
+                                    "event=foreground_window_change "
+                                    "from_process=%s from_title=%s to_process=%s to_title=%s hwnd=%s pid=%s blocked=%s"
+                                ),
+                                previous_signature[2] if previous_signature else "",
+                                previous_signature[3] if previous_signature else "",
+                                info.process_name,
+                                info.window_title,
+                                info.hwnd,
+                                info.pid,
+                                blocked,
+                            )
+                        if blocked_changed:
+                            self.logger.info(
+                                (
+                                    "event=privacy_block_transition "
+                                    "process=%s title=%s blocked=%s previous_blocked=%s"
+                                ),
+                                info.process_name,
+                                info.window_title,
+                                blocked,
+                                previous_blocked,
+                            )
 
-                    if signature_changed:
-                        self.logger.info(
-                            (
-                                "event=foreground_window_change "
-                                "from_process=%s from_title=%s to_process=%s to_title=%s hwnd=%s pid=%s blocked=%s"
-                            ),
-                            previous_signature[2] if previous_signature else "",
-                            previous_signature[3] if previous_signature else "",
-                            info.process_name,
-                            info.window_title,
-                            info.hwnd,
-                            info.pid,
-                            blocked,
-                        )
-                    if blocked_changed:
-                        self.logger.info(
-                            (
-                                "event=privacy_block_transition "
-                                "process=%s title=%s blocked=%s previous_blocked=%s"
-                            ),
-                            info.process_name,
-                            info.window_title,
-                            blocked,
-                            previous_blocked,
-                        )
-
-                self.state.update_foreground(info, blocked, self._current_interval_id)
+                    self.state.update_foreground(info, blocked, self._current_interval_id)
             except Exception as exc:
                 self.logger.exception("Foreground tracker loop error: %s", exc)
             finally:
-                time.sleep(self.poll_interval_seconds)
+                if self._stop_event.wait(self.poll_interval_seconds) or self._shutdown_event.is_set():
+                    break
 
     def _close_current_interval_if_needed(self, end_ts: float | None = None) -> None:
         if self._current_interval_id is None:

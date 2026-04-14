@@ -161,6 +161,7 @@ class TextReconstructionService:
         reconstructor: TextReconstructor,
         poll_interval_seconds: float = 2.0,
         state: SharedState | None = None,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         self.storage = storage
         self.reconstructor = reconstructor
@@ -168,6 +169,7 @@ class TextReconstructionService:
         self.state = state
         self.logger = logging.getLogger(__name__)
 
+        self._shutdown_event = shutdown_event or threading.Event()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -190,6 +192,8 @@ class TextReconstructionService:
         self.logger.info("Text reconstruction service stopped")
 
     def process_once(self, force_flush: bool = False) -> int:
+        if self._shutdown_event.is_set() and not force_flush:
+            return 0
         if not force_flush and self.state is not None and not self.state.snapshot().monitoring_active:
             return 0
 
@@ -218,13 +222,14 @@ class TextReconstructionService:
         return len(segments)
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._shutdown_event.is_set():
             try:
                 self.process_once(force_flush=False)
             except Exception as exc:
                 self.logger.exception("Text reconstruction failed: %s", exc)
             finally:
-                self._stop_event.wait(self.poll_interval_seconds)
+                if self._stop_event.wait(self.poll_interval_seconds) or self._shutdown_event.is_set():
+                    break
 
     def _log_segments(self, segments: list[TextSegment]) -> None:
         for segment in segments:

@@ -14,12 +14,14 @@ class FlushScheduler:
         interval_seconds: int,
         flush_callback: Callable[[str], object | None],
         state: SharedState,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         self.interval_seconds = max(30, interval_seconds)
         self.flush_callback = flush_callback
         self.state = state
         self.logger = logging.getLogger(__name__)
 
+        self._shutdown_event = shutdown_event or threading.Event()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -39,7 +41,7 @@ class FlushScheduler:
         next_run = time.time() + self.interval_seconds
         self.state.set_flush_times(last_flush_ts=self.state.snapshot().last_flush_ts, next_flush_ts=next_run)
 
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._shutdown_event.is_set():
             now = time.time()
             self.state.set_flush_times(last_flush_ts=self.state.snapshot().last_flush_ts, next_flush_ts=next_run)
 
@@ -52,4 +54,5 @@ class FlushScheduler:
                 next_run = time.time() + self.interval_seconds
                 self.state.set_flush_times(last_flush_ts=self.state.snapshot().last_flush_ts, next_flush_ts=next_run)
 
-            self._stop_event.wait(1)
+            if self._stop_event.wait(1) or self._shutdown_event.is_set():
+                break

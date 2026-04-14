@@ -25,6 +25,7 @@ class ScreenshotCaptureService:
         capture_mode: str = "active_window",
         foreground_provider: Callable[[], Any] = get_foreground_window_info,
         window_rect_provider: Callable[[int], tuple[int, int, int, int] | None] = get_window_capture_rect,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         self.storage = storage
         self.state = state
@@ -37,6 +38,7 @@ class ScreenshotCaptureService:
         self.logger = logging.getLogger(__name__)
         self._capture_backend_missing_logged = False
 
+        self._shutdown_event = shutdown_event or threading.Event()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -145,13 +147,14 @@ class ScreenshotCaptureService:
         return True
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._shutdown_event.is_set():
             try:
                 self.capture_once()
             except Exception as exc:
                 self.logger.exception("Screenshot capture failed: %s", exc)
             finally:
-                self._stop_event.wait(self.interval_seconds)
+                if self._stop_event.wait(self.interval_seconds) or self._shutdown_event.is_set():
+                    break
 
 
 

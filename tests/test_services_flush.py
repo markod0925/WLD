@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import logging
-import threading
 from pathlib import Path
 
 from worklog_diary.core.config import AppConfig
@@ -33,15 +31,14 @@ def _config_for_tmp(tmp_path: Path, **overrides: object) -> AppConfig:
 
 
 
-def test_flush_now_returns_none_when_drain_already_running() -> None:
-    services = MonitoringServices.__new__(MonitoringServices)
-    services.logger = logging.getLogger("test.services")
-    services._flush_lock = threading.Lock()
-    assert services._flush_lock.acquire(blocking=False)
+def test_flush_now_returns_none_when_drain_already_running(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    assert services.flush_coordinator._flush_lock.acquire(blocking=False)
     try:
         assert services.flush_now(reason="manual") is None
     finally:
-        services._flush_lock.release()
+        services.flush_coordinator._flush_lock.release()
+        services.shutdown()
 
 
 

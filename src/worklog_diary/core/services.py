@@ -64,6 +64,7 @@ class MonitoringServices:
         self.scheduler = self.registry.build_scheduler(
             flush_callback=self.flush_coordinator.flush_now,
             state=self.state,
+            shutdown_event=self._services.shutdown_event,
         )
         self._services.scheduler = self.scheduler
         self.lifecycle_manager.attach_scheduler(self.scheduler)
@@ -104,32 +105,14 @@ class MonitoringServices:
         self.lifecycle_manager.handle_session_unlocked()
 
     def cancel_flush_drain(self) -> bool:
-        coordinator = getattr(self, "flush_coordinator", None)
-        if coordinator is None:
-            return False
-        return coordinator.cancel_flush_drain()
+        return self.flush_coordinator.cancel_flush_drain()
 
     @property
     def is_drain_active(self) -> bool:
-        coordinator = getattr(self, "flush_coordinator", None)
-        if coordinator is None:
-            return False
-        return coordinator.is_drain_active
+        return self.flush_coordinator.is_drain_active
 
     def flush_now(self, reason: str = "manual") -> FlushDrainResult | None:
-        coordinator = getattr(self, "flush_coordinator", None)
-        if coordinator is not None:
-            return coordinator.flush_now(reason)
-
-        flush_lock = getattr(self, "_flush_lock", None)
-        logger = getattr(self, "logger", logging.getLogger(__name__))
-        if flush_lock is None or not flush_lock.acquire(blocking=False):
-            logger.info("event=summary_flush_skipped reason=already_running request_reason=%s", reason)
-            return None
-        try:
-            return None
-        finally:
-            flush_lock.release()
+        return self.flush_coordinator.flush_now(reason)
 
     def apply_config(self, config: AppConfig) -> None:
         lifecycle_snapshot = self.lifecycle_manager.snapshot()
@@ -208,6 +191,7 @@ class MonitoringServices:
             raise
 
     def shutdown(self) -> None:
+        self._services.shutdown_event.set()
         self.cancel_flush_drain()
         self.stop_monitoring()
         self.summarizer.stop()

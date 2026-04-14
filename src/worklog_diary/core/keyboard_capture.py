@@ -20,6 +20,7 @@ class KeyboardCaptureService:
         state: SharedState,
         privacy: PrivacyPolicyEngine,
         foreground_provider: Callable[[], Any] = get_foreground_window_info,
+        shutdown_event: threading.Event | None = None,
         batch_size: int = 32,
         flush_interval_seconds: float = 0.5,
     ) -> None:
@@ -27,6 +28,7 @@ class KeyboardCaptureService:
         self.state = state
         self.privacy = privacy
         self.foreground_provider = foreground_provider
+        self._shutdown_event = shutdown_event or threading.Event()
         self.batch_size = max(1, int(batch_size))
         self.flush_interval_seconds = max(0.1, float(flush_interval_seconds))
         self.logger = logging.getLogger(__name__)
@@ -211,7 +213,9 @@ class KeyboardCaptureService:
             self._flush_lock.release()
 
     def _run_flush_loop(self) -> None:
-        while not self._stop_event.wait(self.flush_interval_seconds):
+        while not self._stop_event.is_set() and not self._shutdown_event.is_set():
+            if self._stop_event.wait(self.flush_interval_seconds) or self._shutdown_event.is_set():
+                break
             self._flush_pending_events(reason="timer", blocking=False)
 
     def _join_flush_thread(self) -> None:

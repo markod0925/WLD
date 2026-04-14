@@ -21,6 +21,12 @@ class _QueuedSummaryJob:
     reason: str
 
 
+@dataclass(slots=True)
+class _WorkerHandle:
+    thread: threading.Thread
+    stop_event: threading.Event
+
+
 class Summarizer:
     def __init__(
         self,
@@ -29,6 +35,7 @@ class Summarizer:
         lm_client: LMStudioClient,
         max_parallel_jobs: int = 2,
         error_notifier: ErrorNotificationManager | None = None,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         self.storage = storage
         self.batch_builder = batch_builder
@@ -41,7 +48,9 @@ class Summarizer:
         self._queue: deque[_QueuedSummaryJob] = deque()
         self._reserved_ranges: dict[int, tuple[float, float]] = {}
         self._running_jobs: set[int] = set()
-        self._workers: list[threading.Thread] = []
+        self._workers: list[_WorkerHandle] = []
+        self._retired_workers: list[_WorkerHandle] = []
+        self._shutdown_event = shutdown_event or threading.Event()
         self._stop_event = threading.Event()
         self._max_parallel_jobs = max(1, int(max_parallel_jobs))
         self._unrecoverable_error: str | None = None
@@ -51,13 +60,25 @@ class Summarizer:
     def stop(self) -> None:
         self._stop_event.set()
         with self._condition:
+            for handle in self._workers:
+                handle.stop_event.set()
+            for handle in self._retired_workers:
+                handle.stop_event.set()
             self._condition.notify_all()
-        for worker in self._workers:
-            worker.join(timeout=2)
+        for handle in self._workers + self._retired_workers:
+            handle.thread.join(timeout=2)
+        self._workers.clear()
+        self._retired_workers.clear()
 
     def update_max_parallel_jobs(self, max_parallel_jobs: int) -> None:
         with self._condition:
             self._max_parallel_jobs = max(1, int(max_parallel_jobs))
+            if len(self._workers) > self._max_parallel_jobs:
+                retired = self._workers[self._max_parallel_jobs :]
+                self._workers = self._workers[: self._max_parallel_jobs]
+                for handle in retired:
+                    handle.stop_event.set()
+                self._retired_workers.extend(retired)
             self._ensure_worker_count_locked()
             self._condition.notify_all()
 
@@ -73,6 +94,8 @@ class Summarizer:
         return self.get_unrecoverable_error() is not None
 
     def dispatch_pending_jobs(self, reason: str = "manual", max_new_jobs: int | None = None) -> int:
+        if self._stop_event.is_set() or self._shutdown_event.is_set():
+            return 0
         with self._condition:
             available_slots = self._max_parallel_jobs - (len(self._queue) + len(self._running_jobs))
             if max_new_jobs is not None:
@@ -125,6 +148,8 @@ class Summarizer:
             return len(cancelled)
 
     def wait_for_activity(self, timeout_seconds: float = 0.5) -> None:
+        if self._shutdown_event.is_set():
+            return
         with self._condition:
             self._condition.wait(timeout=timeout_seconds)
 
@@ -149,6 +174,8 @@ class Summarizer:
         }
 
     def flush_pending(self, reason: str = "manual") -> int | None:
+        if self._stop_event.is_set() or self._shutdown_event.is_set():
+            return None
         batch = self.batch_builder.build_pending_batch(excluded_ranges=list(self._reserved_ranges.values()))
         if batch is None:
             self.logger.info("event=summary_job_skipped reason=%s detail=no_pending_data", reason)
@@ -185,13 +212,18 @@ class Summarizer:
         )
         return int(daily_summary.id or 0), replaced
 
-    def _worker_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _worker_loop(self, worker_stop_event: threading.Event) -> None:
+        while not self._stop_event.is_set() and not self._shutdown_event.is_set():
             queued_job: _QueuedSummaryJob | None = None
             with self._condition:
-                while not self._stop_event.is_set() and not self._queue:
+                while (
+                    not self._stop_event.is_set()
+                    and not self._shutdown_event.is_set()
+                    and not worker_stop_event.is_set()
+                    and not self._queue
+                ):
                     self._condition.wait(timeout=0.5)
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or self._shutdown_event.is_set() or worker_stop_event.is_set():
                     return
                 if self._queue:
                     queued_job = self._queue.popleft()
@@ -213,6 +245,9 @@ class Summarizer:
                 self._running_jobs.discard(queued_job.job_id)
                 self._reserved_ranges.pop(queued_job.job_id, None)
                 self._condition.notify_all()
+
+            if worker_stop_event.is_set():
+                return
 
     def _run_summary_job(self, job_id: int, batch: SummaryBatch, reason: str) -> int | None:
         self.logger.info(
@@ -295,14 +330,22 @@ class Summarizer:
     def _ensure_worker_count_locked(self) -> None:
         while len(self._workers) < self._max_parallel_jobs:
             index = len(self._workers) + 1
-            worker = threading.Thread(target=self._worker_loop, name=f"SummaryWorker-{index}", daemon=True)
-            self._workers.append(worker)
+            worker_stop_event = threading.Event()
+            worker = threading.Thread(
+                target=self._worker_loop,
+                args=(worker_stop_event,),
+                name=f"SummaryWorker-{index}",
+                daemon=True,
+            )
+            self._workers.append(_WorkerHandle(thread=worker, stop_event=worker_stop_event))
             worker.start()
 
     def wait_for_idle(self, timeout_seconds: float) -> bool:
         deadline = time.time() + max(0.0, timeout_seconds)
         with self._condition:
             while self._queue or self._running_jobs:
+                if self._shutdown_event.is_set():
+                    return False
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     return False

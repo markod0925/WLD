@@ -34,6 +34,7 @@ class FlushDrainResult:
 
 @dataclass(slots=True)
 class MonitoringServiceBundle:
+    shutdown_event: threading.Event
     state: SharedState
     storage: SQLiteStorage
     privacy: PrivacyPolicyEngine
@@ -55,6 +56,7 @@ class ServiceRegistry:
         self.config = config
 
     def build_bundle(self) -> MonitoringServiceBundle:
+        shutdown_event = threading.Event()
         state = SharedState()
         storage = SQLiteStorage(self.config.db_path)
         privacy = PrivacyPolicyEngine(set(self.config.blocked_processes))
@@ -65,11 +67,13 @@ class ServiceRegistry:
             privacy=privacy,
             state=state,
             poll_interval_seconds=self.config.foreground_poll_interval_seconds,
+            shutdown_event=shutdown_event,
         )
         keyboard_capture = KeyboardCaptureService(
             storage=storage,
             state=state,
             privacy=privacy,
+            shutdown_event=shutdown_event,
         )
         screenshot_capture = ScreenshotCaptureService(
             storage=storage,
@@ -78,6 +82,7 @@ class ServiceRegistry:
             screenshot_dir=self.config.screenshot_dir,
             interval_seconds=self.config.screenshot_interval_seconds,
             capture_mode=self.config.capture_mode,
+            shutdown_event=shutdown_event,
         )
 
         text_reconstructor = TextReconstructor(
@@ -88,6 +93,7 @@ class ServiceRegistry:
             reconstructor=text_reconstructor,
             poll_interval_seconds=self.config.reconstruction_poll_interval_seconds,
             state=state,
+            shutdown_event=shutdown_event,
         )
 
         batch_builder = BatchBuilder(
@@ -106,9 +112,11 @@ class ServiceRegistry:
             lm_client=lmstudio_client,
             max_parallel_jobs=self.config.max_parallel_summary_jobs,
             error_notifier=error_notifier,
+            shutdown_event=shutdown_event,
         )
 
         return MonitoringServiceBundle(
+            shutdown_event=shutdown_event,
             state=state,
             storage=storage,
             privacy=privacy,
@@ -123,11 +131,18 @@ class ServiceRegistry:
             summarizer=summarizer,
         )
 
-    def build_scheduler(self, *, flush_callback: Callable[[str], FlushDrainResult | None], state: SharedState) -> FlushScheduler:
+    def build_scheduler(
+        self,
+        *,
+        flush_callback: Callable[[str], FlushDrainResult | None],
+        state: SharedState,
+        shutdown_event: threading.Event | None = None,
+    ) -> FlushScheduler:
         return FlushScheduler(
             interval_seconds=self.config.flush_interval_seconds,
             flush_callback=flush_callback,
             state=state,
+            shutdown_event=shutdown_event,
         )
 
     def build_session_monitor(
@@ -151,6 +166,7 @@ class MonitoringLifecycleManager:
         self._monitoring_requested = False
         self._manual_pause = False
         self._paused_by_lock = False
+        self._lifecycle_phase = "stopped"
 
     def attach_scheduler(self, scheduler: FlushScheduler) -> None:
         self.services.scheduler = scheduler
@@ -175,6 +191,7 @@ class MonitoringLifecycleManager:
             self._services_running = True
 
         active = self._apply_effective_monitoring_state()
+        self._set_lifecycle_phase("idle")
         self.logger.info(
             "event=monitoring_state_change active=%s mode=start paused_by_lock=%s",
             active,
@@ -187,6 +204,7 @@ class MonitoringLifecycleManager:
             self._monitoring_requested = True
             self._paused_by_lock = False
         self._apply_effective_monitoring_state()
+        self._set_lifecycle_phase("idle")
         self.logger.info("event=monitoring_state_change active=false mode=pause")
 
     def stop_monitoring(self) -> None:
@@ -208,6 +226,7 @@ class MonitoringLifecycleManager:
                 self.services.session_monitor.stop()
             self._services_running = False
 
+        self._set_lifecycle_phase("stopped")
         self.logger.info("event=monitoring_state_change active=false mode=stop")
 
     def handle_session_locked(self) -> None:
@@ -228,13 +247,14 @@ class MonitoringLifecycleManager:
         if should_log_resume and active:
             self.logger.info("event=monitoring_resumed_after_unlock")
 
-    def snapshot(self) -> dict[str, bool]:
+    def snapshot(self) -> dict[str, bool | str]:
         with self._status_lock:
             return {
                 "services_running": self._services_running,
                 "monitoring_requested": self._monitoring_requested,
                 "manual_pause": self._manual_pause,
                 "paused_by_lock": self._paused_by_lock,
+                "lifecycle_phase": self._lifecycle_phase,
             }
 
     @property
@@ -264,6 +284,20 @@ class MonitoringLifecycleManager:
         if not target_active:
             self.services.window_tracker.pause()
         return target_active
+
+    def set_draining(self) -> None:
+        self._set_lifecycle_phase("draining")
+
+    def set_idle(self) -> None:
+        self._set_lifecycle_phase("idle")
+
+    def lifecycle_phase(self) -> str:
+        with self._status_lock:
+            return self._lifecycle_phase
+
+    def _set_lifecycle_phase(self, phase: str) -> None:
+        with self._status_lock:
+            self._lifecycle_phase = phase
 
 
 class FlushCoordinator:
@@ -305,6 +339,9 @@ class FlushCoordinator:
             }
 
     def flush_now(self, reason: str = "manual") -> FlushDrainResult | None:
+        if self.services.shutdown_event.is_set():
+            self.logger.info("event=summary_flush_skipped reason=shutdown request_reason=%s", reason)
+            return None
         if not self._flush_lock.acquire(blocking=False):
             self.logger.info("event=summary_flush_skipped reason=already_running request_reason=%s", reason)
             return None
@@ -331,108 +368,109 @@ class FlushCoordinator:
         stop_reason = "empty"
 
         try:
-            try:
-                self.services.keyboard_capture.flush_pending_events(reason=f"summary_flush:{reason}")
-                while True:
-                    if self._drain_cancel_event.is_set():
-                        cancelled = self.services.summarizer.cancel_queued_jobs(reason="cancelled_by_user")
-                        self.logger.info("event=summary_drain_stopped reason=cancelled cancelled_queued_jobs=%s", cancelled)
-                        stop_reason = "cancelled"
+            self.lifecycle_manager.set_draining()
+            self.services.keyboard_capture.flush_pending_events(reason=f"summary_flush:{reason}")
+            while True:
+                if self._drain_cancel_event.is_set():
+                    cancelled = self.services.summarizer.cancel_queued_jobs(reason="cancelled_by_user")
+                    self.logger.info("event=summary_drain_stopped reason=cancelled cancelled_queued_jobs=%s", cancelled)
+                    stop_reason = "cancelled"
+                    break
+
+                for _ in range(5):
+                    self.services.text_service.process_once(force_flush=True)
+                    if self.services.storage.count_unprocessed_key_events() == 0:
                         break
 
-                    for _ in range(5):
-                        self.services.text_service.process_once(force_flush=True)
-                        if self.services.storage.count_unprocessed_key_events() == 0:
-                            break
+                dispatched = self.services.summarizer.dispatch_pending_jobs(reason=reason)
 
-                    dispatched = self.services.summarizer.dispatch_pending_jobs(reason=reason)
+                pending = self.services.storage.get_pending_counts()
+                runtime = self.services.summarizer.get_runtime_status()
 
-                    pending = self.services.storage.get_pending_counts()
-                    runtime = self.services.summarizer.get_runtime_status()
-
-                    self.logger.info(
-                        (
-                            "event=summary_drain_tick reason=%s dispatched=%s queued=%s running=%s "
-                            "pending_text_segments=%s pending_screenshots=%s pending_intervals=%s"
-                        ),
-                        reason,
-                        dispatched,
-                        runtime["queued_jobs"],
-                        runtime["running_jobs"],
-                        pending["text_segments"],
-                        pending["screenshots"],
-                        pending["intervals"],
-                    )
-
-                    if bool(runtime["has_unrecoverable_error"]):
-                        self.services.summarizer.cancel_queued_jobs(reason="cancelled_after_failure")
-                        stop_reason = "error"
-                        break
-
-                    backlog_remaining = _has_pending_backlog(pending)
-                    if not backlog_remaining and int(runtime["pending_summary_jobs"]) == 0:
-                        stop_reason = "empty"
-                        break
-
-                    self.services.summarizer.wait_for_activity(timeout_seconds=0.4)
-
-                self.services.summarizer.wait_for_idle(timeout_seconds=30.0)
-
-                now = time.time()
-                self.services.state.set_flush_times(
-                    last_flush_ts=now,
-                    next_flush_ts=now + self.flush_interval_seconds,
-                )
-
-                end_counts = self.services.storage.get_summary_job_status_counts()
-                result = FlushDrainResult(
-                    stop_reason=stop_reason,
-                    summaries_created=max(0, end_counts.get("succeeded", 0) - start_counts.get("succeeded", 0)),
-                    failed_jobs=max(0, end_counts.get("failed", 0) - start_counts.get("failed", 0)),
-                    cancelled_jobs=max(0, end_counts.get("cancelled", 0) - start_counts.get("cancelled", 0)),
-                    pending_summary_jobs=int(self.services.summarizer.get_runtime_status()["pending_summary_jobs"]),
-                )
-                if result.stop_reason != "error":
-                    self.services.error_notifier.resolve("flush_failure")
-                duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
                 self.logger.info(
                     (
-                        "event=summary_drain_finished reason=%s stop_reason=%s duration_ms=%.3f created=%s failed=%s "
-                        "cancelled=%s pending_summary_jobs=%s"
+                        "event=summary_drain_tick reason=%s dispatched=%s queued=%s running=%s "
+                        "pending_text_segments=%s pending_screenshots=%s pending_intervals=%s"
                     ),
                     reason,
-                    result.stop_reason,
-                    duration_ms,
-                    result.summaries_created,
-                    result.failed_jobs,
-                    result.cancelled_jobs,
-                    result.pending_summary_jobs,
+                    dispatched,
+                    runtime["queued_jobs"],
+                    runtime["running_jobs"],
+                    pending["text_segments"],
+                    pending["screenshots"],
+                    pending["intervals"],
                 )
-                return result
-            except Exception as exc:
-                self.services.error_notifier.notify(
-                    "flush_failure",
-                    "Flush failed: Unable to complete the flush. Check LM Studio and try again.",
-                    key=f"{reason}|{exc.__class__.__name__}",
-                )
-                duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
-                self.logger.exception("event=summary_drain_failed reason=%s error=%s", reason, exc)
-                self.logger.info(
-                    "event=summary_drain_duration reason=%s stop_reason=error duration_ms=%.3f",
-                    reason,
-                    duration_ms,
-                )
-                return FlushDrainResult(
-                    stop_reason="error",
-                    summaries_created=0,
-                    failed_jobs=0,
-                    cancelled_jobs=0,
-                    pending_summary_jobs=int(self.services.summarizer.get_runtime_status()["pending_summary_jobs"]),
-                )
+
+                if bool(runtime["has_unrecoverable_error"]):
+                    self.services.summarizer.cancel_queued_jobs(reason="cancelled_after_failure")
+                    stop_reason = "error"
+                    break
+
+                backlog_remaining = _has_pending_backlog(pending)
+                if not backlog_remaining and int(runtime["pending_summary_jobs"]) == 0:
+                    stop_reason = "empty"
+                    break
+
+                self.services.summarizer.wait_for_activity(timeout_seconds=0.4)
+
+            self.services.summarizer.wait_for_idle(timeout_seconds=30.0)
+
+            now = time.time()
+            self.services.state.set_flush_times(
+                last_flush_ts=now,
+                next_flush_ts=now + self.flush_interval_seconds,
+            )
+
+            end_counts = self.services.storage.get_summary_job_status_counts()
+            result = FlushDrainResult(
+                stop_reason=stop_reason,
+                summaries_created=max(0, end_counts.get("succeeded", 0) - start_counts.get("succeeded", 0)),
+                failed_jobs=max(0, end_counts.get("failed", 0) - start_counts.get("failed", 0)),
+                cancelled_jobs=max(0, end_counts.get("cancelled", 0) - start_counts.get("cancelled", 0)),
+                pending_summary_jobs=int(self.services.summarizer.get_runtime_status()["pending_summary_jobs"]),
+            )
+            if result.stop_reason != "error":
+                self.services.error_notifier.resolve("flush_failure")
+            duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
+            self.logger.info(
+                (
+                    "event=summary_drain_finished reason=%s stop_reason=%s duration_ms=%.3f created=%s failed=%s "
+                    "cancelled=%s pending_summary_jobs=%s"
+                ),
+                reason,
+                result.stop_reason,
+                duration_ms,
+                result.summaries_created,
+                result.failed_jobs,
+                result.cancelled_jobs,
+                result.pending_summary_jobs,
+            )
+            return result
+        except Exception as exc:
+            self.services.error_notifier.notify(
+                "flush_failure",
+                "Flush failed: Unable to complete the flush. Check LM Studio and try again.",
+                key=f"{reason}|{exc.__class__.__name__}",
+            )
+            duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
+            self.logger.exception("event=summary_drain_failed reason=%s error=%s", reason, exc)
+            self.logger.info(
+                "event=summary_drain_duration reason=%s stop_reason=error duration_ms=%.3f",
+                reason,
+                duration_ms,
+            )
+            return FlushDrainResult(
+                stop_reason="error",
+                summaries_created=0,
+                failed_jobs=0,
+                cancelled_jobs=0,
+                pending_summary_jobs=int(self.services.summarizer.get_runtime_status()["pending_summary_jobs"]),
+            )
         finally:
             with self._status_lock:
                 self._drain_active = False
                 self._drain_reason = None
+            self.lifecycle_manager.set_idle()
             self._flush_lock.release()
 
 
@@ -459,6 +497,7 @@ class DiagnosticsService:
             "monitoring_requested": lifecycle["monitoring_requested"],
             "paused_by_lock": lifecycle["paused_by_lock"],
             "manual_pause": lifecycle["manual_pause"],
+            "lifecycle_phase": lifecycle["lifecycle_phase"],
             "summary_running": int(runtime["running_jobs"]) > 0,
             "flush_drain_active": bool(drain["drain_active"]),
             "unrecoverable_summary_error": runtime["unrecoverable_error"],
