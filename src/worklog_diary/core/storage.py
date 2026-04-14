@@ -140,6 +140,8 @@ class SQLiteStorage(ActivityRepository):
         self._log_db_query_timing("close_interval", started_at, rows=1)
 
     def insert_key_event(self, event: KeyEvent) -> int:
+        started_at = time.perf_counter()
+        values = self._key_event_values(event)
         with self._lock:
             cursor = self._conn.execute(
                 """
@@ -147,22 +149,45 @@ class SQLiteStorage(ActivityRepository):
                     ts, key, event_type, modifiers, process_name, window_title, hwnd, active_interval_id, processed
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    event.ts,
-                    event.key,
-                    event.event_type,
-                    json.dumps(event.modifiers),
-                    event.process_name,
-                    event.window_title,
-                    event.hwnd,
-                    event.active_interval_id,
-                    int(event.processed),
-                ),
+                values,
             )
             self._conn.commit()
             key_event_id = int(cursor.lastrowid)
         self._record_db_write()
+        self._log_db_query_timing("insert_key_event", started_at, rows=1)
         return key_event_id
+
+    def insert_key_events(self, events: list[KeyEvent]) -> int:
+        if not events:
+            return 0
+
+        started_at = time.perf_counter()
+        with self._lock:
+            self._conn.executemany(
+                """
+                INSERT INTO key_events(
+                    ts, key, event_type, modifiers, process_name, window_title, hwnd, active_interval_id, processed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [self._key_event_values(event) for event in events],
+            )
+            self._conn.commit()
+        self._record_db_write()
+        self._log_db_query_timing("insert_key_events", started_at, rows=len(events))
+        return len(events)
+
+    def _key_event_values(self, event: KeyEvent) -> tuple[object, ...]:
+        return (
+            event.ts,
+            event.key,
+            event.event_type,
+            json.dumps(event.modifiers),
+            event.process_name,
+            event.window_title,
+            event.hwnd,
+            event.active_interval_id,
+            int(event.processed),
+        )
 
     def fetch_unprocessed_key_events(self, limit: int = 5000) -> list[KeyEvent]:
         started_at = time.perf_counter()

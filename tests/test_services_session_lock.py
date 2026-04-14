@@ -83,11 +83,13 @@ def test_paused_by_lock_suppresses_key_capture_logic(tmp_path: Path) -> None:
         )
 
         capture._handle_event("a", "down")
+        capture.flush_pending_events()
         baseline = services.storage.get_diagnostics_snapshot()["table_counts"]["key_events"]
         assert baseline == 1
 
         services.handle_session_locked()
         capture._handle_event("b", "down")
+        capture.flush_pending_events()
         after_lock = services.storage.get_diagnostics_snapshot()["table_counts"]["key_events"]
         assert after_lock == baseline
     finally:

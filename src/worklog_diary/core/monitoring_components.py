@@ -332,6 +332,7 @@ class FlushCoordinator:
 
         try:
             try:
+                self.services.keyboard_capture.flush_pending_events(reason=f"summary_flush:{reason}")
                 while True:
                     if self._drain_cancel_event.is_set():
                         cancelled = self.services.summarizer.cancel_queued_jobs(reason="cancelled_by_user")

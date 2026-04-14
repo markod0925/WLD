@@ -35,6 +35,7 @@ def test_blocked_app_never_creates_key_events_even_if_state_is_stale(tmp_path: P
         foreground_provider=lambda: blocked_info,
     )
     service._handle_event("a", "down")
+    service.flush_pending_events()
 
     assert storage.get_diagnostics_snapshot()["table_counts"]["key_events"] == 0
     storage.close()

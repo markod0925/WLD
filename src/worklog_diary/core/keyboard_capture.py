@@ -20,16 +20,25 @@ class KeyboardCaptureService:
         state: SharedState,
         privacy: PrivacyPolicyEngine,
         foreground_provider: Callable[[], Any] = get_foreground_window_info,
+        batch_size: int = 32,
+        flush_interval_seconds: float = 0.5,
     ) -> None:
         self.storage = storage
         self.state = state
         self.privacy = privacy
         self.foreground_provider = foreground_provider
+        self.batch_size = max(1, int(batch_size))
+        self.flush_interval_seconds = max(0.1, float(flush_interval_seconds))
         self.logger = logging.getLogger(__name__)
 
         self._listener: Any | None = None
         self._pressed_modifiers: set[str] = set()
+        self._pending_key_events: list[KeyEvent] = []
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._flush_thread: threading.Thread | None = None
+        self._last_flush_started_at = time.monotonic()
 
     def start(self) -> None:
         if self._listener is not None:
@@ -46,13 +55,22 @@ class KeyboardCaptureService:
         self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
         self._listener.daemon = True
         self._listener.start()
+        self._stop_event.clear()
+        self._last_flush_started_at = time.monotonic()
+        self._flush_thread = threading.Thread(target=self._run_flush_loop, name="KeyboardCaptureFlush", daemon=True)
+        self._flush_thread.start()
         self.logger.info("Keyboard capture service started")
 
     def stop(self) -> None:
+        self._stop_event.set()
         if self._listener is None:
+            self._flush_pending_events(reason="stop", blocking=True)
+            self._join_flush_thread()
             return
         self._listener.stop()
         self._listener = None
+        self._join_flush_thread()
+        self._flush_pending_events(reason="stop", blocking=True)
         self.logger.info("Keyboard capture service stopped")
 
     def _on_press(self, key: Any) -> None:
@@ -68,6 +86,11 @@ class KeyboardCaptureService:
         with self._lock:
             if event_type == "down" and modifier:
                 self._pressed_modifiers.add(modifier)
+            elif event_type == "up" and modifier:
+                self._pressed_modifiers.discard(modifier)
+                return
+            elif event_type == "up":
+                return
 
             modifiers = sorted(self._pressed_modifiers)
 
@@ -82,8 +105,6 @@ class KeyboardCaptureService:
                     key_name,
                     event_type,
                 )
-                if event_type == "up" and modifier:
-                    self._pressed_modifiers.discard(modifier)
                 return
 
             current_info = self.foreground_provider()
@@ -95,6 +116,7 @@ class KeyboardCaptureService:
             should_record = not blocked_now and matches_state
 
             if should_record:
+                buffer_was_empty = not self._pending_key_events
                 event = KeyEvent(
                     id=None,
                     ts=time.time(),
@@ -107,7 +129,9 @@ class KeyboardCaptureService:
                     active_interval_id=snapshot.active_interval_id,
                     processed=False,
                 )
-                self.storage.insert_key_event(event)
+                self._pending_key_events.append(event)
+                if buffer_was_empty:
+                    self._last_flush_started_at = time.monotonic()
                 self.logger.debug(
                     (
                         "event=key_capture_accepted key=%s event_type=%s modifiers=%s "
@@ -136,8 +160,67 @@ class KeyboardCaptureService:
                     current_info.hwnd,
                 )
 
-            if event_type == "up" and modifier:
-                self._pressed_modifiers.discard(modifier)
+        if self._should_flush_buffer():
+            self._flush_pending_events(reason="batch_size", blocking=False)
+
+    def flush_pending_events(self, reason: str = "manual") -> int:
+        return self._flush_pending_events(reason=reason, blocking=True)
+
+    def _should_flush_buffer(self) -> bool:
+        with self._lock:
+            buffered_count = len(self._pending_key_events)
+        if buffered_count == 0:
+            return False
+        if buffered_count >= self.batch_size:
+            return True
+        elapsed = time.monotonic() - self._last_flush_started_at
+        return elapsed >= self.flush_interval_seconds
+
+    def _flush_pending_events(self, reason: str, *, blocking: bool) -> int:
+        if not self._flush_lock.acquire(blocking=blocking):
+            return 0
+        started_at = time.perf_counter()
+        try:
+            with self._lock:
+                if not self._pending_key_events:
+                    return 0
+                batch = list(self._pending_key_events)
+                self._pending_key_events = []
+            try:
+                inserted = self.storage.insert_key_events(batch)
+            except Exception as exc:
+                with self._lock:
+                    self._pending_key_events = batch + self._pending_key_events
+                self.logger.exception(
+                    "event=key_capture_buffer_flush_failed reason=%s batch_size=%s error=%s",
+                    reason,
+                    len(batch),
+                    exc,
+                )
+                return 0
+            self._last_flush_started_at = time.monotonic()
+            duration_ms = (time.perf_counter() - started_at) * 1000.0
+            self.logger.info(
+                "event=key_capture_buffer_flushed reason=%s inserted=%s duration_ms=%.3f",
+                reason,
+                inserted,
+                duration_ms,
+            )
+            return inserted
+        finally:
+            self._flush_lock.release()
+
+    def _run_flush_loop(self) -> None:
+        while not self._stop_event.wait(self.flush_interval_seconds):
+            self._flush_pending_events(reason="timer", blocking=False)
+
+    def _join_flush_thread(self) -> None:
+        flush_thread = self._flush_thread
+        if flush_thread is None:
+            return
+        if flush_thread.is_alive():
+            flush_thread.join(timeout=3)
+        self._flush_thread = None
 
 
 
