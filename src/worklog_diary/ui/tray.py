@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from ..core.services import MonitoringServices
+from ..core.monitoring_components import DiagnosticsService
 from .settings_window import SettingsWindow
 from .summaries_window import SummariesWindow
 
@@ -18,9 +19,15 @@ class NotificationBridge(QObject):
 
 
 class TrayController:
-    def __init__(self, app: QApplication, services: MonitoringServices) -> None:
+    def __init__(
+        self,
+        app: QApplication,
+        services: MonitoringServices,
+        diagnostics_service: DiagnosticsService | None = None,
+    ) -> None:
         self.app = app
         self.services = services
+        self.diagnostics_service = diagnostics_service
         self._notification_bridge = NotificationBridge()
         self._notification_bridge.user_error.connect(self._show_user_error)
         self.services.set_error_notification_sink(self._notification_bridge.user_error.emit)
@@ -144,7 +151,10 @@ class TrayController:
         self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 5000)
 
     def _show_diagnostics(self) -> None:
-        diagnostics = self.services.storage.get_diagnostics_snapshot()
+        if self.diagnostics_service is not None:
+            diagnostics = self.diagnostics_service.get_diagnostics_snapshot()
+        else:
+            diagnostics = self.services.storage.get_diagnostics_snapshot()
         pending = diagnostics["pending_counts"]
         jobs = diagnostics["summary_jobs"]
         ranges = diagnostics["pending_ranges"]
@@ -202,7 +212,10 @@ class TrayController:
         self.app.quit()
 
     def _refresh_status(self) -> None:
-        status = self.services.get_status()
+        if self.diagnostics_service is not None:
+            status = self.diagnostics_service.get_status()
+        else:
+            status = self.services.get_status()
         monitoring = str(status["monitoring_state"])
         blocked = "yes" if status["blocked"] else "no"
         self.tray.setIcon(self._select_tray_icon(status))
@@ -272,7 +285,7 @@ def run_tray_app(services: MonitoringServices) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    controller = TrayController(app, services)
+    controller = TrayController(app, services, services.diagnostics_service)
     controller.show()
 
     if services.config.start_monitoring_on_launch:

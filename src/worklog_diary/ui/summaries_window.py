@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core.monitoring_components import DiagnosticsService
 from ..core.services import MonitoringServices
 from .summaries_view_model import DaySummaryView, SummaryCardView, build_calendar_highlight_days, build_day_summary_view
 
@@ -27,9 +28,14 @@ class SummariesWindow(QWidget):
     daily_recap_finished = Signal(object, object)
     flush_finished = Signal(object, object)
 
-    def __init__(self, services: MonitoringServices) -> None:
+    def __init__(
+        self,
+        services: MonitoringServices,
+        diagnostics_service: DiagnosticsService | None = None,
+    ) -> None:
         super().__init__()
         self.services = services
+        self.diagnostics_service = diagnostics_service
         self.logger = logging.getLogger(__name__)
         self.setWindowTitle("WorkLog Diary Summaries")
         self.resize(1100, 700)
@@ -236,7 +242,7 @@ class SummariesWindow(QWidget):
         self._sync_flush_button_state()
 
     def _toggle_flush(self) -> None:
-        if self._flush_inflight or self.services.is_drain_active:
+        if self._flush_inflight or self._is_flush_drain_active():
             if self.services.cancel_flush_drain():
                 self._sync_flush_button_state()
             return
@@ -265,9 +271,14 @@ class SummariesWindow(QWidget):
         self.refresh()
 
     def _sync_flush_button_state(self) -> None:
-        active = self._flush_inflight or self.services.is_drain_active
+        active = self._flush_inflight or self._is_flush_drain_active()
         self.flush_button.setText("Stop Flush" if active else "Start Flush")
         self.flush_button.setEnabled(True)
+
+    def _is_flush_drain_active(self) -> bool:
+        if self.diagnostics_service is not None:
+            return bool(self.diagnostics_service.get_health_snapshot()["flush_drain_active"])
+        return bool(getattr(self.services, "is_drain_active", False))
 
 
 def _build_summary_card_widget(card: SummaryCardView) -> QFrame:

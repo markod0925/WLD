@@ -475,6 +475,8 @@ class FlushCoordinator:
 
 
 class DiagnosticsService:
+    """Expose runtime state and diagnostics snapshots to the UI layer."""
+
     def __init__(
         self,
         services: MonitoringServiceBundle,
@@ -502,6 +504,9 @@ class DiagnosticsService:
             "flush_drain_active": bool(drain["drain_active"]),
             "unrecoverable_summary_error": runtime["unrecoverable_error"],
         }
+
+    def get_diagnostics_snapshot(self) -> dict:
+        return self.services.storage.get_diagnostics_snapshot()
 
     def get_status(self) -> dict:
         snapshot = self.services.state.snapshot()
