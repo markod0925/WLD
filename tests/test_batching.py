@@ -1,5 +1,39 @@
-from worklog_diary.core.batching import build_batch_from_pending
-from worklog_diary.core.models import ActiveInterval, BlockedInterval, ScreenshotRecord, TextSegment
+from datetime import date
+
+from worklog_diary.core.batching import BatchBuilder, build_batch_from_pending
+from worklog_diary.core.models import ActiveInterval, BlockedInterval, ScreenshotRecord, SummaryRecord, TextSegment
+
+
+class FakeActivityRepository:
+    def __init__(
+        self,
+        *,
+        intervals: list[ActiveInterval],
+        blocked_intervals: list[BlockedInterval],
+        text_segments: list[TextSegment],
+        screenshots: list[ScreenshotRecord],
+        summaries: list[SummaryRecord] | None = None,
+    ) -> None:
+        self._intervals = list(intervals)
+        self._blocked_intervals = list(blocked_intervals)
+        self._text_segments = list(text_segments)
+        self._screenshots = list(screenshots)
+        self._summaries = list(summaries or [])
+
+    def fetch_unsummarized_intervals(self, limit: int = 10000) -> list[ActiveInterval]:
+        return self._intervals[:limit]
+
+    def fetch_unsummarized_blocked_intervals(self, limit: int = 10000) -> list[BlockedInterval]:
+        return self._blocked_intervals[:limit]
+
+    def fetch_unsummarized_text_segments(self, limit: int = 200) -> list[TextSegment]:
+        return self._text_segments[:limit]
+
+    def fetch_unsummarized_screenshots(self, limit: int = 20) -> list[ScreenshotRecord]:
+        return self._screenshots[:limit]
+
+    def list_summaries_for_day(self, day: date, limit: int = 500) -> list[SummaryRecord]:
+        return self._summaries[:limit]
 
 
 
@@ -51,3 +85,54 @@ def test_blocked_intervals_preserved_in_batch() -> None:
 def test_empty_batch_returns_none() -> None:
     batch = build_batch_from_pending([], [], [], [])
     assert batch is None
+
+
+def test_batch_builder_works_with_fake_repository() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=10.0, end_ts=20.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+    ]
+    text_segments = [
+        TextSegment(
+            id=1,
+            start_ts=12.0,
+            end_ts=13.0,
+            process_name="a.exe",
+            window_title="A",
+            text="hello",
+            hotkeys=[],
+            raw_key_count=3,
+        )
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=text_segments,
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+
+    assert batch is not None
+    assert batch.start_ts == 10.0
+    assert batch.end_ts == 20.0
+    assert batch.active_intervals == intervals
+    assert batch.text_segments == text_segments
+
+
+def test_batch_builder_honors_excluded_ranges_with_fake_repository() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=10.0, end_ts=20.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+        ActiveInterval(id=2, start_ts=30.0, end_ts=40.0, hwnd=2, pid=2, process_name="b.exe", window_title="B", blocked=False),
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(storage=repo).build_pending_batch(excluded_ranges=[(9.0, 21.0)])
+
+    assert batch is not None
+    assert len(batch.active_intervals) == 1
+    assert batch.active_intervals[0].id == 2

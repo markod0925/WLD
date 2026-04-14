@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .activity_repository import ActivityRepository
 from .models import ActiveInterval, BlockedInterval, ScreenshotRecord, TextSegment
-from .storage import SQLiteStorage
 
 
 @dataclass(slots=True)
@@ -65,7 +65,7 @@ class SummaryBatch:
 class BatchBuilder:
     def __init__(
         self,
-        storage: SQLiteStorage,
+        storage: ActivityRepository,
         max_text_segments: int = 400,
         max_screenshots: int = 3,
     ) -> None:

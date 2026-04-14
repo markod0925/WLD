@@ -9,6 +9,7 @@ import time
 from datetime import date as Day, datetime, time as DateTimeTime, timedelta
 from pathlib import Path
 
+from .activity_repository import ActivityRepository
 from .models import (
     ActiveInterval,
     BlockedInterval,
@@ -21,7 +22,7 @@ from .models import (
 )
 
 
-class SQLiteStorage:
+class SQLiteStorage(ActivityRepository):
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
