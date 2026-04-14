@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import threading
 import uuid
 from collections.abc import Callable
 
+from ctypes import wintypes
+
 from .config import native_hooks_disabled
 
 
 class SessionMonitor:
+    """Listen for Windows session lock and unlock events on a background thread."""
+
     def __init__(
         self,
         *,
@@ -61,8 +66,6 @@ class SessionMonitor:
 
         if hwnd:
             try:
-                import ctypes
-
                 ctypes.windll.user32.PostMessageW(int(hwnd), 0x0010, 0, 0)  # WM_CLOSE
             except Exception:
                 pass
@@ -70,14 +73,6 @@ class SessionMonitor:
         thread.join(timeout=5.0)
 
     def _run_windows_loop(self) -> None:
-        try:
-            import ctypes
-            from ctypes import wintypes
-        except Exception as exc:
-            self._startup_error = str(exc)
-            self._startup_event.set()
-            return
-
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         wtsapi32 = ctypes.windll.wtsapi32

@@ -8,6 +8,8 @@ from .models import ActiveInterval, BlockedInterval, ScreenshotRecord, TextSegme
 
 @dataclass(slots=True)
 class SummaryBatch:
+    """Immutable snapshot of the pending activity that will be summarized."""
+
     start_ts: float
     end_ts: float
     active_intervals: list[ActiveInterval]
@@ -63,6 +65,8 @@ class SummaryBatch:
 
 
 class BatchBuilder:
+    """Build a summary batch from the repository without touching SQLite directly."""
+
     def __init__(
         self,
         storage: ActivityRepository,
@@ -77,13 +81,8 @@ class BatchBuilder:
         intervals = self.storage.fetch_unsummarized_intervals()
         blocked_intervals = self.storage.fetch_unsummarized_blocked_intervals()
 
-        text_limit = self.max_text_segments
-        screenshot_limit = self.max_screenshots
-        if excluded_ranges:
-            if self.max_text_segments > 0:
-                text_limit = max(self.max_text_segments, self.max_text_segments * (len(excluded_ranges) + 1))
-            if self.max_screenshots > 0:
-                screenshot_limit = max(self.max_screenshots, self.max_screenshots * (len(excluded_ranges) + 1))
+        text_limit = self._expanded_fetch_limit(self.max_text_segments, excluded_ranges)
+        screenshot_limit = self._expanded_fetch_limit(self.max_screenshots, excluded_ranges)
 
         text_segments = self.storage.fetch_unsummarized_text_segments(limit=text_limit)
         screenshots = self.storage.fetch_unsummarized_screenshots(limit=screenshot_limit)
@@ -122,6 +121,14 @@ class BatchBuilder:
             text_segments=text_segments,
             screenshots=screenshots,
         )
+
+    @staticmethod
+    def _expanded_fetch_limit(base_limit: int, excluded_ranges: list[tuple[float, float]] | None) -> int:
+        if base_limit <= 0:
+            return 0
+        if not excluded_ranges:
+            return base_limit
+        return base_limit * (len(excluded_ranges) + 1)
 
 
 

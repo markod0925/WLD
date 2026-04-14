@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 class StorageCleanupService:
+    """Clean up raw activity rows and associated screenshot files."""
+
     def __init__(self, conn: sqlite3.Connection, lock: threading.Lock, logger: logging.Logger) -> None:
         self._conn = conn
         self._lock = lock
@@ -81,7 +83,7 @@ class StorageCleanupService:
             return 0
         with self._lock:
             rows = self._conn.execute("SELECT file_path FROM screenshots").fetchall()
-            referenced_paths = {Path(str(row["file_path"])) for row in rows}
+            referenced_paths = {_normalized_path_key(str(row["file_path"])) for row in rows}
 
         removed = 0
         for directory in candidate_dirs:
@@ -90,7 +92,7 @@ class StorageCleanupService:
             for file_path in directory.glob("*"):
                 if file_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
                     continue
-                if file_path in referenced_paths:
+                if _normalized_path_key(str(file_path)) in referenced_paths:
                     continue
                 try:
                     os.remove(file_path)
@@ -110,3 +112,7 @@ class StorageCleanupService:
                 duration_ms,
                 rows,
             )
+
+
+def _normalized_path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))

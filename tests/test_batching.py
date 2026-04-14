@@ -136,3 +136,28 @@ def test_batch_builder_honors_excluded_ranges_with_fake_repository() -> None:
     assert batch is not None
     assert len(batch.active_intervals) == 1
     assert batch.active_intervals[0].id == 2
+
+
+def test_batch_builder_expands_text_limit_after_excluding_ranges() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=10.0, end_ts=20.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+        ActiveInterval(id=2, start_ts=30.0, end_ts=40.0, hwnd=2, pid=2, process_name="b.exe", window_title="B", blocked=False),
+    ]
+    text_segments = [
+        TextSegment(id=1, start_ts=12.0, end_ts=13.0, process_name="a.exe", window_title="A", text="excluded", hotkeys=[], raw_key_count=1),
+        TextSegment(id=2, start_ts=32.0, end_ts=33.0, process_name="b.exe", window_title="B", text="kept", hotkeys=[], raw_key_count=1),
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=text_segments,
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(storage=repo, max_text_segments=1, max_screenshots=3).build_pending_batch(
+        excluded_ranges=[(11.0, 14.0)]
+    )
+
+    assert batch is not None
+    assert len(batch.text_segments) == 1
+    assert batch.text_segments[0].id == 2

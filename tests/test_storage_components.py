@@ -4,6 +4,7 @@ from pathlib import Path
 
 from worklog_diary.core.storage import SQLiteStorage
 from worklog_diary.core.models import ScreenshotRecord
+import worklog_diary.core.storage_cleanup as storage_cleanup_module
 
 
 def test_storage_bootstrap_enables_wal(tmp_path: Path) -> None:
@@ -46,5 +47,34 @@ def test_storage_cleanup_service_purges_screenshot_files(tmp_path: Path) -> None
         assert removed == [str(screenshot_path)]
         assert not screenshot_path.exists()
         assert storage.fetch_unsummarized_screenshots() == []
+    finally:
+        storage.close()
+
+
+def test_storage_cleanup_service_compares_paths_case_insensitively(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    screenshot_dir = tmp_path / "Shots"
+    screenshot_dir.mkdir()
+    actual_path = screenshot_dir / "Shot.PNG"
+    actual_path.write_bytes(b"fake image")
+    try:
+        storage.insert_screenshot(
+            ScreenshotRecord(
+                id=None,
+                ts=10.0,
+                file_path=str(screenshot_dir / "shot.png"),
+                process_name="code.exe",
+                window_title="Editor",
+                active_interval_id=None,
+            )
+        )
+        monkeypatch.setattr(storage_cleanup_module.os.path, "normcase", lambda value: value.lower())
+
+        removed = storage.cleanup_service._cleanup_orphaned_screenshot_files({screenshot_dir})
+
+        assert removed == 0
+        assert actual_path.exists()
     finally:
         storage.close()

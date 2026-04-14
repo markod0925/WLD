@@ -18,6 +18,8 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class AppConfig:
+    """Validated application settings persisted to `config.json`."""
+
     config_version: int = CONFIG_VERSION
     blocked_processes: list[str] = field(default_factory=lambda: DEFAULT_BLOCKED_PROCESSES.copy())
     screenshot_interval_seconds: int = 60

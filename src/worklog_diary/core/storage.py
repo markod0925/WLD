@@ -25,6 +25,8 @@ from .models import (
 
 
 class SQLiteStorage(ActivityRepository):
+    """SQLite-backed repository for activity capture and summary records."""
+
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -670,6 +672,7 @@ def _row_to_daily_summary_record(row: sqlite3.Row) -> DailySummaryRecord:
 
 
 def _day_epoch_bounds(day: Day) -> tuple[float, float]:
-    start_dt = datetime.combine(day, DateTimeTime.min)
+    local_tz = datetime.now().astimezone().tzinfo
+    start_dt = datetime.combine(day, DateTimeTime.min, tzinfo=local_tz)
     end_dt = start_dt + timedelta(days=1)
     return start_dt.timestamp(), end_dt.timestamp()

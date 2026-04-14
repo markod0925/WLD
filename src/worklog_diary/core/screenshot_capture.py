@@ -8,6 +8,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:
+    import mss
+    import mss.tools
+except Exception as exc:  # pragma: no cover - optional dependency
+    mss = None
+    MSS_IMPORT_ERROR = exc
+else:  # pragma: no cover - import success depends on environment
+    MSS_IMPORT_ERROR = None
+
 from .models import ScreenshotRecord, SharedState
 from .privacy import PrivacyPolicyEngine
 from .storage import SQLiteStorage
@@ -15,6 +24,8 @@ from .window_tracker import get_foreground_window_info, get_window_capture_rect
 
 
 class ScreenshotCaptureService:
+    """Capture screenshots for the active foreground window on a background loop."""
+
     def __init__(
         self,
         storage: SQLiteStorage,
@@ -102,12 +113,9 @@ class ScreenshotCaptureService:
         filename = datetime.fromtimestamp(ts).strftime("%Y%m%d_%H%M%S_%f") + ".png"
         file_path = self.screenshot_dir / filename
 
-        try:
-            import mss
-            import mss.tools
-        except Exception as exc:
+        if mss is None:
             if not self._capture_backend_missing_logged:
-                self.logger.warning("Screenshot capture backend unavailable: %s", exc)
+                self.logger.warning("Screenshot capture backend unavailable: %s", MSS_IMPORT_ERROR)
                 self._capture_backend_missing_logged = True
             return False
 

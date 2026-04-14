@@ -6,6 +6,14 @@ import time
 from typing import Any
 from collections.abc import Callable
 
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception as exc:  # pragma: no cover - optional dependency
+    pynput_keyboard = None
+    PYNPUT_KEYBOARD_IMPORT_ERROR = exc
+else:  # pragma: no cover - import success depends on environment
+    PYNPUT_KEYBOARD_IMPORT_ERROR = None
+
 from .config import native_hooks_disabled
 from .models import KeyEvent, SharedState
 from .privacy import PrivacyPolicyEngine
@@ -14,6 +22,8 @@ from .window_tracker import get_foreground_window_info
 
 
 class KeyboardCaptureService:
+    """Capture keyboard events and persist them in buffered batches."""
+
     def __init__(
         self,
         storage: SQLiteStorage,
@@ -48,13 +58,11 @@ class KeyboardCaptureService:
         if native_hooks_disabled():
             self.logger.info("Keyboard capture disabled in test/native-hook-off mode")
             return
-        try:
-            from pynput import keyboard
-        except Exception as exc:
-            self.logger.warning("Keyboard capture disabled: %s", exc)
+        if pynput_keyboard is None:
+            self.logger.warning("Keyboard capture disabled: %s", PYNPUT_KEYBOARD_IMPORT_ERROR)
             return
 
-        self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self._listener = pynput_keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
         self._listener.daemon = True
         self._listener.start()
         self._stop_event.clear()
