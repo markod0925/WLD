@@ -12,6 +12,8 @@ SRC = ROOT / "src"
 datas = [
     (str(ROOT / "README.md"), "."),
     (str(ROOT / "sample_config.json"), "."),
+    (str(ROOT / "assets" / "WLD_Logo.png"), "assets"),
+    (str(ROOT / "assets" / "WLD_Logo.ico"), "assets"),
 ]
 
 hiddenimports = collect_submodules("worklog_diary")
@@ -41,6 +43,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(ROOT / "assets" / "WLD_Logo.ico"),
 )
 
 coll = COLLECT(

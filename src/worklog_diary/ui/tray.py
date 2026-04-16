@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from ..core.services import MonitoringServices
 from ..core.monitoring_components import DiagnosticsService
+from ..resources import app_logo_path
 from .settings_window import SettingsWindow
 from .summaries_window import SummariesWindow
 
@@ -44,6 +45,9 @@ class TrayController:
 
         self.settings_window = SettingsWindow(services)
         self.summaries_window = SummariesWindow(services)
+        window_icon = self.app.windowIcon()
+        self.settings_window.setWindowIcon(window_icon)
+        self.summaries_window.setWindowIcon(window_icon)
 
         self.menu = QMenu()
         self.status_action = self.menu.addAction("Status: idle")
@@ -284,6 +288,7 @@ class TrayController:
 def run_tray_app(services: MonitoringServices) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(QIcon(str(app_logo_path())))
 
     controller = TrayController(app, services, services.diagnostics_service)
     controller.show()

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/WLD_Logo.png" alt="WorkLog Diary logo" width="360">
+</p>
+
 # WorkLogDiary
 
 ## What is this?
