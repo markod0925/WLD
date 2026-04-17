@@ -71,6 +71,13 @@ class LMStudioPromptBuilder:
             screenshots.append(sanitized)
             screenshots_truncated = screenshots_truncated or truncated
 
+        activity_segments: list[dict[str, Any]] = []
+        activity_truncated = False
+        for item in source.get("activity_segments", []):
+            sanitized, truncated = self._truncate_structure(item)
+            activity_segments.append(sanitized)
+            activity_truncated = activity_truncated or truncated
+
         active_intervals: list[dict[str, Any]] = []
         active_truncated = False
         for item in source["active_intervals"]:
@@ -90,6 +97,7 @@ class LMStudioPromptBuilder:
             "batch": {
                 "start_ts": source["start_ts"],
                 "end_ts": source["end_ts"],
+                "activity_segments": activity_segments,
                 "active_intervals": active_intervals,
                 "blocked_intervals": blocked_intervals,
                 "text_segments": text_segments,
@@ -103,14 +111,22 @@ class LMStudioPromptBuilder:
                 "blocked_intervals": len(source["blocked_intervals"]),
                 "text_segments": len(source["text_segments"]),
                 "screenshots": len(source["screenshots"]),
+                "activity_segments": len(source.get("activity_segments", [])),
             },
             included_counts={
                 "active_intervals": len(active_intervals),
                 "blocked_intervals": len(blocked_intervals),
                 "text_segments": len(text_segments),
                 "screenshots": len(screenshots),
+                "activity_segments": len(activity_segments),
             },
-            structure_truncated=text_truncated or screenshots_truncated or active_truncated or blocked_truncated,
+            structure_truncated=(
+                text_truncated
+                or screenshots_truncated
+                or active_truncated
+                or blocked_truncated
+                or activity_truncated
+            ),
         )
         return payload, metadata
 

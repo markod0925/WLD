@@ -75,6 +75,14 @@ class ScreenshotRecord:
     active_interval_id: int | None
     window_hwnd: int | None = None
     fingerprint: str | None = None
+    exact_hash: str | None = None
+    perceptual_hash: str | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    nearest_phash_distance: int | None = None
+    nearest_ssim: float | None = None
+    dedup_reason: str | None = None
+    visual_context_streak: int = 0
 
 
 @dataclass(slots=True)

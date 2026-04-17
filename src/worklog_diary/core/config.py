@@ -11,7 +11,7 @@ from typing import Any
 
 DEFAULT_BLOCKED_PROCESSES = ["chrome.exe", "msedge.exe", "webex.exe", "lm studio.exe"]
 SUPPORTED_CAPTURE_MODES = {"full_screen", "active_window"}
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +40,21 @@ class AppConfig:
     max_text_segments_per_summary: int = 400
     max_parallel_summary_jobs: int = 2
     request_timeout_seconds: int = 600
+    activity_segment_min_duration_seconds: float = 180.0
+    activity_segment_max_duration_seconds: float = 900.0
+    activity_segment_idle_gap_seconds: float = 20.0
+    activity_segment_title_similarity_threshold: float = 0.72
+    summary_similarity_suppress_threshold: float = 0.86
+    summary_similarity_merge_threshold: float = 0.74
+    summary_cooldown_seconds: int = 240
+    recent_summary_compare_count: int = 5
+    screenshot_dedup_exact_hash_enabled: bool = True
+    screenshot_dedup_perceptual_hash_enabled: bool = True
+    screenshot_dedup_phash_threshold: int = 6
+    screenshot_dedup_ssim_enabled: bool = True
+    screenshot_dedup_ssim_threshold: float = 0.985
+    screenshot_dedup_resize_width: int = 32
+    screenshot_dedup_compare_recent_count: int = 8
     screenshot_dedup_enabled: bool = True
     screenshot_dedup_threshold: int = 6
     screenshot_min_keep_interval_seconds: int = 120
@@ -64,8 +79,33 @@ class AppConfig:
         self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "active_window"
 
         self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
+        self.activity_segment_min_duration_seconds = max(0.0, float(self.activity_segment_min_duration_seconds))
+        self.activity_segment_max_duration_seconds = max(
+            self.activity_segment_min_duration_seconds,
+            float(self.activity_segment_max_duration_seconds),
+        )
+        self.activity_segment_idle_gap_seconds = max(0.0, float(self.activity_segment_idle_gap_seconds))
+        self.activity_segment_title_similarity_threshold = max(
+            0.0, min(1.0, float(self.activity_segment_title_similarity_threshold))
+        )
+        self.summary_similarity_suppress_threshold = max(
+            0.0, min(1.0, float(self.summary_similarity_suppress_threshold))
+        )
+        self.summary_similarity_merge_threshold = max(
+            0.0, min(self.summary_similarity_suppress_threshold, float(self.summary_similarity_merge_threshold))
+        )
+        self.summary_cooldown_seconds = max(0, int(self.summary_cooldown_seconds))
+        self.recent_summary_compare_count = max(1, int(self.recent_summary_compare_count))
+        self.screenshot_dedup_exact_hash_enabled = bool(self.screenshot_dedup_exact_hash_enabled)
+        self.screenshot_dedup_perceptual_hash_enabled = bool(self.screenshot_dedup_perceptual_hash_enabled)
+        self.screenshot_dedup_phash_threshold = max(0, min(64, int(self.screenshot_dedup_phash_threshold)))
+        self.screenshot_dedup_ssim_enabled = bool(self.screenshot_dedup_ssim_enabled)
+        self.screenshot_dedup_ssim_threshold = max(0.0, min(1.0, float(self.screenshot_dedup_ssim_threshold)))
+        self.screenshot_dedup_resize_width = max(8, int(self.screenshot_dedup_resize_width))
+        self.screenshot_dedup_compare_recent_count = max(1, int(self.screenshot_dedup_compare_recent_count))
         self.screenshot_dedup_enabled = bool(self.screenshot_dedup_enabled)
         self.screenshot_dedup_threshold = max(0, min(64, int(self.screenshot_dedup_threshold)))
+        self.screenshot_dedup_threshold = self.screenshot_dedup_phash_threshold
         self.screenshot_min_keep_interval_seconds = max(0, int(self.screenshot_min_keep_interval_seconds))
         self.config_version = CONFIG_VERSION
 
@@ -199,6 +239,21 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "max_text_segments_per_summary": _coerce_int,
         "max_parallel_summary_jobs": _coerce_int,
         "request_timeout_seconds": _coerce_int,
+        "activity_segment_min_duration_seconds": _coerce_float,
+        "activity_segment_max_duration_seconds": _coerce_float,
+        "activity_segment_idle_gap_seconds": _coerce_float,
+        "activity_segment_title_similarity_threshold": _coerce_float,
+        "summary_similarity_suppress_threshold": _coerce_float,
+        "summary_similarity_merge_threshold": _coerce_float,
+        "summary_cooldown_seconds": _coerce_int,
+        "recent_summary_compare_count": _coerce_int,
+        "screenshot_dedup_exact_hash_enabled": _coerce_bool,
+        "screenshot_dedup_perceptual_hash_enabled": _coerce_bool,
+        "screenshot_dedup_phash_threshold": _coerce_int,
+        "screenshot_dedup_ssim_enabled": _coerce_bool,
+        "screenshot_dedup_ssim_threshold": _coerce_float,
+        "screenshot_dedup_resize_width": _coerce_int,
+        "screenshot_dedup_compare_recent_count": _coerce_int,
         "screenshot_dedup_enabled": _coerce_bool,
         "screenshot_dedup_threshold": _coerce_int,
         "screenshot_min_keep_interval_seconds": _coerce_int,
@@ -209,6 +264,14 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
             needs_save = True
             continue
         values[field_name] = converter(data[field_name], field_name, source=source)
+
+    if "screenshot_dedup_phash_threshold" not in data and "screenshot_dedup_threshold" in data:
+        values["screenshot_dedup_phash_threshold"] = _coerce_int(
+            data["screenshot_dedup_threshold"],
+            "screenshot_dedup_threshold",
+            source=source,
+        )
+        needs_save = True
 
     values["config_version"] = CONFIG_VERSION
     config = AppConfig(**values)

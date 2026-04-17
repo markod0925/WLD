@@ -12,6 +12,7 @@ from .error_notifications import ErrorNotificationManager
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .lmstudio_client import LMStudioClient
 from .storage import SQLiteStorage
+from .summary_dedup import SummaryDeduplicator
 
 
 @dataclass(slots=True)
@@ -36,12 +37,14 @@ class Summarizer:
         max_parallel_jobs: int = 2,
         error_notifier: ErrorNotificationManager | None = None,
         shutdown_event: threading.Event | None = None,
+        summary_deduplicator: SummaryDeduplicator | None = None,
     ) -> None:
         self.storage = storage
         self.batch_builder = batch_builder
         self.lm_client = lm_client
         self.logger = logging.getLogger(__name__)
         self.error_notifier = error_notifier or ErrorNotificationManager()
+        self.summary_deduplicator = summary_deduplicator or SummaryDeduplicator()
 
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -93,7 +96,13 @@ class Summarizer:
     def has_unrecoverable_error(self) -> bool:
         return self.get_unrecoverable_error() is not None
 
-    def dispatch_pending_jobs(self, reason: str = "manual", max_new_jobs: int | None = None) -> int:
+    def dispatch_pending_jobs(
+        self,
+        reason: str = "manual",
+        max_new_jobs: int | None = None,
+        *,
+        force_flush: bool = False,
+    ) -> int:
         if self._stop_event.is_set() or self._shutdown_event.is_set():
             return 0
         with self._condition:
@@ -106,7 +115,10 @@ class Summarizer:
             created = 0
             for _ in range(available_slots):
                 excluded_ranges = list(self._reserved_ranges.values())
-                batch = self.batch_builder.build_pending_batch(excluded_ranges=excluded_ranges)
+                batch = self.batch_builder.build_pending_batch(
+                    excluded_ranges=excluded_ranges,
+                    force_flush=force_flush or reason != "scheduled",
+                )
                 if batch is None:
                     break
 
@@ -173,10 +185,13 @@ class Summarizer:
             "unrecoverable_error": unrecoverable_error,
         }
 
-    def flush_pending(self, reason: str = "manual") -> int | None:
+    def flush_pending(self, reason: str = "manual", *, force_flush: bool = False) -> int | None:
         if self._stop_event.is_set() or self._shutdown_event.is_set():
             return None
-        batch = self.batch_builder.build_pending_batch(excluded_ranges=list(self._reserved_ranges.values()))
+        batch = self.batch_builder.build_pending_batch(
+            excluded_ranges=list(self._reserved_ranges.values()),
+            force_flush=force_flush or reason != "scheduled",
+        )
         if batch is None:
             self.logger.info("event=summary_job_skipped reason=%s detail=no_pending_data", reason)
             return None
@@ -267,13 +282,78 @@ class Summarizer:
         )
         try:
             summary_text, summary_json = self.lm_client.summarize_batch(batch)
-            summary_id = self.storage.insert_summary(
-                job_id=job_id,
-                start_ts=batch.start_ts,
-                end_ts=batch.end_ts,
+            summary_payload = self._enrich_summary_payload(batch, summary_text, summary_json, reason=reason)
+            recent_summaries = self.storage.list_summaries(limit=self.summary_deduplicator.recent_compare_count)
+            dedup_decision = self.summary_deduplicator.evaluate(
+                batch=batch,
                 summary_text=summary_text,
-                summary_json=summary_json,
+                summary_json=summary_payload,
+                recent_summaries=recent_summaries,
             )
+
+            summary_id: int | None = None
+            if dedup_decision.action == "merge_previous" and dedup_decision.matched_summary_id is not None:
+                merged_record = next(
+                    (item for item in recent_summaries if item.id == dedup_decision.matched_summary_id),
+                    None,
+                )
+                if merged_record is not None:
+                    merged_payload = self._merge_summary_payload(
+                        merged_record.summary_json,
+                        batch=batch,
+                        new_summary_text=summary_text,
+                        new_summary_payload=summary_payload,
+                        reason=reason,
+                        similarity=dedup_decision.similarity,
+                    )
+                    self.storage.update_summary_record(
+                        merged_record.id or 0,
+                        end_ts=max(merged_record.end_ts, batch.end_ts),
+                        summary_json=merged_payload,
+                    )
+                    summary_id = merged_record.id
+                    self.logger.info(
+                        (
+                            "event=summary_job_merged job_id=%s summary_id=%s reason=%s matched_summary_id=%s "
+                            "similarity=%.3f start_ts=%.3f end_ts=%.3f"
+                        ),
+                        job_id,
+                        summary_id,
+                        dedup_decision.reason,
+                        dedup_decision.matched_summary_id,
+                        dedup_decision.similarity,
+                        batch.start_ts,
+                        batch.end_ts,
+                    )
+                else:
+                    summary_id = self.storage.insert_summary(
+                        job_id=job_id,
+                        start_ts=batch.start_ts,
+                        end_ts=batch.end_ts,
+                        summary_text=summary_text,
+                        summary_json=summary_payload,
+                    )
+            elif dedup_decision.action == "suppress":
+                self.logger.info(
+                    (
+                        "event=summary_job_suppressed job_id=%s reason=%s matched_summary_id=%s similarity=%.3f "
+                        "start_ts=%.3f end_ts=%.3f"
+                    ),
+                    job_id,
+                    dedup_decision.reason,
+                    dedup_decision.matched_summary_id,
+                    dedup_decision.similarity,
+                    batch.start_ts,
+                    batch.end_ts,
+                )
+            else:
+                summary_id = self.storage.insert_summary(
+                    job_id=job_id,
+                    start_ts=batch.start_ts,
+                    end_ts=batch.end_ts,
+                    summary_text=summary_text,
+                    summary_json=summary_payload,
+                )
 
             self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
             self.storage.purge_raw_data(batch.start_ts, batch.end_ts)
@@ -326,6 +406,64 @@ class Summarizer:
             )
             self.logger.exception("event=summary_job_failed job_id=%s reason=%s error=%s", job_id, reason, exc)
             return None
+
+    def _enrich_summary_payload(
+        self,
+        batch: SummaryBatch,
+        summary_text: str,
+        summary_json: dict[str, object] | object,
+        *,
+        reason: str,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = dict(summary_json) if isinstance(summary_json, dict) else {}
+        segment = batch.activity_segments[0] if batch.activity_segments else None
+        payload["summary_text"] = summary_text
+        payload["source_batch"] = {
+            "start_ts": batch.start_ts,
+            "end_ts": batch.end_ts,
+            "reason": reason,
+        }
+        if segment is not None:
+            payload["source_context"] = {
+                "segment_id": segment.segment_id,
+                "process_name": segment.dominant_process_name,
+                "window_title": segment.dominant_window_title,
+                "closure_reason": segment.closure_reason,
+                "blocked": segment.blocked,
+            }
+        else:
+            payload["source_context"] = {}
+        payload["activity_segments"] = [segment.to_dict() for segment in batch.activity_segments]
+        return payload
+
+    def _merge_summary_payload(
+        self,
+        existing_payload: dict[str, object] | object,
+        *,
+        batch: SummaryBatch,
+        new_summary_text: str,
+        new_summary_payload: dict[str, object],
+        reason: str,
+        similarity: float,
+    ) -> dict[str, object]:
+        merged: dict[str, object] = dict(existing_payload) if isinstance(existing_payload, dict) else {}
+        history = list(merged.get("merge_history", [])) if isinstance(merged.get("merge_history", []), list) else []
+        history.append(
+            {
+                "start_ts": batch.start_ts,
+                "end_ts": batch.end_ts,
+                "reason": reason,
+                "similarity": similarity,
+                "summary_text": new_summary_text,
+                "source_context": new_summary_payload.get("source_context", {}),
+            }
+        )
+        merged["merge_history"] = history
+        merged["merged_count"] = int(merged.get("merged_count", 0)) + 1
+        merged["last_merge"] = history[-1]
+        merged["source_batch"] = new_summary_payload.get("source_batch", {})
+        merged["activity_segments"] = new_summary_payload.get("activity_segments", [])
+        return merged
 
     def _ensure_worker_count_locked(self) -> None:
         while len(self._workers) < self._max_parallel_jobs:

@@ -19,6 +19,7 @@ from .screenshot_capture import ScreenshotCaptureService
 from .session_monitor import SessionMonitor
 from .storage import SQLiteStorage
 from .summarizer import Summarizer
+from .summary_dedup import SummaryDeduplicator
 from .text_reconstructor import TextReconstructionService, TextReconstructor
 from .window_tracker import ForegroundWindowTrackerService
 
@@ -83,6 +84,14 @@ class ServiceRegistry:
             interval_seconds=self.config.screenshot_interval_seconds,
             capture_mode=self.config.capture_mode,
             shutdown_event=shutdown_event,
+            dedup_exact_hash_enabled=self.config.screenshot_dedup_exact_hash_enabled,
+            dedup_perceptual_hash_enabled=self.config.screenshot_dedup_perceptual_hash_enabled,
+            dedup_phash_threshold=self.config.screenshot_dedup_phash_threshold,
+            dedup_ssim_enabled=self.config.screenshot_dedup_ssim_enabled,
+            dedup_ssim_threshold=self.config.screenshot_dedup_ssim_threshold,
+            dedup_resize_width=self.config.screenshot_dedup_resize_width,
+            dedup_compare_recent_count=self.config.screenshot_dedup_compare_recent_count,
+            min_keep_interval_seconds=self.config.screenshot_min_keep_interval_seconds,
         )
 
         text_reconstructor = TextReconstructor(
@@ -103,11 +112,23 @@ class ServiceRegistry:
             dedup_enabled=self.config.screenshot_dedup_enabled,
             dedup_threshold=self.config.screenshot_dedup_threshold,
             min_keep_interval_seconds=self.config.screenshot_min_keep_interval_seconds,
+            activity_segment_min_duration_seconds=self.config.activity_segment_min_duration_seconds,
+            activity_segment_max_duration_seconds=self.config.activity_segment_max_duration_seconds,
+            activity_segment_idle_gap_seconds=self.config.activity_segment_idle_gap_seconds,
+            activity_segment_title_similarity_threshold=self.config.activity_segment_title_similarity_threshold,
+            activity_segment_screenshot_phash_threshold=self.config.screenshot_dedup_phash_threshold,
+            activity_segment_screenshot_ssim_threshold=self.config.screenshot_dedup_ssim_threshold,
         )
         lmstudio_client = LMStudioClient(
             base_url=self.config.lmstudio_base_url,
             model=self.config.lmstudio_model,
             timeout_seconds=self.config.request_timeout_seconds,
+        )
+        summary_deduplicator = SummaryDeduplicator(
+            suppress_threshold=self.config.summary_similarity_suppress_threshold,
+            merge_threshold=self.config.summary_similarity_merge_threshold,
+            cooldown_seconds=self.config.summary_cooldown_seconds,
+            recent_compare_count=self.config.recent_summary_compare_count,
         )
         summarizer = Summarizer(
             storage=storage,
@@ -116,6 +137,7 @@ class ServiceRegistry:
             max_parallel_jobs=self.config.max_parallel_summary_jobs,
             error_notifier=error_notifier,
             shutdown_event=shutdown_event,
+            summary_deduplicator=summary_deduplicator,
         )
 
         return MonitoringServiceBundle(

@@ -15,6 +15,7 @@ from .monitoring_components import (
     MonitoringServiceBundle,
     ServiceRegistry,
 )
+from .summary_dedup import SummaryDeduplicator
 
 
 class MonitoringServices:
@@ -129,6 +130,17 @@ class MonitoringServices:
         self.window_tracker.poll_interval_seconds = max(0.2, self.config.foreground_poll_interval_seconds)
         self.screenshot_capture.interval_seconds = max(5, self.config.screenshot_interval_seconds)
         self.screenshot_capture.capture_mode = self.config.capture_mode
+        self.screenshot_capture._dedup_state.exact_hash_enabled = self.config.screenshot_dedup_exact_hash_enabled
+        self.screenshot_capture._dedup_state.perceptual_hash_enabled = self.config.screenshot_dedup_perceptual_hash_enabled
+        self.screenshot_capture._dedup_state.phash_threshold = self.config.screenshot_dedup_phash_threshold
+        self.screenshot_capture._dedup_state.ssim_enabled = self.config.screenshot_dedup_ssim_enabled
+        self.screenshot_capture._dedup_state.ssim_threshold = self.config.screenshot_dedup_ssim_threshold
+        self.screenshot_capture._dedup_state.compare_recent_count = self.config.screenshot_dedup_compare_recent_count
+        self.screenshot_capture._dedup_state.min_interval_same_visual_context_seconds = (
+            self.config.screenshot_min_keep_interval_seconds
+        )
+        self.screenshot_capture._dedup_state._trim_history()
+        self.screenshot_capture._dedup_resize_width = max(8, self.config.screenshot_dedup_resize_width)
         self.text_service.poll_interval_seconds = max(0.5, self.config.reconstruction_poll_interval_seconds)
         self.text_reconstructor.inactivity_gap_seconds = self.config.text_inactivity_gap_seconds
         self.batch_builder.max_text_segments = self.config.max_text_segments_per_summary
@@ -136,9 +148,23 @@ class MonitoringServices:
         self.batch_builder.dedup_enabled = self.config.screenshot_dedup_enabled
         self.batch_builder.dedup_threshold = self.config.screenshot_dedup_threshold
         self.batch_builder.min_keep_interval_seconds = self.config.screenshot_min_keep_interval_seconds
+        self.batch_builder.activity_segment_min_duration_seconds = self.config.activity_segment_min_duration_seconds
+        self.batch_builder.activity_segment_max_duration_seconds = self.config.activity_segment_max_duration_seconds
+        self.batch_builder.activity_segment_idle_gap_seconds = self.config.activity_segment_idle_gap_seconds
+        self.batch_builder.activity_segment_title_similarity_threshold = (
+            self.config.activity_segment_title_similarity_threshold
+        )
+        self.batch_builder.activity_segment_screenshot_phash_threshold = self.config.screenshot_dedup_phash_threshold
+        self.batch_builder.activity_segment_screenshot_ssim_threshold = self.config.screenshot_dedup_ssim_threshold
         self.lmstudio_client.base_url = self.config.lmstudio_base_url.rstrip("/")
         self.lmstudio_client.model = self.config.lmstudio_model
         self.lmstudio_client.timeout_seconds = self.config.request_timeout_seconds
+        self.summarizer.summary_deduplicator = SummaryDeduplicator(
+            suppress_threshold=self.config.summary_similarity_suppress_threshold,
+            merge_threshold=self.config.summary_similarity_merge_threshold,
+            cooldown_seconds=self.config.summary_cooldown_seconds,
+            recent_compare_count=self.config.recent_summary_compare_count,
+        )
         self.summarizer.update_max_parallel_jobs(self.config.max_parallel_summary_jobs)
         self.scheduler.interval_seconds = max(30, self.config.flush_interval_seconds)
         self.flush_coordinator.flush_interval_seconds = max(30, self.config.flush_interval_seconds)

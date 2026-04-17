@@ -19,7 +19,7 @@ else:  # pragma: no cover - import success depends on environment
 
 from .models import ScreenshotRecord, SharedState
 from .privacy import PrivacyPolicyEngine
-from .screenshot_dedup import compute_screenshot_fingerprint
+from .screenshot_dedup import ScreenshotDedupState, analyze_screenshot
 from .storage import SQLiteStorage
 from .window_tracker import get_foreground_window_info, get_window_capture_rect
 
@@ -38,6 +38,14 @@ class ScreenshotCaptureService:
         foreground_provider: Callable[[], Any] = get_foreground_window_info,
         window_rect_provider: Callable[[int], tuple[int, int, int, int] | None] = get_window_capture_rect,
         shutdown_event: threading.Event | None = None,
+        dedup_exact_hash_enabled: bool = True,
+        dedup_perceptual_hash_enabled: bool = True,
+        dedup_phash_threshold: int = 6,
+        dedup_ssim_enabled: bool = True,
+        dedup_ssim_threshold: float = 0.985,
+        dedup_resize_width: int = 32,
+        dedup_compare_recent_count: int = 8,
+        min_keep_interval_seconds: float = 120.0,
     ) -> None:
         self.storage = storage
         self.state = state
@@ -49,6 +57,18 @@ class ScreenshotCaptureService:
         self.window_rect_provider = window_rect_provider
         self.logger = logging.getLogger(__name__)
         self._capture_backend_missing_logged = False
+        self._dedup_state = ScreenshotDedupState(
+            compare_recent_count=dedup_compare_recent_count,
+            exact_hash_enabled=dedup_exact_hash_enabled,
+            perceptual_hash_enabled=dedup_perceptual_hash_enabled,
+            phash_threshold=dedup_phash_threshold,
+            ssim_enabled=dedup_ssim_enabled,
+            ssim_threshold=dedup_ssim_threshold,
+            min_interval_same_visual_context_seconds=min_keep_interval_seconds,
+        )
+        self._dedup_resize_width = max(8, int(dedup_resize_width))
+        self._dedup_hash_size = 8
+        self._seed_dedup_history()
 
         self._shutdown_event = shutdown_event or threading.Event()
         self._stop_event = threading.Event()
@@ -134,7 +154,67 @@ class ScreenshotCaptureService:
                 return False
 
             image = sct.grab(capture_region)
-            fingerprint = compute_screenshot_fingerprint(image.rgb, image.size)
+            decision = None
+            analysis = analyze_screenshot(
+                image.rgb,
+                image.size,
+                resize_width=self._dedup_resize_width,
+                hash_size=self._dedup_hash_size,
+            )
+            if analysis is None:
+                self.logger.info(
+                    "event=screenshot_capture_analysis_unavailable process=%s title=%s mode=%s",
+                    current_info.process_name,
+                    current_info.window_title,
+                    self.capture_mode,
+                )
+            else:
+                decision = self._dedup_state.consider(
+                    ts=ts,
+                    process_name=current_info.process_name,
+                    window_title=current_info.window_title,
+                    window_hwnd=current_info.hwnd,
+                    active_interval_id=snapshot.active_interval_id,
+                    analysis=analysis,
+                )
+                if not decision.keep:
+                    self.logger.info(
+                        (
+                            "event=screenshot_skipped reason=%s process=%s title=%s interval_id=%s "
+                            "phash_distance=%s ssim=%s streak=%s"
+                        ),
+                        decision.reason,
+                        current_info.process_name,
+                        current_info.window_title,
+                        snapshot.active_interval_id,
+                        decision.nearest_phash_distance,
+                        decision.nearest_ssim,
+                        decision.visual_context_streak,
+                    )
+                    return False
+
+                self.logger.info(
+                    (
+                        "event=screenshot_dedup_keep reason=%s process=%s title=%s interval_id=%s "
+                        "phash_distance=%s ssim=%s streak=%s"
+                    ),
+                    decision.reason,
+                    current_info.process_name,
+                    current_info.window_title,
+                    snapshot.active_interval_id,
+                    decision.nearest_phash_distance,
+                    decision.nearest_ssim,
+                    decision.visual_context_streak,
+                )
+                self._dedup_state.record_kept(
+                    ts=ts,
+                    process_name=current_info.process_name,
+                    window_title=current_info.window_title,
+                    window_hwnd=current_info.hwnd,
+                    active_interval_id=snapshot.active_interval_id,
+                    analysis=analysis,
+                )
+
             mss.tools.to_png(image.rgb, image.size, output=str(file_path))
 
         record = ScreenshotRecord(
@@ -145,7 +225,15 @@ class ScreenshotCaptureService:
             window_title=current_info.window_title,
             active_interval_id=snapshot.active_interval_id,
             window_hwnd=current_info.hwnd,
-            fingerprint=fingerprint,
+            fingerprint=analysis.perceptual_hash if analysis is not None else None,
+            exact_hash=analysis.exact_hash if analysis is not None else None,
+            perceptual_hash=analysis.perceptual_hash if analysis is not None else None,
+            image_width=analysis.width if analysis is not None else None,
+            image_height=analysis.height if analysis is not None else None,
+            nearest_phash_distance=decision.nearest_phash_distance if decision is not None else None,
+            nearest_ssim=decision.nearest_ssim if decision is not None else None,
+            dedup_reason=decision.reason if decision is not None else "analysis_unavailable",
+            visual_context_streak=decision.visual_context_streak if decision is not None else 0,
         )
         self.storage.insert_screenshot(record)
         self.logger.info(
@@ -157,6 +245,14 @@ class ScreenshotCaptureService:
             self.capture_mode,
         )
         return True
+
+    def _seed_dedup_history(self) -> None:
+        try:
+            recent = self.storage.fetch_recent_screenshots(limit=self._dedup_state.compare_recent_count)
+        except Exception as exc:
+            self.logger.debug("event=screenshot_dedup_seed_failed error=%s", exc)
+            return
+        self._dedup_state.seed(list(reversed(recent)))
 
     def _run(self) -> None:
         while not self._stop_event.is_set() and not self._shutdown_event.is_set():

@@ -71,6 +71,14 @@ class StorageSchemaManager:
             active_interval_id INTEGER,
             window_hwnd INTEGER,
             fingerprint TEXT,
+            exact_hash TEXT,
+            perceptual_hash TEXT,
+            image_width INTEGER,
+            image_height INTEGER,
+            nearest_phash_distance INTEGER,
+            nearest_ssim REAL,
+            dedup_reason TEXT,
+            visual_context_streak INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(active_interval_id) REFERENCES active_intervals(id)
         );
 
@@ -217,6 +225,22 @@ class StorageSchemaManager:
             self._conn.execute("ALTER TABLE screenshots ADD COLUMN window_hwnd INTEGER")
         if "fingerprint" not in columns:
             self._conn.execute("ALTER TABLE screenshots ADD COLUMN fingerprint TEXT")
+        if "exact_hash" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN exact_hash TEXT")
+        if "perceptual_hash" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN perceptual_hash TEXT")
+        if "image_width" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN image_width INTEGER")
+        if "image_height" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN image_height INTEGER")
+        if "nearest_phash_distance" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN nearest_phash_distance INTEGER")
+        if "nearest_ssim" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN nearest_ssim REAL")
+        if "dedup_reason" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN dedup_reason TEXT")
+        if "visual_context_streak" not in columns:
+            self._conn.execute("ALTER TABLE screenshots ADD COLUMN visual_context_streak INTEGER NOT NULL DEFAULT 0")
 
     def _log_db_query_timing(self, operation: str, started_at: float, *, rows: int | None = None) -> None:
         duration_ms = (time.perf_counter() - started_at) * 1000.0

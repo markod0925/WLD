@@ -89,12 +89,14 @@ class LMStudioClient:
         self.logger.info(
             (
                 "event=lmstudio_request model=%s base_url=%s start_ts=%.3f end_ts=%.3f "
-                "text_segments=%s screenshots=%s payload_content_type=%s prompt_size_bytes=%s payload_size_bytes=%s truncated=%s"
+                "activity_segments=%s text_segments=%s screenshots=%s payload_content_type=%s "
+                "prompt_size_bytes=%s payload_size_bytes=%s truncated=%s"
             ),
             self.model,
             self.base_url,
             batch.start_ts,
             batch.end_ts,
+            len(batch.activity_segments),
             len(batch.text_segments),
             len(batch.screenshots),
             "multimodal" if isinstance(user_content, list) else "text",

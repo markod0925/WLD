@@ -293,13 +293,16 @@ class SQLiteStorage(ActivityRepository):
 
     def insert_screenshot(self, screenshot: ScreenshotRecord) -> int:
         started_at = time.perf_counter()
+        perceptual_hash = screenshot.perceptual_hash or screenshot.fingerprint
         with self._lock:
             cursor = self._conn.execute(
                 """
                 INSERT INTO screenshots(
-                    ts, file_path, process_name, window_title, active_interval_id, window_hwnd, fingerprint
+                    ts, file_path, process_name, window_title, active_interval_id, window_hwnd,
+                    fingerprint, exact_hash, perceptual_hash, image_width, image_height,
+                    nearest_phash_distance, nearest_ssim, dedup_reason, visual_context_streak
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     screenshot.ts,
@@ -308,7 +311,15 @@ class SQLiteStorage(ActivityRepository):
                     screenshot.window_title,
                     screenshot.active_interval_id,
                     screenshot.window_hwnd,
-                    screenshot.fingerprint,
+                    perceptual_hash,
+                    screenshot.exact_hash,
+                    perceptual_hash,
+                    screenshot.image_width,
+                    screenshot.image_height,
+                    screenshot.nearest_phash_distance,
+                    screenshot.nearest_ssim,
+                    screenshot.dedup_reason,
+                    int(screenshot.visual_context_streak),
                 ),
             )
             self._conn.commit()
@@ -322,7 +333,10 @@ class SQLiteStorage(ActivityRepository):
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, ts, file_path, process_name, window_title, active_interval_id, window_hwnd, fingerprint
+                SELECT
+                    id, ts, file_path, process_name, window_title, active_interval_id, window_hwnd,
+                    fingerprint, exact_hash, perceptual_hash, image_width, image_height,
+                    nearest_phash_distance, nearest_ssim, dedup_reason, visual_context_streak
                 FROM screenshots
                 ORDER BY ts ASC
                 LIMIT ?
@@ -340,10 +354,62 @@ class SQLiteStorage(ActivityRepository):
                 active_interval_id=int(row["active_interval_id"]) if row["active_interval_id"] is not None else None,
                 window_hwnd=int(row["window_hwnd"]) if row["window_hwnd"] is not None else None,
                 fingerprint=str(row["fingerprint"]) if row["fingerprint"] is not None else None,
+                exact_hash=str(row["exact_hash"]) if row["exact_hash"] is not None else None,
+                perceptual_hash=str(row["perceptual_hash"]) if row["perceptual_hash"] is not None else None,
+                image_width=int(row["image_width"]) if row["image_width"] is not None else None,
+                image_height=int(row["image_height"]) if row["image_height"] is not None else None,
+                nearest_phash_distance=int(row["nearest_phash_distance"])
+                if row["nearest_phash_distance"] is not None
+                else None,
+                nearest_ssim=float(row["nearest_ssim"]) if row["nearest_ssim"] is not None else None,
+                dedup_reason=str(row["dedup_reason"]) if row["dedup_reason"] is not None else None,
+                visual_context_streak=int(row["visual_context_streak"]) if row["visual_context_streak"] is not None else 0,
             )
             for row in rows
         ]
         self._log_db_query_timing("fetch_unsummarized_screenshots", started_at, rows=len(result))
+        return result
+
+    def fetch_recent_screenshots(self, limit: int = 20) -> list[ScreenshotRecord]:
+        started_at = time.perf_counter()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, ts, file_path, process_name, window_title, active_interval_id, window_hwnd,
+                    fingerprint, exact_hash, perceptual_hash, image_width, image_height,
+                    nearest_phash_distance, nearest_ssim, dedup_reason, visual_context_streak
+                FROM screenshots
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        result = [
+            ScreenshotRecord(
+                id=int(row["id"]),
+                ts=float(row["ts"]),
+                file_path=str(row["file_path"]),
+                process_name=str(row["process_name"]),
+                window_title=str(row["window_title"]),
+                active_interval_id=int(row["active_interval_id"]) if row["active_interval_id"] is not None else None,
+                window_hwnd=int(row["window_hwnd"]) if row["window_hwnd"] is not None else None,
+                fingerprint=str(row["fingerprint"]) if row["fingerprint"] is not None else None,
+                exact_hash=str(row["exact_hash"]) if row["exact_hash"] is not None else None,
+                perceptual_hash=str(row["perceptual_hash"]) if row["perceptual_hash"] is not None else None,
+                image_width=int(row["image_width"]) if row["image_width"] is not None else None,
+                image_height=int(row["image_height"]) if row["image_height"] is not None else None,
+                nearest_phash_distance=int(row["nearest_phash_distance"])
+                if row["nearest_phash_distance"] is not None
+                else None,
+                nearest_ssim=float(row["nearest_ssim"]) if row["nearest_ssim"] is not None else None,
+                dedup_reason=str(row["dedup_reason"]) if row["dedup_reason"] is not None else None,
+                visual_context_streak=int(row["visual_context_streak"]) if row["visual_context_streak"] is not None else 0,
+            )
+            for row in rows
+        ]
+        self._log_db_query_timing("fetch_recent_screenshots", started_at, rows=len(result))
         return result
 
     def fetch_unsummarized_intervals(self, limit: int = 10000) -> list[ActiveInterval]:
@@ -501,6 +567,40 @@ class SQLiteStorage(ActivityRepository):
         self._record_db_write()
         self._log_db_query_timing("insert_summary", started_at, rows=1)
         return summary_id
+
+    def update_summary_record(
+        self,
+        summary_id: int,
+        *,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+        summary_text: str | None = None,
+        summary_json: dict | None = None,
+    ) -> None:
+        started_at = time.perf_counter()
+        updates: list[str] = []
+        values: list[object] = []
+        if start_ts is not None:
+            updates.append("start_ts = ?")
+            values.append(start_ts)
+        if end_ts is not None:
+            updates.append("end_ts = ?")
+            values.append(end_ts)
+        if summary_text is not None:
+            updates.append("summary_text = ?")
+            values.append(summary_text)
+        if summary_json is not None:
+            updates.append("summary_json = ?")
+            values.append(json.dumps(summary_json))
+        if not updates:
+            return
+
+        values.append(summary_id)
+        with self._lock:
+            self._conn.execute(f"UPDATE summaries SET {', '.join(updates)} WHERE id = ?", values)
+            self._conn.commit()
+        self._record_db_write()
+        self._log_db_query_timing("update_summary_record", started_at, rows=1)
 
     def list_summaries(self, limit: int = 100) -> list[SummaryRecord]:
         started_at = time.perf_counter()

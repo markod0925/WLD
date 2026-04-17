@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import logging
 
+from .activity_segmenter import ActivitySegment, ActivitySegmenter, build_activity_observations
 from .activity_repository import ActivityRepository
 from .models import ActiveInterval, BlockedInterval, ScreenshotRecord, TextSegment
 from .screenshot_dedup import select_representative_screenshots
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -13,15 +17,17 @@ class SummaryBatch:
 
     start_ts: float
     end_ts: float
-    active_intervals: list[ActiveInterval]
-    blocked_intervals: list[BlockedInterval]
-    text_segments: list[TextSegment]
-    screenshots: list[ScreenshotRecord]
+    activity_segments: list[ActivitySegment] = field(default_factory=list)
+    active_intervals: list[ActiveInterval] = field(default_factory=list)
+    blocked_intervals: list[BlockedInterval] = field(default_factory=list)
+    text_segments: list[TextSegment] = field(default_factory=list)
+    screenshots: list[ScreenshotRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "start_ts": self.start_ts,
             "end_ts": self.end_ts,
+            "activity_segments": [segment.to_dict() for segment in self.activity_segments],
             "active_intervals": [
                 {
                     "start_ts": item.start_ts,
@@ -59,6 +65,13 @@ class SummaryBatch:
                     "file_path": item.file_path,
                     "process_name": item.process_name,
                     "window_title": item.window_title,
+                    "fingerprint": item.fingerprint,
+                    "exact_hash": item.exact_hash,
+                    "perceptual_hash": item.perceptual_hash,
+                    "nearest_phash_distance": item.nearest_phash_distance,
+                    "nearest_ssim": item.nearest_ssim,
+                    "dedup_reason": item.dedup_reason,
+                    "visual_context_streak": item.visual_context_streak,
                 }
                 for item in self.screenshots
             ],
@@ -76,6 +89,12 @@ class BatchBuilder:
         dedup_enabled: bool = True,
         dedup_threshold: int = 6,
         min_keep_interval_seconds: float = 120.0,
+        activity_segment_min_duration_seconds: float = 180.0,
+        activity_segment_max_duration_seconds: float = 900.0,
+        activity_segment_idle_gap_seconds: float = 20.0,
+        activity_segment_title_similarity_threshold: float = 0.72,
+        activity_segment_screenshot_phash_threshold: int = 6,
+        activity_segment_screenshot_ssim_threshold: float = 0.985,
     ) -> None:
         self.storage = storage
         self.max_text_segments = max_text_segments
@@ -83,8 +102,28 @@ class BatchBuilder:
         self.dedup_enabled = bool(dedup_enabled)
         self.dedup_threshold = max(0, int(dedup_threshold))
         self.min_keep_interval_seconds = max(0.0, float(min_keep_interval_seconds))
+        self.activity_segment_min_duration_seconds = max(0.0, float(activity_segment_min_duration_seconds))
+        self.activity_segment_max_duration_seconds = max(
+            self.activity_segment_min_duration_seconds,
+            float(activity_segment_max_duration_seconds),
+        )
+        self.activity_segment_idle_gap_seconds = max(0.0, float(activity_segment_idle_gap_seconds))
+        self.activity_segment_title_similarity_threshold = max(
+            0.0,
+            min(1.0, float(activity_segment_title_similarity_threshold)),
+        )
+        self.activity_segment_screenshot_phash_threshold = max(0, int(activity_segment_screenshot_phash_threshold))
+        self.activity_segment_screenshot_ssim_threshold = max(
+            0.0,
+            min(1.0, float(activity_segment_screenshot_ssim_threshold)),
+        )
 
-    def build_pending_batch(self, excluded_ranges: list[tuple[float, float]] | None = None) -> SummaryBatch | None:
+    def build_pending_batch(
+        self,
+        excluded_ranges: list[tuple[float, float]] | None = None,
+        *,
+        force_flush: bool = False,
+    ) -> SummaryBatch | None:
         intervals = self.storage.fetch_unsummarized_intervals()
         blocked_intervals = self.storage.fetch_unsummarized_blocked_intervals()
 
@@ -110,9 +149,57 @@ class BatchBuilder:
                 if not _overlaps_any_range(item.start_ts, item.end_ts or item.start_ts, excluded_ranges)
             ]
             text_segments = [
-                item for item in text_segments if not _overlaps_any_range(item.start_ts, item.end_ts, excluded_ranges)
-            ]
-            screenshots = [item for item in screenshots if not _overlaps_any_range(item.ts, item.ts, excluded_ranges)]
+            item for item in text_segments if not _overlaps_any_range(item.start_ts, item.end_ts, excluded_ranges)
+        ]
+        screenshots = [item for item in screenshots if not _overlaps_any_range(item.ts, item.ts, excluded_ranges)]
+
+        observations = build_activity_observations(
+            intervals=intervals,
+            blocked_intervals=blocked_intervals,
+            text_segments=text_segments,
+            screenshots=screenshots,
+        )
+        segments = ActivitySegmenter(
+            idle_gap_seconds=self.activity_segment_idle_gap_seconds,
+            max_duration_seconds=self.activity_segment_max_duration_seconds,
+            title_similarity_threshold=self.activity_segment_title_similarity_threshold,
+            screenshot_phash_threshold=self.activity_segment_screenshot_phash_threshold,
+            screenshot_ssim_threshold=self.activity_segment_screenshot_ssim_threshold,
+        ).segment(observations, force_flush=force_flush)
+
+        ready_segment = next((segment for segment in segments if segment.is_closed), None)
+        if ready_segment is None:
+            if not force_flush or not segments:
+                _LOGGER.info(
+                    "event=activity_segment_pending reason=%s detail=%s segment_count=%s",
+                    "force_flush_requested" if force_flush else "open_segment_not_mature",
+                    "no_closed_segment_ready",
+                    len(segments),
+                )
+                return None
+            ready_segment = segments[-1]
+        _LOGGER.info(
+            (
+                "event=activity_segment_selected segment_id=%s reason=%s start_ts=%.3f end_ts=%.3f "
+                "duration_seconds=%.3f process=%s title=%s observations=%s screenshots=%s text_segments=%s"
+            ),
+            ready_segment.segment_id,
+            ready_segment.closure_reason,
+            ready_segment.start_ts,
+            ready_segment.end_ts,
+            ready_segment.duration_seconds,
+            ready_segment.dominant_process_name,
+            ready_segment.dominant_window_title,
+            ready_segment.observation_count,
+            ready_segment.screenshot_count,
+            ready_segment.text_segment_count,
+        )
+
+        segment_end = ready_segment.end_ts
+        intervals = [item for item in intervals if (item.end_ts or item.start_ts) <= segment_end]
+        blocked_intervals = [item for item in blocked_intervals if (item.end_ts or item.start_ts) <= segment_end]
+        text_segments = [item for item in text_segments if item.end_ts <= segment_end]
+        screenshots = [item for item in screenshots if item.ts <= segment_end]
 
         screenshots = select_representative_screenshots(
             screenshots,
@@ -122,23 +209,12 @@ class BatchBuilder:
             min_keep_interval_seconds=self.min_keep_interval_seconds,
         )
 
-        safe_end = _compute_safe_end_boundary(
-            text_segments=text_segments,
-            screenshots=screenshots,
-            max_text_segments=self.max_text_segments,
-            max_screenshots=self.max_screenshots,
-        )
-        if safe_end is not None:
-            intervals = [item for item in intervals if (item.end_ts or item.start_ts) <= safe_end]
-            blocked_intervals = [item for item in blocked_intervals if (item.end_ts or item.start_ts) <= safe_end]
-            text_segments = [item for item in text_segments if item.end_ts <= safe_end]
-            screenshots = [item for item in screenshots if item.ts <= safe_end]
-
         return build_batch_from_pending(
             intervals=intervals,
             blocked_intervals=blocked_intervals,
             text_segments=text_segments,
             screenshots=screenshots,
+            activity_segments=[ready_segment],
         )
 
     @staticmethod
@@ -164,6 +240,7 @@ def build_batch_from_pending(
     blocked_intervals: list[BlockedInterval],
     text_segments: list[TextSegment],
     screenshots: list[ScreenshotRecord],
+    activity_segments: list[ActivitySegment] | None = None,
 ) -> SummaryBatch | None:
     if not intervals and not blocked_intervals and not text_segments and not screenshots:
         return None
@@ -193,27 +270,12 @@ def build_batch_from_pending(
     return SummaryBatch(
         start_ts=start_ts,
         end_ts=end_ts,
+        activity_segments=list(activity_segments or []),
         active_intervals=sorted(intervals, key=lambda item: item.start_ts),
         blocked_intervals=sorted(blocked_intervals, key=lambda item: item.start_ts),
         text_segments=sorted(text_segments, key=lambda item: item.start_ts),
         screenshots=sorted(screenshots, key=lambda item: item.ts),
     )
-
-
-def _compute_safe_end_boundary(
-    text_segments: list[TextSegment],
-    screenshots: list[ScreenshotRecord],
-    max_text_segments: int,
-    max_screenshots: int,
-) -> float | None:
-    boundaries: list[float] = []
-    if max_text_segments > 0 and len(text_segments) >= max_text_segments and text_segments:
-        boundaries.append(max(item.end_ts for item in text_segments))
-    if max_screenshots > 0 and len(screenshots) >= max_screenshots and screenshots:
-        boundaries.append(max(item.ts for item in screenshots))
-    if not boundaries:
-        return None
-    return min(boundaries)
 
 
 def _overlaps_any_range(start_ts: float, end_ts: float, excluded_ranges: list[tuple[float, float]]) -> bool:
