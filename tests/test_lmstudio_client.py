@@ -183,3 +183,69 @@ def test_lmstudio_client_daily_recap_uses_structured_schema(monkeypatch: pytest.
     assert recap_text == "daily recap"
     assert parsed["summary_text"] == "daily recap"
     assert parsed["metadata"]["response_kind"] == "daily_recap"
+
+
+def test_prompt_builder_limits_daily_recap_prompt_budget() -> None:
+    builder = LMStudioPromptBuilder(
+        max_daily_summaries=20,
+        max_text_chars=500,
+        max_prompt_chars=2000,
+    )
+    summaries = [
+        SummaryRecord(
+            id=i,
+            job_id=i,
+            start_ts=float(i),
+            end_ts=float(i + 1),
+            summary_text=("x" * 350) + str(i),
+            summary_json={"summary_text": "x" * 350},
+            created_ts=float(i + 2),
+        )
+        for i in range(8)
+    ]
+
+    result = builder.build_daily_recap_prompt(day=date(2026, 4, 20), summaries=summaries)
+
+    assert len(result.prompt_text) > 2000
+    assert result.metadata["max_prompt_chars"] == 2000
+
+
+def test_lmstudio_client_daily_recap_splits_large_input_into_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    builder = LMStudioPromptBuilder(max_text_chars=500, max_prompt_chars=1800, max_daily_summaries=50)
+    client = LMStudioClient(
+        base_url="http://localhost:1234/v1",
+        model="test-model",
+        timeout_seconds=5,
+        prompt_builder=builder,
+    )
+    calls: list[dict] = []
+
+    def fake_post(*_args: object, **kwargs: object) -> FakeResponse:
+        calls.append(kwargs["json"])
+        call_index = len(calls)
+        return FakeResponse(
+            f'{{"summary_text":"response-{call_index}","key_points":[],"blocked_activity":[],"metadata":{{}}}}'
+        )
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    summaries = [
+        SummaryRecord(
+            id=i,
+            job_id=i,
+            start_ts=float(i),
+            end_ts=float(i + 1),
+            summary_text=("x" * 450) + str(i),
+            summary_json={"summary_text": "x" * 450},
+            created_ts=float(i + 2),
+        )
+        for i in range(6)
+    ]
+
+    chunks = client._split_daily_recap_chunks(day=date(2026, 4, 20), summaries=summaries)
+    recap_text, parsed = client.summarize_daily_recap(day=date(2026, 4, 20), summaries=summaries)
+
+    assert len(chunks) > 1
+    assert recap_text == f"response-{len(chunks) + 1}"
+    assert parsed["summary_text"] == f"response-{len(chunks) + 1}"
+    assert parsed["metadata"]["intermediate_chunk_count"] == len(chunks)
+    assert len(calls) == len(chunks) + 1

@@ -30,6 +30,7 @@ class AppConfig:
     flush_interval_seconds: int = 300
     lmstudio_base_url: str = "http://127.0.0.1:1234/v1"
     lmstudio_model: str = "local-model"
+    lmstudio_max_prompt_chars: int = 20000
     app_data_dir: str = ""
     screenshot_dir: str = ""
     log_dir: str = ""
@@ -79,6 +80,7 @@ class AppConfig:
         self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "active_window"
 
         self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
+        self.lmstudio_max_prompt_chars = max(2000, int(self.lmstudio_max_prompt_chars))
         self.activity_segment_min_duration_seconds = max(0.0, float(self.activity_segment_min_duration_seconds))
         self.activity_segment_max_duration_seconds = max(
             self.activity_segment_min_duration_seconds,
@@ -229,6 +231,7 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "flush_interval_seconds": _coerce_int,
         "lmstudio_base_url": _coerce_str,
         "lmstudio_model": _coerce_str,
+        "lmstudio_max_prompt_chars": _coerce_int,
         "app_data_dir": _coerce_str,
         "screenshot_dir": _coerce_str,
         "log_dir": _coerce_str,

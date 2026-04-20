@@ -160,6 +160,7 @@ class MonitoringServices:
         self.lmstudio_client.base_url = self.config.lmstudio_base_url.rstrip("/")
         self.lmstudio_client.model = self.config.lmstudio_model
         self.lmstudio_client.timeout_seconds = self.config.request_timeout_seconds
+        self.lmstudio_client.prompt_builder.max_prompt_chars = self.config.lmstudio_max_prompt_chars
         self.summarizer.summary_deduplicator = SummaryDeduplicator(
             suppress_threshold=self.config.summary_similarity_suppress_threshold,
             merge_threshold=self.config.summary_similarity_merge_threshold,

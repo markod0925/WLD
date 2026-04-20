@@ -147,6 +147,27 @@ class LMStudioClient:
         endpoint = f"{self.base_url}/chat/completions"
         job_id = f"daily_recap:{day.isoformat()}"
         text_chars = sum(len(summary.summary_text) for summary in summaries)
+        summary_chunks = self._split_daily_recap_chunks(day=day, summaries=summaries)
+        chunk_count = len(summary_chunks)
+        log_llm_stage(
+            self.logger,
+            "chunk_plan",
+            "ok",
+            job_id=job_id,
+            model=self.model,
+            endpoint=endpoint,
+            summaries=len(summaries),
+            chunks=chunk_count,
+            max_prompt_chars=self.prompt_builder.max_prompt_chars,
+        )
+        if chunk_count > 1:
+            self.logger.info(
+                "event=daily_recap_chunking_enabled job_id=%s summaries=%s chunks=%s max_prompt_chars=%s",
+                job_id,
+                len(summaries),
+                chunk_count,
+                self.prompt_builder.max_prompt_chars,
+            )
         log_llm_stage(
             self.logger,
             "payload_build",
@@ -157,8 +178,17 @@ class LMStudioClient:
             text_chars=text_chars,
             summaries=len(summaries),
         )
-        try:
-            prompt_result = self.prompt_builder.build_daily_recap_prompt(day=day, summaries=summaries)
+        intermediate: list[LMStudioStructuredResponse] = []
+        for index, chunk in enumerate(summary_chunks):
+            response_kind = "daily_recap" if chunk_count == 1 else f"daily_recap_chunk_{index + 1}"
+            prompt_result = self._build_daily_recap_prompt_result(
+                day=day,
+                summaries=chunk,
+                endpoint=endpoint,
+                job_id=job_id,
+                text_chars=text_chars,
+                total_summaries=len(summaries),
+            )
             payload = self._build_payload(
                 prompt_text=prompt_result.prompt_text,
                 system_message=(
@@ -166,6 +196,84 @@ class LMStudioClient:
                     "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
                 ),
             )
+            log_llm_stage(
+                self.logger,
+                "payload_build",
+                "ok",
+                job_id=job_id,
+                model=self.model,
+                endpoint=endpoint,
+                text_chars=text_chars,
+                summaries=len(chunk),
+                messages=len(payload["messages"]),
+                images=0,
+                truncated=prompt_result.metadata.get("truncated", False),
+                chunk=f"{index + 1}/{chunk_count}",
+            )
+            structured = self._request_structured_completion(
+                payload=payload,
+                response_kind=response_kind,
+                prompt_result=prompt_result,
+                endpoint=endpoint,
+            )
+            intermediate.append(structured)
+
+        if chunk_count == 1:
+            structured = intermediate[0]
+        else:
+            aggregate_summaries = self._to_intermediate_summary_records(intermediate)
+            final_prompt_result = self._build_daily_recap_prompt_result(
+                day=day,
+                summaries=aggregate_summaries,
+                endpoint=endpoint,
+                job_id=job_id,
+                text_chars=sum(len(item.summary_text) for item in aggregate_summaries),
+                total_summaries=len(aggregate_summaries),
+            )
+            final_payload = self._build_payload(
+                prompt_text=final_prompt_result.prompt_text,
+                system_message=(
+                    "You generate concise daily work recaps. "
+                    "Combine intermediate recap chunks into one final daily recap. "
+                    "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
+                ),
+            )
+            log_llm_stage(
+                self.logger,
+                "payload_build",
+                "ok",
+                job_id=job_id,
+                model=self.model,
+                endpoint=endpoint,
+                text_chars=sum(len(item.summary_text) for item in aggregate_summaries),
+                summaries=len(aggregate_summaries),
+                messages=len(final_payload["messages"]),
+                images=0,
+                truncated=final_prompt_result.metadata.get("truncated", False),
+                chunk="final",
+            )
+            structured = self._request_structured_completion(
+                payload=final_payload,
+                response_kind="daily_recap",
+                prompt_result=final_prompt_result,
+                endpoint=endpoint,
+            )
+            structured.metadata["intermediate_chunk_count"] = chunk_count
+
+        return structured.summary_text, structured.to_dict()
+
+    def _build_daily_recap_prompt_result(
+        self,
+        *,
+        day: date,
+        summaries: list[SummaryRecord],
+        endpoint: str,
+        job_id: str,
+        text_chars: int,
+        total_summaries: int,
+    ) -> PromptBuildResult:
+        try:
+            return self.prompt_builder.build_daily_recap_prompt(day=day, summaries=summaries)
         except Exception as exc:
             log_llm_stage(
                 self.logger,
@@ -176,7 +284,7 @@ class LMStudioClient:
                 model=self.model,
                 endpoint=endpoint,
                 text_chars=text_chars,
-                summaries=len(summaries),
+                summaries=total_summaries,
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
                 exc_info=True,
@@ -186,26 +294,38 @@ class LMStudioClient:
                 "payload_build",
             ) from exc
 
-        log_llm_stage(
-            self.logger,
-            "payload_build",
-            "ok",
-            job_id=job_id,
-            model=self.model,
-            endpoint=endpoint,
-            text_chars=text_chars,
-            summaries=len(summaries),
-            messages=len(payload["messages"]),
-            images=0,
-            truncated=prompt_result.metadata.get("truncated", False),
-        )
-        structured = self._request_structured_completion(
-            payload=payload,
-            response_kind="daily_recap",
-            prompt_result=prompt_result,
-            endpoint=endpoint,
-        )
-        return structured.summary_text, structured.to_dict()
+    def _split_daily_recap_chunks(self, *, day: date, summaries: list[SummaryRecord]) -> list[list[SummaryRecord]]:
+        if not summaries:
+            return [[]]
+        chunks: list[list[SummaryRecord]] = []
+        current: list[SummaryRecord] = []
+        for summary in summaries:
+            candidate = [*current, summary]
+            prompt = self.prompt_builder.build_daily_recap_prompt(day=day, summaries=candidate)
+            if len(prompt.prompt_text) <= self.prompt_builder.max_prompt_chars or not current:
+                current = candidate
+                continue
+            chunks.append(current)
+            current = [summary]
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _to_intermediate_summary_records(self, items: list[LMStudioStructuredResponse]) -> list[SummaryRecord]:
+        records: list[SummaryRecord] = []
+        for index, item in enumerate(items, start=1):
+            records.append(
+                SummaryRecord(
+                    id=None,
+                    job_id=index,
+                    start_ts=float(index),
+                    end_ts=float(index),
+                    summary_text=item.summary_text,
+                    summary_json=item.to_dict(),
+                    created_ts=float(index),
+                )
+            )
+        return records
 
     def _post_chat_completion(self, payload: dict[str, Any], *, endpoint: str) -> requests.Response:
         start = time.perf_counter()

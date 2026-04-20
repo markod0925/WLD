@@ -39,5 +39,6 @@
   "screenshot_dedup_compare_recent_count": 8,
   "screenshot_dedup_enabled": true,
   "screenshot_dedup_threshold": 6,
-  "screenshot_min_keep_interval_seconds": 120
+  "screenshot_min_keep_interval_seconds": 120,
+  "lmstudio_max_prompt_chars": 20000
 }

@@ -23,11 +23,13 @@ class LMStudioPromptBuilder:
         max_summary_screenshots: int = 3,
         max_daily_summaries: int = 120,
         max_text_chars: int = 1500,
+        max_prompt_chars: int = 20000,
     ) -> None:
         self.max_summary_text_segments = max(1, int(max_summary_text_segments))
         self.max_summary_screenshots = max(1, int(max_summary_screenshots))
         self.max_daily_summaries = max(1, int(max_daily_summaries))
         self.max_text_chars = max(200, int(max_text_chars))
+        self.max_prompt_chars = max(2000, int(max_prompt_chars))
 
     def build_summary_prompt(self, batch: SummaryBatch) -> PromptBuildResult:
         payload, metadata = self._build_summary_payload(batch)
@@ -187,6 +189,7 @@ class LMStudioPromptBuilder:
             "max_summary_screenshots": self.max_summary_screenshots,
             "max_daily_summaries": self.max_daily_summaries,
             "max_text_chars": self.max_text_chars,
+            "max_prompt_chars": self.max_prompt_chars,
             "original_counts": original_counts,
             "included_counts": included_counts,
         }
