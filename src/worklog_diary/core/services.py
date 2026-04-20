@@ -7,6 +7,7 @@ from datetime import date
 from .config import AppConfig, app_data_dir_source, is_frozen_executable, save_config
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .logging_setup import configure_logging
+from .lmstudio_logging import get_failed_stage
 from .monitoring_components import (
     DiagnosticsService,
     FlushCoordinator,
@@ -216,7 +217,13 @@ class MonitoringServices:
                 "Summary generation failed. The daily recap could not be created.",
                 key=f"{day_key}|{exc.__class__.__name__}",
             )
-            self.logger.exception("event=daily_recap_generation_failed day=%s error=%s", day_key, exc)
+            self.logger.exception(
+                "event=daily_recap_generation_failed day=%s failed_stage=%s error_type=%s error=%s",
+                day_key,
+                get_failed_stage(exc, default="unknown"),
+                exc.__class__.__name__,
+                exc,
+            )
             raise
 
     def shutdown(self) -> None:

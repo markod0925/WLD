@@ -6,14 +6,17 @@ import pytest
 import requests
 
 from worklog_diary.core.batching import SummaryBatch
+from worklog_diary.core.errors import LMStudioServiceUnavailableError
 from worklog_diary.core.lmstudio_client import LMStudioClient
 from worklog_diary.core.lmstudio_prompt import LMStudioPromptBuilder
 from worklog_diary.core.models import ActiveInterval, ScreenshotRecord, SummaryRecord, TextSegment
 
 
 class FakeResponse:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, status_code: int = 200) -> None:
         self._content = content
+        self.status_code = status_code
+        self.text = content
 
     def raise_for_status(self) -> None:
         return None
@@ -126,7 +129,7 @@ def test_lmstudio_client_retries_malformed_response_then_parses(monkeypatch: pyt
     assert "invalid" in calls[1]["messages"][1]["content"].lower()
 
 
-def test_lmstudio_client_falls_back_after_malformed_responses(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lmstudio_client_raises_on_malformed_responses_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
     responses = iter([FakeResponse("still bad"), FakeResponse("still bad again")])
 
@@ -135,16 +138,13 @@ def test_lmstudio_client_falls_back_after_malformed_responses(monkeypatch: pytes
 
     monkeypatch.setattr(requests, "post", fake_post)
 
-    summary_text, parsed = client.summarize_batch(_summary_batch())
+    with pytest.raises(LMStudioServiceUnavailableError) as exc_info:
+        client.summarize_batch(_summary_batch())
 
-    assert summary_text == "still bad again"
-    assert parsed["metadata"]["parse_status"] == "fallback"
-    assert parsed["metadata"]["attempts"] == 2
-    assert parsed["key_points"] == []
-    assert parsed["blocked_activity"] == []
+    assert getattr(exc_info.value, "failed_stage", None) == "response_parse"
 
 
-def test_lmstudio_client_falls_back_on_non_object_json(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lmstudio_client_raises_on_non_object_json(monkeypatch: pytest.MonkeyPatch) -> None:
     client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
     responses = iter([FakeResponse("[1, 2, 3]"), FakeResponse("[1, 2, 3]")])
 
@@ -153,11 +153,10 @@ def test_lmstudio_client_falls_back_on_non_object_json(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(requests, "post", fake_post)
 
-    summary_text, parsed = client.summarize_batch(_summary_batch())
+    with pytest.raises(LMStudioServiceUnavailableError) as exc_info:
+        client.summarize_batch(_summary_batch())
 
-    assert summary_text == "[1, 2, 3]"
-    assert parsed["metadata"]["parse_status"] == "fallback"
-    assert "JSON object" in parsed["metadata"]["parse_error"]
+    assert getattr(exc_info.value, "failed_stage", None) == "response_parse"
 
 
 def test_lmstudio_client_daily_recap_uses_structured_schema(monkeypatch: pytest.MonkeyPatch) -> None:

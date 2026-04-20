@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import re
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,12 @@ from .batching import SummaryBatch
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .lmstudio_prompt import LMStudioPromptBuilder, PromptBuildResult
 from .models import SummaryRecord
+from .lmstudio_logging import (
+    log_llm_stage,
+    safe_error,
+    safe_response_preview,
+    set_failed_stage,
+)
 
 
 STRUCTURED_SCHEMA_KEYS = ("summary_text", "key_points", "blocked_activity", "metadata")
@@ -63,129 +70,244 @@ class LMStudioClient:
         self.logger = logging.getLogger(__name__)
 
     def summarize_batch(self, batch: SummaryBatch) -> tuple[str, dict[str, Any]]:
-        prompt_result = self.prompt_builder.build_summary_prompt(batch)
-        prompt_size_bytes = len(prompt_result.prompt_text.encode("utf-8"))
-        content: list[dict[str, Any]] = [{"type": "text", "text": prompt_result.prompt_text}]
-        for screenshot in batch.screenshots:
-            image_data = _file_to_data_uri(screenshot.file_path)
-            if image_data:
-                content.append({"type": "image_url", "image_url": {"url": image_data}})
-
-        user_content: str | list[dict[str, Any]]
-        if len(content) == 1:
-            user_content = prompt_result.prompt_text
-        else:
-            user_content = content
-
-        payload = self._build_payload(
-            prompt_text=prompt_result.prompt_text,
-            system_message=(
-                "You summarize desktop work activity. "
-                "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
-            ),
-            user_content=user_content,
+        endpoint = f"{self.base_url}/chat/completions"
+        text_chars = sum(len(segment.text) for segment in batch.text_segments)
+        screenshot_count = len(batch.screenshots)
+        log_llm_stage(
+            self.logger,
+            "payload_build",
+            "start",
+            model=self.model,
+            endpoint=endpoint,
+            text_chars=text_chars,
+            screenshots=screenshot_count,
         )
-        payload_size_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        self.logger.info(
-            (
-                "event=lmstudio_request model=%s base_url=%s start_ts=%.3f end_ts=%.3f "
-                "activity_segments=%s text_segments=%s screenshots=%s payload_content_type=%s "
-                "prompt_size_bytes=%s payload_size_bytes=%s truncated=%s"
-            ),
-            self.model,
-            self.base_url,
-            batch.start_ts,
-            batch.end_ts,
-            len(batch.activity_segments),
-            len(batch.text_segments),
-            len(batch.screenshots),
-            "multimodal" if isinstance(user_content, list) else "text",
-            prompt_size_bytes,
-            payload_size_bytes,
-            prompt_result.metadata.get("truncated", False),
+        try:
+            prompt_result = self.prompt_builder.build_summary_prompt(batch)
+            content: list[dict[str, Any]] = [{"type": "text", "text": prompt_result.prompt_text}]
+            for screenshot in batch.screenshots:
+                image_data = _file_to_data_uri(screenshot.file_path)
+                if image_data:
+                    content.append({"type": "image_url", "image_url": {"url": image_data}})
+
+            user_content: str | list[dict[str, Any]]
+            if len(content) == 1:
+                user_content = prompt_result.prompt_text
+            else:
+                user_content = content
+
+            payload = self._build_payload(
+                prompt_text=prompt_result.prompt_text,
+                system_message=(
+                    "You summarize desktop work activity. "
+                    "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
+                ),
+                user_content=user_content,
+            )
+        except Exception as exc:
+            log_llm_stage(
+                self.logger,
+                "payload_build",
+                "error",
+                level=logging.ERROR,
+                model=self.model,
+                endpoint=endpoint,
+                text_chars=text_chars,
+                screenshots=screenshot_count,
+                error_type=exc.__class__.__name__,
+                error=safe_error(exc),
+                exc_info=True,
+            )
+            raise set_failed_stage(
+                LMStudioServiceUnavailableError("Service unavailable: LM Studio payload could not be built."),
+                "payload_build",
+            ) from exc
+
+        log_llm_stage(
+            self.logger,
+            "payload_build",
+            "ok",
+            model=self.model,
+            endpoint=endpoint,
+            text_chars=text_chars,
+            screenshots=screenshot_count,
+            messages=len(payload["messages"]),
+            images=len(content) - 1,
+            truncated=prompt_result.metadata.get("truncated", False),
         )
         structured = self._request_structured_completion(
             payload=payload,
             response_kind="summary",
             prompt_result=prompt_result,
+            endpoint=endpoint,
         )
         return structured.summary_text, structured.to_dict()
 
     def summarize_daily_recap(self, day: date, summaries: list[SummaryRecord]) -> tuple[str, dict[str, Any]]:
-        prompt_result = self.prompt_builder.build_daily_recap_prompt(day=day, summaries=summaries)
-        prompt_size_bytes = len(prompt_result.prompt_text.encode("utf-8"))
-        payload = self._build_payload(
-            prompt_text=prompt_result.prompt_text,
-            system_message=(
-                "You generate concise daily work recaps. "
-                "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
-            ),
+        endpoint = f"{self.base_url}/chat/completions"
+        job_id = f"daily_recap:{day.isoformat()}"
+        text_chars = sum(len(summary.summary_text) for summary in summaries)
+        log_llm_stage(
+            self.logger,
+            "payload_build",
+            "start",
+            job_id=job_id,
+            model=self.model,
+            endpoint=endpoint,
+            text_chars=text_chars,
+            summaries=len(summaries),
         )
-        payload_size_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        try:
+            prompt_result = self.prompt_builder.build_daily_recap_prompt(day=day, summaries=summaries)
+            payload = self._build_payload(
+                prompt_text=prompt_result.prompt_text,
+                system_message=(
+                    "You generate concise daily work recaps. "
+                    "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
+                ),
+            )
+        except Exception as exc:
+            log_llm_stage(
+                self.logger,
+                "payload_build",
+                "error",
+                level=logging.ERROR,
+                job_id=job_id,
+                model=self.model,
+                endpoint=endpoint,
+                text_chars=text_chars,
+                summaries=len(summaries),
+                error_type=exc.__class__.__name__,
+                error=safe_error(exc),
+                exc_info=True,
+            )
+            raise set_failed_stage(
+                LMStudioServiceUnavailableError("Service unavailable: LM Studio payload could not be built."),
+                "payload_build",
+            ) from exc
 
-        self.logger.info(
-            (
-                "event=lmstudio_daily_recap_request model=%s base_url=%s day=%s source_summaries=%s "
-                "prompt_size_bytes=%s payload_size_bytes=%s truncated=%s"
-            ),
-            self.model,
-            self.base_url,
-            day.isoformat(),
-            len(summaries),
-            prompt_size_bytes,
-            payload_size_bytes,
-            prompt_result.metadata.get("truncated", False),
+        log_llm_stage(
+            self.logger,
+            "payload_build",
+            "ok",
+            job_id=job_id,
+            model=self.model,
+            endpoint=endpoint,
+            text_chars=text_chars,
+            summaries=len(summaries),
+            messages=len(payload["messages"]),
+            images=0,
+            truncated=prompt_result.metadata.get("truncated", False),
         )
         structured = self._request_structured_completion(
             payload=payload,
             response_kind="daily_recap",
             prompt_result=prompt_result,
+            endpoint=endpoint,
         )
         return structured.summary_text, structured.to_dict()
 
-    def _post_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_chat_completion(self, payload: dict[str, Any], *, endpoint: str) -> requests.Response:
+        start = time.perf_counter()
+        log_llm_stage(
+            self.logger,
+            "http_start",
+            "start",
+            endpoint=endpoint,
+            url=endpoint,
+            timeout=self.timeout_seconds,
+        )
         try:
             response = requests.post(
-                f"{self.base_url}/chat/completions",
+                endpoint,
                 json=payload,
                 timeout=self.timeout_seconds,
             )
-            response.raise_for_status()
-            data = response.json()
         except requests.Timeout as exc:
-            raise LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running.") from exc
+            elapsed_s = time.perf_counter() - start
+            log_llm_stage(
+                self.logger,
+                "http_response",
+                "error",
+                level=logging.ERROR,
+                endpoint=endpoint,
+                elapsed_s=elapsed_s,
+                error_type="Timeout",
+                error=safe_error(exc),
+                timeout=self.timeout_seconds,
+                exc_info=True,
+            )
+            raise set_failed_stage(
+                LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running."),
+                "http_response",
+            ) from exc
         except requests.ConnectionError as exc:
-            raise LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running.") from exc
-        except requests.HTTPError as exc:
-            raise LMStudioServiceUnavailableError(
-                "Service unavailable: LM Studio could not generate a response. Check that the selected model is loaded."
+            elapsed_s = time.perf_counter() - start
+            log_llm_stage(
+                self.logger,
+                "http_response",
+                "error",
+                level=logging.ERROR,
+                endpoint=endpoint,
+                elapsed_s=elapsed_s,
+                error_type="ConnectionError",
+                error=safe_error(exc),
+                exc_info=True,
+            )
+            raise set_failed_stage(
+                LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running."),
+                "http_response",
             ) from exc
         except requests.RequestException as exc:
-            raise LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check the configured address.") from exc
-        except ValueError as exc:
-            raise LMStudioServiceUnavailableError(
-                "Service unavailable: LM Studio returned an unexpected response."
+            elapsed_s = time.perf_counter() - start
+            log_llm_stage(
+                self.logger,
+                "http_response",
+                "error",
+                level=logging.ERROR,
+                endpoint=endpoint,
+                elapsed_s=elapsed_s,
+                error_type=exc.__class__.__name__,
+                error=safe_error(exc),
+                exc_info=True,
+            )
+            raise set_failed_stage(
+                LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check the configured address."),
+                "http_response",
             ) from exc
 
-        if not isinstance(data, dict):
-            raise LMStudioServiceUnavailableError("Service unavailable: LM Studio returned an unexpected response.")
-        return data
+        elapsed_s = time.perf_counter() - start
+        http_status = getattr(response, "status_code", None)
+        if http_status is None or not 200 <= int(http_status) < 300:
+            body_preview = safe_response_preview(getattr(response, "text", ""))
+            log_llm_stage(
+                self.logger,
+                "http_response",
+                "error",
+                level=logging.ERROR,
+                endpoint=endpoint,
+                elapsed_s=elapsed_s,
+                http_status=http_status,
+                error_type="HTTPError",
+                error=f"HTTP status {http_status}",
+                body_preview=body_preview,
+            )
+            raise set_failed_stage(
+                LMStudioServiceUnavailableError(
+                    "Service unavailable: LM Studio could not generate a response. Check that the selected model is loaded."
+                ),
+                "http_response",
+            )
 
-    def _extract_message_content(self, data: dict[str, Any]) -> str:
-        try:
-            raw_content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise LMStudioServiceUnavailableError(
-                "Service unavailable: LM Studio returned an unexpected response."
-            ) from exc
-
-        if isinstance(raw_content, list):
-            text_content = "\n".join(part.get("text", "") for part in raw_content if isinstance(part, dict))
-        elif isinstance(raw_content, dict):
-            text_content = str(raw_content.get("text", ""))
-        else:
-            text_content = str(raw_content)
-        return text_content
+        log_llm_stage(
+            self.logger,
+            "http_response",
+            "ok",
+            endpoint=endpoint,
+            elapsed_s=elapsed_s,
+            http_status=http_status,
+        )
+        return response
 
     def _build_payload(
         self,
@@ -212,15 +334,26 @@ class LMStudioClient:
         payload: dict[str, Any],
         response_kind: str,
         prompt_result: PromptBuildResult,
+        endpoint: str,
     ) -> LMStudioStructuredResponse:
         last_error: str | None = None
         last_response_text = ""
         current_payload = payload
 
         for attempt in range(1, self.max_response_attempts + 1):
-            data = self._post_chat_completion(current_payload)
-            last_response_text = self._extract_message_content(data)
+            response = self._post_chat_completion(current_payload, endpoint=endpoint)
+            raw_response_text = getattr(response, "text", "")
+            log_llm_stage(
+                self.logger,
+                "response_parse",
+                "start",
+                attempt=attempt,
+            )
             try:
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError("LM Studio response must be a JSON object")
+                last_response_text, finish_reason = self._extract_message_content(data)
                 parsed = _parse_structured_response(last_response_text, response_kind=response_kind)
                 parsed.metadata.update(
                     {
@@ -230,35 +363,42 @@ class LMStudioClient:
                         "attempt": attempt,
                     }
                 )
+                if finish_reason is not None:
+                    parsed.metadata["finish_reason"] = finish_reason
                 if prompt_result.metadata.get("truncated"):
                     parsed.metadata["truncated"] = True
+                log_llm_stage(
+                    self.logger,
+                    "response_parse",
+                    "ok",
+                    attempt=attempt,
+                    output_chars=len(parsed.summary_text),
+                    finish_reason=finish_reason or "unknown",
+                )
                 return parsed
             except ValueError as exc:
                 last_error = str(exc)
-                self.logger.warning(
-                    "event=lmstudio_parse_retry response_kind=%s attempt=%s error=%s",
-                    response_kind,
-                    attempt,
-                    exc,
+                log_llm_stage(
+                    self.logger,
+                    "response_parse",
+                    "error",
+                    level=logging.ERROR,
+                    attempt=attempt,
+                    error_type=exc.__class__.__name__,
+                    error=safe_error(exc),
+                    response_preview=safe_response_preview(raw_response_text or last_response_text),
+                    exc_info=True,
                 )
                 if attempt >= self.max_response_attempts:
                     break
                 current_payload = self._retry_payload(current_payload, response_kind=response_kind, error=last_error)
 
-        fallback = _build_fallback_response(
-            response_kind=response_kind,
-            raw_text=last_response_text,
-            prompt_metadata=prompt_result.metadata,
-            parse_error=last_error or "Unknown parse failure",
-            attempts=self.max_response_attempts,
+        raise set_failed_stage(
+            LMStudioServiceUnavailableError(
+                "Service unavailable: LM Studio returned an unexpected response."
+            ),
+            "response_parse",
         )
-        self.logger.warning(
-            "event=lmstudio_parse_fallback response_kind=%s attempts=%s parse_error=%s",
-            response_kind,
-            self.max_response_attempts,
-            last_error,
-        )
-        return fallback
 
     def _retry_payload(self, payload: dict[str, Any], *, response_kind: str, error: str) -> dict[str, Any]:
         retry_payload = json.loads(json.dumps(payload))
@@ -271,8 +411,25 @@ class LMStudioClient:
             {"role": "system", "content": retry_instruction},
             payload["messages"][1],
         ]
-        self.logger.info("event=lmstudio_retry_requested response_kind=%s", response_kind)
         return retry_payload
+
+    def _extract_message_content(self, data: dict[str, Any]) -> tuple[str, str | None]:
+        try:
+            choice = data["choices"][0]
+            message = choice["message"]
+            raw_content = message["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError("LM Studio returned an unexpected response") from exc
+
+        finish_reason = choice.get("finish_reason")
+        if isinstance(raw_content, list):
+            text_content = "\n".join(part.get("text", "") for part in raw_content if isinstance(part, dict))
+        elif isinstance(raw_content, dict):
+            text_content = str(raw_content.get("text", ""))
+        else:
+            text_content = str(raw_content)
+        return text_content, str(finish_reason) if finish_reason is not None else None
+
 
 def _parse_structured_response(text: str, *, response_kind: str) -> LMStudioStructuredResponse:
     cleaned = text.strip()
@@ -306,32 +463,6 @@ def _parse_structured_response(text: str, *, response_kind: str) -> LMStudioStru
         blocked_activity=blocked_activity,
         metadata=metadata,
         raw_response=text,
-    )
-
-
-def _build_fallback_response(
-    *,
-    response_kind: str,
-    raw_text: str,
-    prompt_metadata: dict[str, Any],
-    parse_error: str,
-    attempts: int,
-) -> LMStudioStructuredResponse:
-    fallback_summary = _coerce_text(raw_text or "LM Studio returned a non-JSON response.")
-    metadata = {
-        "schema": "worklog.lmstudio.response.v1",
-        "response_kind": response_kind,
-        "parse_status": "fallback",
-        "parse_error": parse_error,
-        "attempts": attempts,
-        "prompt_metadata": prompt_metadata,
-    }
-    return LMStudioStructuredResponse(
-        summary_text=fallback_summary,
-        key_points=[],
-        blocked_activity=[],
-        metadata=metadata,
-        raw_response=raw_text or None,
     )
 
 

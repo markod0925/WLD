@@ -12,6 +12,7 @@ from .config import AppConfig
 from .error_notifications import ErrorNotificationManager
 from .keyboard_capture import KeyboardCaptureService
 from .lmstudio_client import LMStudioClient
+from .lmstudio_logging import get_failed_stage
 from .models import SharedState
 from .privacy import PrivacyPolicyEngine
 from .scheduler import FlushScheduler
@@ -478,7 +479,13 @@ class FlushCoordinator:
                 key=f"{reason}|{exc.__class__.__name__}",
             )
             duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
-            self.logger.exception("event=summary_drain_failed reason=%s error=%s", reason, exc)
+            self.logger.exception(
+                "event=summary_drain_failed reason=%s failed_stage=%s error_type=%s error=%s",
+                reason,
+                get_failed_stage(exc, default="unknown"),
+                exc.__class__.__name__,
+                exc,
+            )
             self.logger.info(
                 "event=summary_drain_duration reason=%s stop_reason=error duration_ms=%.3f",
                 reason,

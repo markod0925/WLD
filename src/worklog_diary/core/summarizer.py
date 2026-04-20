@@ -11,6 +11,7 @@ from .batching import BatchBuilder, SummaryBatch
 from .error_notifications import ErrorNotificationManager
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .lmstudio_client import LMStudioClient
+from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, safe_error
 from .storage import SQLiteStorage
 from .summary_dedup import SummaryDeduplicator
 
@@ -120,6 +121,14 @@ class Summarizer:
                     force_flush=force_flush or reason != "scheduled",
                 )
                 if batch is None:
+                    log_llm_stage(
+                        self.logger,
+                        "submission_decision",
+                        "skip",
+                        job_id="none",
+                        reason="no_content",
+                        detail="no_pending_data",
+                    )
                     break
 
                 job_id = self.storage.create_summary_job(batch.start_ts, batch.end_ts, status="queued")
@@ -127,20 +136,17 @@ class Summarizer:
                 self._reserved_ranges[job_id] = (batch.start_ts, batch.end_ts)
                 created += 1
 
-                self.logger.info(
-                    (
-                        "event=summary_job_queued job_id=%s reason=%s start_ts=%.3f end_ts=%.3f "
-                        "intervals=%s blocked_intervals=%s text_segments=%s screenshots=%s queue_size=%s"
-                    ),
-                    job_id,
-                    reason,
-                    batch.start_ts,
-                    batch.end_ts,
-                    len(batch.active_intervals),
-                    len(batch.blocked_intervals),
-                    len(batch.text_segments),
-                    len(batch.screenshots),
-                    len(self._queue),
+                log_llm_stage(
+                    self.logger,
+                    "job_created",
+                    "ok",
+                    job_id=job_id,
+                    reason=reason,
+                    start_ts=batch.start_ts,
+                    end_ts=batch.end_ts,
+                    screenshots=len(batch.screenshots),
+                    text_chars=sum(len(segment.text) for segment in batch.text_segments),
+                    queue_size=len(self._queue),
                 )
 
             if created:
@@ -193,10 +199,28 @@ class Summarizer:
             force_flush=force_flush or reason != "scheduled",
         )
         if batch is None:
-            self.logger.info("event=summary_job_skipped reason=%s detail=no_pending_data", reason)
+            log_llm_stage(
+                self.logger,
+                "submission_decision",
+                "skip",
+                job_id="none",
+                reason="no_content",
+                detail="no_pending_data",
+            )
             return None
 
         job_id = self.storage.create_summary_job(batch.start_ts, batch.end_ts, status="running")
+        log_llm_stage(
+            self.logger,
+            "job_created",
+            "ok",
+            job_id=job_id,
+            reason=reason,
+            start_ts=batch.start_ts,
+            end_ts=batch.end_ts,
+            screenshots=len(batch.screenshots),
+            text_chars=sum(len(segment.text) for segment in batch.text_segments),
+        )
         return self._run_summary_job(job_id=job_id, batch=batch, reason=reason)
 
     def generate_daily_recap_for_day(self, day: date) -> tuple[int, bool]:
@@ -205,7 +229,8 @@ class Summarizer:
             raise ValueError(f"No summaries available for day {day.isoformat()}")
 
         try:
-            recap_text, recap_json = self.lm_client.summarize_daily_recap(day=day, summaries=summaries)
+            with llm_job_context(f"daily_recap:{day.isoformat()}"):
+                recap_text, recap_json = self.lm_client.summarize_daily_recap(day=day, summaries=summaries)
         except LMStudioConnectionError as exc:
             self._notify_lmstudio_error("lmstudio_connection", str(exc), key=f"{self._lmstudio_identity()}|connection")
             raise
@@ -265,23 +290,19 @@ class Summarizer:
                 return
 
     def _run_summary_job(self, job_id: int, batch: SummaryBatch, reason: str) -> int | None:
-        self.logger.info(
-            (
-                "event=summary_job_started job_id=%s reason=%s start_ts=%.3f end_ts=%.3f "
-                "intervals=%s blocked_intervals=%s text_segments=%s screenshots=%s queue_size=%s"
-            ),
-            job_id,
-            reason,
-            batch.start_ts,
-            batch.end_ts,
-            len(batch.active_intervals),
-            len(batch.blocked_intervals),
-            len(batch.text_segments),
-            len(batch.screenshots),
-            len(self._queue),
+        log_llm_stage(
+            self.logger,
+            "submission_decision",
+            "proceed",
+            job_id=job_id,
+            reason="ready",
+            job_reason=reason,
+            screenshots=len(batch.screenshots),
+            text_chars=sum(len(segment.text) for segment in batch.text_segments),
         )
         try:
-            summary_text, summary_json = self.lm_client.summarize_batch(batch)
+            with llm_job_context(job_id):
+                summary_text, summary_json = self.lm_client.summarize_batch(batch)
             summary_payload = self._enrich_summary_payload(batch, summary_text, summary_json, reason=reason)
             recent_summaries = self.storage.list_summaries(limit=self.summary_deduplicator.recent_compare_count)
             dedup_decision = self.summary_deduplicator.evaluate(
@@ -306,26 +327,38 @@ class Summarizer:
                         reason=reason,
                         similarity=dedup_decision.similarity,
                     )
+                    log_llm_stage(
+                        self.logger,
+                        "summary_store",
+                        "start",
+                        job_id=job_id,
+                        action="merge_previous",
+                        summary_id=merged_record.id,
+                    )
                     self.storage.update_summary_record(
                         merged_record.id or 0,
                         end_ts=max(merged_record.end_ts, batch.end_ts),
                         summary_json=merged_payload,
                     )
                     summary_id = merged_record.id
-                    self.logger.info(
-                        (
-                            "event=summary_job_merged job_id=%s summary_id=%s reason=%s matched_summary_id=%s "
-                            "similarity=%.3f start_ts=%.3f end_ts=%.3f"
-                        ),
-                        job_id,
-                        summary_id,
-                        dedup_decision.reason,
-                        dedup_decision.matched_summary_id,
-                        dedup_decision.similarity,
-                        batch.start_ts,
-                        batch.end_ts,
+                    log_llm_stage(
+                        self.logger,
+                        "summary_store",
+                        "ok",
+                        job_id=job_id,
+                        action="merge_previous",
+                        summary_id=summary_id,
+                        matched_summary_id=dedup_decision.matched_summary_id,
+                        similarity=dedup_decision.similarity,
                     )
                 else:
+                    log_llm_stage(
+                        self.logger,
+                        "summary_store",
+                        "start",
+                        job_id=job_id,
+                        action="insert",
+                    )
                     summary_id = self.storage.insert_summary(
                         job_id=job_id,
                         start_ts=batch.start_ts,
@@ -333,26 +366,46 @@ class Summarizer:
                         summary_text=summary_text,
                         summary_json=summary_payload,
                     )
+                    log_llm_stage(
+                        self.logger,
+                        "summary_store",
+                        "ok",
+                        job_id=job_id,
+                        action="insert",
+                        summary_id=summary_id,
+                    )
             elif dedup_decision.action == "suppress":
-                self.logger.info(
-                    (
-                        "event=summary_job_suppressed job_id=%s reason=%s matched_summary_id=%s similarity=%.3f "
-                        "start_ts=%.3f end_ts=%.3f"
-                    ),
-                    job_id,
-                    dedup_decision.reason,
-                    dedup_decision.matched_summary_id,
-                    dedup_decision.similarity,
-                    batch.start_ts,
-                    batch.end_ts,
+                log_llm_stage(
+                    self.logger,
+                    "summary_store",
+                    "skip",
+                    job_id=job_id,
+                    reason=dedup_decision.reason,
+                    matched_summary_id=dedup_decision.matched_summary_id,
+                    similarity=dedup_decision.similarity,
                 )
             else:
+                log_llm_stage(
+                    self.logger,
+                    "summary_store",
+                    "start",
+                    job_id=job_id,
+                    action="insert",
+                )
                 summary_id = self.storage.insert_summary(
                     job_id=job_id,
                     start_ts=batch.start_ts,
                     end_ts=batch.end_ts,
                     summary_text=summary_text,
                     summary_json=summary_payload,
+                )
+                log_llm_stage(
+                    self.logger,
+                    "summary_store",
+                    "ok",
+                    job_id=job_id,
+                    action="insert",
+                    summary_id=summary_id,
                 )
 
             self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
@@ -363,12 +416,12 @@ class Summarizer:
                 "lmstudio_connection",
                 "lmstudio_service_unavailable",
             )
-            self.logger.info(
-                "event=summary_job_completed job_id=%s summary_id=%s start_ts=%.3f end_ts=%.3f",
-                job_id,
-                summary_id,
-                batch.start_ts,
-                batch.end_ts,
+            log_llm_stage(
+                self.logger,
+                "job_complete",
+                "ok",
+                job_id=job_id,
+                summary_id=summary_id,
             )
             return summary_id
         except LMStudioConnectionError as exc:
@@ -379,7 +432,17 @@ class Summarizer:
                 str(exc),
                 key=f"{self._lmstudio_identity()}|connection",
             )
-            self.logger.exception("event=summary_job_failed job_id=%s reason=%s error=%s", job_id, reason, exc)
+            log_llm_stage(
+                self.logger,
+                "job_failed",
+                "error",
+                level=logging.ERROR,
+                job_id=job_id,
+                failed_stage=get_failed_stage(exc, default="http_response"),
+                error_type=exc.__class__.__name__,
+                error=safe_error(exc),
+                exc_info=True,
+            )
             return None
         except LMStudioServiceUnavailableError as exc:
             self.storage.update_summary_job(
@@ -393,7 +456,17 @@ class Summarizer:
                 str(exc),
                 key=f"{self._lmstudio_identity()}|unavailable",
             )
-            self.logger.exception("event=summary_job_failed job_id=%s reason=%s error=%s", job_id, reason, exc)
+            log_llm_stage(
+                self.logger,
+                "job_failed",
+                "error",
+                level=logging.ERROR,
+                job_id=job_id,
+                failed_stage=get_failed_stage(exc, default="response_parse"),
+                error_type=exc.__class__.__name__,
+                error=safe_error(exc),
+                exc_info=True,
+            )
             return None
         except Exception as exc:
             self.storage.update_summary_job(job_id, status="failed", error="Summary generation failed.")
@@ -404,7 +477,17 @@ class Summarizer:
                 "Summary generation failed. Check that LM Studio is running and the configured model is available.",
                 key=f"{self._lmstudio_identity()}|{exc.__class__.__name__}",
             )
-            self.logger.exception("event=summary_job_failed job_id=%s reason=%s error=%s", job_id, reason, exc)
+            log_llm_stage(
+                self.logger,
+                "job_failed",
+                "error",
+                level=logging.ERROR,
+                job_id=job_id,
+                failed_stage=get_failed_stage(exc, default="summary_store"),
+                error_type=exc.__class__.__name__,
+                error=safe_error(exc),
+                exc_info=True,
+            )
             return None
 
     def _enrich_summary_payload(

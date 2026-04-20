@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from worklog_diary.core.lmstudio_logging import get_failed_stage
+
 from ..core.monitoring_components import DiagnosticsService
 from ..core.services import MonitoringServices
 from .summaries_view_model import DaySummaryView, SummaryCardView, build_calendar_highlight_days, build_day_summary_view
@@ -225,7 +227,13 @@ class SummariesWindow(QWidget):
             try:
                 self.services.generate_daily_recap(selected_day)
             except Exception as exc:
-                self.logger.exception("event=daily_recap_generation_failed day=%s error=%s", selected_day.isoformat(), exc)
+                self.logger.exception(
+                    "event=daily_recap_generation_failed day=%s failed_stage=%s error_type=%s error=%s",
+                    selected_day.isoformat(),
+                    get_failed_stage(exc, default="unknown"),
+                    exc.__class__.__name__,
+                    exc,
+                )
             finally:
                 self.daily_recap_finished.emit(selected_day, None)
 

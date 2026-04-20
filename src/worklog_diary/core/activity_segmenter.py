@@ -126,9 +126,9 @@ class ActivitySegmenter:
             current.add_observation(observation, visual_similarity=transition.visual_similarity)
 
         if force_flush:
-            completed.append(current.finalize("manual_flush", current.visual_similarity, is_closed=True))
+            completed.append(current.finalize("manual_flush", current.last_visual_similarity, is_closed=True))
         else:
-            completed.append(current.finalize("open", current.visual_similarity, is_closed=False))
+            completed.append(current.finalize("open", current.last_visual_similarity, is_closed=False))
 
         return completed
 
