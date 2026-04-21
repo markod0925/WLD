@@ -11,7 +11,7 @@ from typing import Any
 
 DEFAULT_BLOCKED_PROCESSES = ["chrome.exe", "msedge.exe", "webex.exe", "lm studio.exe"]
 SUPPORTED_CAPTURE_MODES = {"full_screen", "active_window"}
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +59,24 @@ class AppConfig:
     screenshot_dedup_enabled: bool = True
     screenshot_dedup_threshold: int = 6
     screenshot_min_keep_interval_seconds: int = 120
+
+    semantic_coalescing_enabled: bool = False
+    semantic_embedding_base_url: str = "http://127.0.0.1:1234/v1"
+    semantic_embedding_model: str = "text-embedding-nomic-embed-text-v1.5"
+    semantic_max_candidate_gap_seconds: int = 900
+    semantic_max_neighbor_count: int = 2
+    semantic_min_cosine_similarity: float = 0.90
+    semantic_min_merge_score: float = 0.85
+    semantic_same_app_boost: float = 0.20
+    semantic_window_title_boost: float = 0.10
+    semantic_keyword_overlap_boost: float = 0.10
+    semantic_temporal_gap_penalty_weight: float = 0.12
+    semantic_app_switch_penalty: float = 0.20
+    semantic_lock_boundary_blocks_merge: bool = True
+    semantic_pause_boundary_blocks_merge: bool = True
+    semantic_transition_keywords: list[str] = field(default_factory=lambda: ["then", "afterward", "next", "switched", "meeting", "call", "pausa", "riunione", "poi", "successivamente"])
+    semantic_store_merge_diagnostics: bool = True
+    semantic_recompute_missing_embeddings_on_startup: bool = False
 
     def normalize(self) -> None:
         if not self.app_data_dir:
@@ -109,6 +127,23 @@ class AppConfig:
         self.screenshot_dedup_threshold = max(0, min(64, int(self.screenshot_dedup_threshold)))
         self.screenshot_dedup_threshold = self.screenshot_dedup_phash_threshold
         self.screenshot_min_keep_interval_seconds = max(0, int(self.screenshot_min_keep_interval_seconds))
+        self.semantic_coalescing_enabled = bool(self.semantic_coalescing_enabled)
+        self.semantic_embedding_base_url = str(self.semantic_embedding_base_url).strip() or "http://127.0.0.1:1234/v1"
+        self.semantic_embedding_model = str(self.semantic_embedding_model).strip() or "text-embedding-nomic-embed-text-v1.5"
+        self.semantic_max_candidate_gap_seconds = max(0, int(self.semantic_max_candidate_gap_seconds))
+        self.semantic_max_neighbor_count = max(1, int(self.semantic_max_neighbor_count))
+        self.semantic_min_cosine_similarity = max(0.0, min(1.0, float(self.semantic_min_cosine_similarity)))
+        self.semantic_min_merge_score = max(0.0, min(1.0, float(self.semantic_min_merge_score)))
+        self.semantic_same_app_boost = max(0.0, float(self.semantic_same_app_boost))
+        self.semantic_window_title_boost = max(0.0, float(self.semantic_window_title_boost))
+        self.semantic_keyword_overlap_boost = max(0.0, float(self.semantic_keyword_overlap_boost))
+        self.semantic_temporal_gap_penalty_weight = max(0.0, float(self.semantic_temporal_gap_penalty_weight))
+        self.semantic_app_switch_penalty = max(0.0, float(self.semantic_app_switch_penalty))
+        self.semantic_lock_boundary_blocks_merge = bool(self.semantic_lock_boundary_blocks_merge)
+        self.semantic_pause_boundary_blocks_merge = bool(self.semantic_pause_boundary_blocks_merge)
+        self.semantic_transition_keywords = [str(item).strip().lower() for item in self.semantic_transition_keywords if str(item).strip()]
+        self.semantic_store_merge_diagnostics = bool(self.semantic_store_merge_diagnostics)
+        self.semantic_recompute_missing_embeddings_on_startup = bool(self.semantic_recompute_missing_embeddings_on_startup)
         self.config_version = CONFIG_VERSION
 
     @classmethod
@@ -188,6 +223,18 @@ def _coerce_blocked_processes(value: Any, field_name: str, *, source: str | None
     return coerced
 
 
+
+
+def _coerce_str_list(value: Any, field_name: str, *, source: str | None = None) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(_format_config_error(source, field_name, "expected a list of strings", value))
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(_format_config_error(source, field_name, "expected a list of strings", value))
+        if item.strip():
+            result.append(item.strip())
+    return result
 def _format_config_error(source: str | None, field_name: str, expected: str, value: Any) -> str:
     location = f" in {source}" if source else ""
     return f"Invalid config value{location} for '{field_name}': {expected}, got {value!r}"
@@ -260,6 +307,23 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "screenshot_dedup_enabled": _coerce_bool,
         "screenshot_dedup_threshold": _coerce_int,
         "screenshot_min_keep_interval_seconds": _coerce_int,
+        "semantic_coalescing_enabled": _coerce_bool,
+        "semantic_embedding_base_url": _coerce_str,
+        "semantic_embedding_model": _coerce_str,
+        "semantic_max_candidate_gap_seconds": _coerce_int,
+        "semantic_max_neighbor_count": _coerce_int,
+        "semantic_min_cosine_similarity": _coerce_float,
+        "semantic_min_merge_score": _coerce_float,
+        "semantic_same_app_boost": _coerce_float,
+        "semantic_window_title_boost": _coerce_float,
+        "semantic_keyword_overlap_boost": _coerce_float,
+        "semantic_temporal_gap_penalty_weight": _coerce_float,
+        "semantic_app_switch_penalty": _coerce_float,
+        "semantic_lock_boundary_blocks_merge": _coerce_bool,
+        "semantic_pause_boundary_blocks_merge": _coerce_bool,
+        "semantic_transition_keywords": _coerce_str_list,
+        "semantic_store_merge_diagnostics": _coerce_bool,
+        "semantic_recompute_missing_embeddings_on_startup": _coerce_bool,
     }
 
     for field_name, converter in converters.items():

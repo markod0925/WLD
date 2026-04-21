@@ -103,6 +103,55 @@ class StorageSchemaManager:
             FOREIGN KEY(job_id) REFERENCES summary_jobs(id)
         );
 
+
+
+        CREATE TABLE IF NOT EXISTS summary_embeddings (
+            summary_id INTEGER PRIMARY KEY,
+            canonical_hash TEXT NOT NULL,
+            embedding_json TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            embedding_base_url TEXT NOT NULL,
+            created_ts REAL NOT NULL,
+            updated_ts REAL NOT NULL,
+            FOREIGN KEY(summary_id) REFERENCES summaries(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS coalesced_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,
+            start_ts REAL NOT NULL,
+            end_ts REAL NOT NULL,
+            summary_text TEXT NOT NULL,
+            summary_json TEXT NOT NULL,
+            created_ts REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS coalesced_summary_members (
+            coalesced_summary_id INTEGER NOT NULL,
+            summary_id INTEGER NOT NULL,
+            member_index INTEGER NOT NULL,
+            PRIMARY KEY(coalesced_summary_id, summary_id),
+            FOREIGN KEY(coalesced_summary_id) REFERENCES coalesced_summaries(id),
+            FOREIGN KEY(summary_id) REFERENCES summaries(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS semantic_merge_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,
+            left_summary_id INTEGER NOT NULL,
+            right_summary_id INTEGER NOT NULL,
+            embedding_cosine_similarity REAL NOT NULL,
+            app_similarity_score REAL NOT NULL,
+            window_similarity_score REAL NOT NULL,
+            keyword_overlap_score REAL NOT NULL,
+            temporal_gap_seconds REAL NOT NULL,
+            blockers_json TEXT NOT NULL,
+            final_merge_score REAL NOT NULL,
+            decision TEXT NOT NULL,
+            reasons_json TEXT NOT NULL,
+            created_ts REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS daily_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             day TEXT NOT NULL UNIQUE,
@@ -122,12 +171,15 @@ class StorageSchemaManager:
         CREATE INDEX IF NOT EXISTS idx_summaries_created ON summaries(created_ts DESC);
         CREATE INDEX IF NOT EXISTS idx_summaries_start ON summaries(start_ts);
         CREATE INDEX IF NOT EXISTS idx_daily_summaries_day ON daily_summaries(day);
+        CREATE INDEX IF NOT EXISTS idx_coalesced_summaries_day ON coalesced_summaries(day, start_ts);
+        CREATE INDEX IF NOT EXISTS idx_semantic_merge_diagnostics_day ON semantic_merge_diagnostics(day, left_summary_id);
         """
         with self._lock:
             journal_mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
             self._conn.executescript(schema)
             self.ensure_daily_summaries_schema()
             self.ensure_screenshots_schema()
+            self.ensure_semantic_coalescing_schema()
             self._conn.commit()
 
         if journal_mode is not None:
@@ -241,6 +293,27 @@ class StorageSchemaManager:
             self._conn.execute("ALTER TABLE screenshots ADD COLUMN dedup_reason TEXT")
         if "visual_context_streak" not in columns:
             self._conn.execute("ALTER TABLE screenshots ADD COLUMN visual_context_streak INTEGER NOT NULL DEFAULT 0")
+
+
+    def ensure_semantic_coalescing_schema(self) -> None:
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'summary_embeddings'"
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS summary_embeddings (
+                    summary_id INTEGER PRIMARY KEY,
+                    canonical_hash TEXT NOT NULL,
+                    embedding_json TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    embedding_base_url TEXT NOT NULL,
+                    created_ts REAL NOT NULL,
+                    updated_ts REAL NOT NULL,
+                    FOREIGN KEY(summary_id) REFERENCES summaries(id)
+                )
+                """
+            )
 
     def _log_db_query_timing(self, operation: str, started_at: float, *, rows: int | None = None) -> None:
         duration_ms = (time.perf_counter() - started_at) * 1000.0

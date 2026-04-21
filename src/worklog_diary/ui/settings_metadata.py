@@ -68,6 +68,23 @@ EXPOSURE_BY_KEY: dict[str, ExposureLevel] = {
     "screenshot_dedup_enabled": "debug",
     "screenshot_dedup_threshold": "internal",
     "screenshot_min_keep_interval_seconds": "debug",
+    "semantic_coalescing_enabled": "debug",
+    "semantic_embedding_base_url": "debug",
+    "semantic_embedding_model": "debug",
+    "semantic_max_candidate_gap_seconds": "debug",
+    "semantic_max_neighbor_count": "debug",
+    "semantic_min_cosine_similarity": "debug",
+    "semantic_min_merge_score": "debug",
+    "semantic_same_app_boost": "debug",
+    "semantic_window_title_boost": "debug",
+    "semantic_keyword_overlap_boost": "debug",
+    "semantic_temporal_gap_penalty_weight": "debug",
+    "semantic_app_switch_penalty": "debug",
+    "semantic_lock_boundary_blocks_merge": "debug",
+    "semantic_pause_boundary_blocks_merge": "debug",
+    "semantic_transition_keywords": "debug",
+    "semantic_store_merge_diagnostics": "debug",
+    "semantic_recompute_missing_embeddings_on_startup": "debug",
 }
 
 
@@ -479,6 +496,235 @@ EXPOSED_SETTINGS: tuple[SettingUiMetadata, ...] = (
         max_value=100,
     ),
     _setting(
+        key="semantic_coalescing_enabled",
+        label="Enable semantic coalescing:",
+        tooltip=(
+            "Description: Runs a conservative local semantic merge pass over adjacent summaries.\n"
+            "Impact: Reduces repetitive micro-summaries while preserving timeline boundaries.\n"
+            "Safety: Disabled by default to avoid over-merging until tuned for your workflow.\n"
+            f"Default: {DEFAULTS['semantic_coalescing_enabled']}."
+        ),
+        exposure="debug",
+        widget="bool",
+    ),
+    _setting(
+        key="semantic_embedding_base_url",
+        label="Semantic embedding base URL:",
+        tooltip=(
+            "Description: OpenAI-compatible endpoint used only for semantic coalescing embeddings.\n"
+            "Impact: Separate from summarization endpoint to avoid changing summary model behavior.\n"
+            "Safety: Coalescing degrades gracefully if embedding requests fail.\n"
+            f"Default: {DEFAULTS['semantic_embedding_base_url']}."
+        ),
+        exposure="debug",
+        widget="text",
+    ),
+    _setting(
+        key="semantic_embedding_model",
+        label="Semantic embedding model:",
+        tooltip=(
+            "Description: Embedding model id used by the semantic coalescing stage.\n"
+            "Impact: Controls semantic similarity quality and local runtime cost.\n"
+            "Tip: Use the exact LM Studio embedding model identifier.\n"
+            f"Default: {DEFAULTS['semantic_embedding_model']}."
+        ),
+        exposure="debug",
+        widget="text",
+    ),
+    _setting(
+        key="semantic_max_candidate_gap_seconds",
+        label="Semantic max candidate gap (s):",
+        tooltip=(
+            "Description: Maximum time gap allowed for candidate summary comparisons.\n"
+            "Impact: Limits coalescing to temporally local neighbors only.\n"
+            "Safety: Larger values can increase over-merge risk.\n"
+            f"Default: {DEFAULTS['semantic_max_candidate_gap_seconds']}."
+        ),
+        exposure="debug",
+        widget="int",
+        min_value=0,
+        max_value=7200,
+    ),
+    _setting(
+        key="semantic_max_neighbor_count",
+        label="Semantic local neighbor count:",
+        tooltip=(
+            "Description: Number of nearby summaries considered in local coalescing traversal.\n"
+            "Impact: Higher values increase evaluation cost and merge opportunities.\n"
+            "Safety: Keep small for conservative behavior.\n"
+            f"Default: {DEFAULTS['semantic_max_neighbor_count']}."
+        ),
+        exposure="debug",
+        widget="int",
+        min_value=1,
+        max_value=8,
+    ),
+    _setting(
+        key="semantic_min_cosine_similarity",
+        label="Semantic min cosine similarity:",
+        tooltip=(
+            "Description: Minimum embedding cosine score required before a merge is considered.\n"
+            "Impact: Higher values are stricter and reduce merge frequency.\n"
+            "Safety: Merges are also gated by non-semantic signals and blockers.\n"
+            f"Default: {DEFAULTS['semantic_min_cosine_similarity']}."
+        ),
+        exposure="debug",
+        widget="float",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+    ),
+    _setting(
+        key="semantic_min_merge_score",
+        label="Semantic min merge score:",
+        tooltip=(
+            "Description: Final weighted threshold required to merge candidate summaries.\n"
+            "Impact: Raises or lowers aggressiveness after all weighted signals are combined.\n"
+            "Safety: Keep high for conservative timeline-preserving behavior.\n"
+            f"Default: {DEFAULTS['semantic_min_merge_score']}."
+        ),
+        exposure="debug",
+        widget="float",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+    ),
+    _setting(
+        key="semantic_same_app_boost",
+        label="Semantic same app boost:",
+        tooltip=(
+            "Description: Positive score contribution when neighboring summaries share the same app/process.\n"
+            "Impact: Encourages merges for true local continuations.\n"
+            "Safety: Lower if merges across app contexts seem too permissive.\n"
+            f"Default: {DEFAULTS['semantic_same_app_boost']}."
+        ),
+        exposure="debug",
+        widget="float",
+        min_value=0.0,
+        max_value=2.0,
+        step=0.01,
+    ),
+    _setting(
+        key="semantic_window_title_boost",
+        label="Semantic window title boost:",
+        tooltip=(
+            "Description: Weighted contribution from window title similarity.\n"
+            "Impact: Helps preserve project/window continuity in merge decisions.\n"
+            "Safety: Lower to reduce influence of noisy or generic titles.\n"
+            f"Default: {DEFAULTS['semantic_window_title_boost']}."
+        ),
+        exposure="debug",
+        widget="float",
+        min_value=0.0,
+        max_value=2.0,
+        step=0.01,
+    ),
+    _setting(
+        key="semantic_keyword_overlap_boost",
+        label="Semantic keyword overlap boost:",
+        tooltip=(
+            "Description: Weighted contribution from lexical token overlap between summary texts.\n"
+            "Impact: Supports merges when short summaries share concrete task vocabulary.\n"
+            "Safety: Lower if repeated generic words cause false positives.\n"
+            f"Default: {DEFAULTS['semantic_keyword_overlap_boost']}."
+        ),
+        exposure="debug",
+        widget="float",
+        min_value=0.0,
+        max_value=2.0,
+        step=0.01,
+    ),
+    _setting(
+        key="semantic_temporal_gap_penalty_weight",
+        label="Semantic temporal gap penalty:",
+        tooltip=(
+            "Description: Penalty weight applied as time gap increases between candidate summaries.\n"
+            "Impact: Larger values discourage merges across pauses.\n"
+            "Safety: Increase to be stricter around timeline separation.\n"
+            f"Default: {DEFAULTS['semantic_temporal_gap_penalty_weight']}."
+        ),
+        exposure="debug",
+        widget="float",
+        min_value=0.0,
+        max_value=2.0,
+        step=0.01,
+    ),
+    _setting(
+        key="semantic_app_switch_penalty",
+        label="Semantic app switch penalty:",
+        tooltip=(
+            "Description: Penalty weight for process/app mismatches.\n"
+            "Impact: Larger values make cross-app merges significantly less likely.\n"
+            "Safety: Keep non-zero for conservative behavior.\n"
+            f"Default: {DEFAULTS['semantic_app_switch_penalty']}."
+        ),
+        exposure="debug",
+        widget="float",
+        min_value=0.0,
+        max_value=2.0,
+        step=0.01,
+    ),
+    _setting(
+        key="semantic_lock_boundary_blocks_merge",
+        label="Block merge on lock boundary:",
+        tooltip=(
+            "Description: Hard blocker for lock/unlock transitions between candidates.\n"
+            "Impact: Prevents merges that cross session boundaries.\n"
+            "Safety: Strongly recommended for auditability.\n"
+            f"Default: {DEFAULTS['semantic_lock_boundary_blocks_merge']}."
+        ),
+        exposure="debug",
+        widget="bool",
+    ),
+    _setting(
+        key="semantic_pause_boundary_blocks_merge",
+        label="Block merge on pause boundary:",
+        tooltip=(
+            "Description: Hard blocker for pause/idle boundaries between candidates.\n"
+            "Impact: Preserves timeline structure around inactivity interruptions.\n"
+            "Safety: Recommended to avoid broad merges over pauses.\n"
+            f"Default: {DEFAULTS['semantic_pause_boundary_blocks_merge']}."
+        ),
+        exposure="debug",
+        widget="bool",
+    ),
+    _setting(
+        key="semantic_transition_keywords",
+        label="Semantic transition keywords:",
+        tooltip=(
+            "Description: Lexical blockers used to detect probable task transitions in summaries.\n"
+            "Impact: If any keyword appears, merge is blocked conservatively.\n"
+            "Tip: Enter one keyword per line in debug settings.\n"
+            f"Default: {', '.join(DEFAULTS['semantic_transition_keywords'])}."
+        ),
+        exposure="debug",
+        widget="multiline",
+    ),
+    _setting(
+        key="semantic_store_merge_diagnostics",
+        label="Store semantic diagnostics rows:",
+        tooltip=(
+            "Description: Persists candidate-pair merge diagnostics in SQLite for debugging.\n"
+            "Impact: Enables read-only inspection of blockers/scores/decisions.\n"
+            "Cost: Small additional DB writes during coalescing runs.\n"
+            f"Default: {DEFAULTS['semantic_store_merge_diagnostics']}."
+        ),
+        exposure="debug",
+        widget="bool",
+    ),
+    _setting(
+        key="semantic_recompute_missing_embeddings_on_startup",
+        label="Recompute missing embeddings on startup:",
+        tooltip=(
+            "Description: Optional maintenance behavior for filling missing embedding cache rows.\n"
+            "Impact: May increase startup work if many summaries lack embeddings.\n"
+            "Safety: Keep disabled unless actively repairing cache completeness.\n"
+            f"Default: {DEFAULTS['semantic_recompute_missing_embeddings_on_startup']}."
+        ),
+        exposure="debug",
+        widget="bool",
+    ),
+    _setting(
         key="screenshot_min_keep_interval_seconds",
         label="Min keep interval same context (s):",
         tooltip="Description: Minimum time between kept screenshots in nearly identical visual context.\nImpact: Higher values reduce screenshot volume in repetitive scenes.\nExperimental: Useful for storage and prompt-size tuning.\nDefault: 120 seconds.",
@@ -525,3 +771,52 @@ def float_step_decimals(step: float) -> int:
     if "." not in text:
         return 0
     return len(text.split(".", 1)[1])
+
+
+SEMANTIC_PRESET_OFF = "off"
+SEMANTIC_PRESET_CONSERVATIVE = "conservative"
+SEMANTIC_PRESET_AGGRESSIVE = "aggressive"
+SEMANTIC_PRESET_DESCRIPTIONS: dict[str, str] = {
+    SEMANTIC_PRESET_OFF: "Disables semantic coalescing.",
+    SEMANTIC_PRESET_CONSERVATIVE: "Merges only highly similar, adjacent activities. Recommended default.",
+    SEMANTIC_PRESET_AGGRESSIVE: "Merges broader activity spans. May combine loosely related work blocks.",
+    "custom": "Raw semantic parameters do not match a built-in preset.",
+}
+
+
+def semantic_preset_values(preset: str) -> dict[str, object]:
+    normalized = preset.strip().lower()
+    if normalized == SEMANTIC_PRESET_OFF:
+        return {
+            "semantic_coalescing_enabled": False,
+        }
+    if normalized == SEMANTIC_PRESET_AGGRESSIVE:
+        return {
+            "semantic_coalescing_enabled": True,
+            "semantic_min_cosine_similarity": 0.85,
+            "semantic_min_merge_score": 0.72,
+            "semantic_max_candidate_gap_seconds": 1200,
+            "semantic_app_switch_penalty": 0.15,
+        }
+    return {
+        "semantic_coalescing_enabled": True,
+        "semantic_min_cosine_similarity": 0.90,
+        "semantic_min_merge_score": 0.85,
+        "semantic_max_candidate_gap_seconds": 900,
+        "semantic_app_switch_penalty": 0.20,
+    }
+
+
+def semantic_preset_name_for_values(values: Mapping[str, object]) -> str:
+    comparable_keys = (
+        "semantic_coalescing_enabled",
+        "semantic_min_cosine_similarity",
+        "semantic_min_merge_score",
+        "semantic_max_candidate_gap_seconds",
+        "semantic_app_switch_penalty",
+    )
+    for name in (SEMANTIC_PRESET_OFF, SEMANTIC_PRESET_CONSERVATIVE, SEMANTIC_PRESET_AGGRESSIVE):
+        preset = semantic_preset_values(name)
+        if all(values.get(key) == preset.get(key) for key in comparable_keys):
+            return name
+    return "custom"

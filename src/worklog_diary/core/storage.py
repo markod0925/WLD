@@ -18,6 +18,7 @@ from .models import (
     DailySummaryRecord,
     ForegroundInfo,
     KeyEvent,
+    CoalescingDiagnosticRecord,
     ScreenshotRecord,
     SummaryRecord,
     TextSegment,
@@ -829,6 +830,241 @@ class SQLiteStorage(ActivityRepository):
         record = _row_to_daily_summary_record(row)
         self._log_db_query_timing("get_daily_summary_for_day", started_at, rows=1)
         return record
+
+
+    def get_summary_embedding(self, summary_id: int) -> dict[str, object] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT canonical_hash, embedding_json, embedding_model, embedding_base_url
+                FROM summary_embeddings
+                WHERE summary_id = ?
+                """,
+                (summary_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "canonical_hash": str(row["canonical_hash"]),
+            "embedding": json.loads(str(row["embedding_json"])),
+            "model": str(row["embedding_model"]),
+            "base_url": str(row["embedding_base_url"]),
+        }
+
+    def upsert_summary_embedding(
+        self,
+        *,
+        summary_id: int,
+        canonical_hash: str,
+        embedding: list[float],
+        model: str,
+        base_url: str,
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO summary_embeddings(summary_id, canonical_hash, embedding_json, embedding_model, embedding_base_url, created_ts, updated_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(summary_id) DO UPDATE SET
+                    canonical_hash = excluded.canonical_hash,
+                    embedding_json = excluded.embedding_json,
+                    embedding_model = excluded.embedding_model,
+                    embedding_base_url = excluded.embedding_base_url,
+                    updated_ts = excluded.updated_ts
+                """,
+                (summary_id, canonical_hash, json.dumps(embedding), model, base_url, now, now),
+            )
+            self._conn.commit()
+
+    def replace_coalesced_summaries_for_day(self, day: Day, plans: list[object]) -> list[int]:
+        day_key = day.isoformat()
+        now = time.time()
+        inserted_ids: list[int] = []
+        with self._lock:
+            existing_rows = self._conn.execute(
+                "SELECT id FROM coalesced_summaries WHERE day = ?",
+                (day_key,),
+            ).fetchall()
+            existing_ids = [int(row["id"]) for row in existing_rows]
+            if existing_ids:
+                placeholders = ",".join("?" for _ in existing_ids)
+                self._conn.execute(
+                    f"DELETE FROM coalesced_summary_members WHERE coalesced_summary_id IN ({placeholders})",
+                    existing_ids,
+                )
+            self._conn.execute("DELETE FROM coalesced_summaries WHERE day = ?", (day_key,))
+
+            for plan in plans:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO coalesced_summaries(day, start_ts, end_ts, summary_text, summary_json, created_ts)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (day_key, plan.start_ts, plan.end_ts, plan.summary_text, json.dumps(plan.summary_json), now),
+                )
+                coalesced_id = int(cursor.lastrowid)
+                self._conn.executemany(
+                    """
+                    INSERT INTO coalesced_summary_members(coalesced_summary_id, summary_id, member_index)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (coalesced_id, int(summary_id), idx)
+                        for idx, summary_id in enumerate(plan.source_summary_ids)
+                    ],
+                )
+                inserted_ids.append(coalesced_id)
+            self._conn.commit()
+        return inserted_ids
+
+    def replace_coalescing_diagnostics_for_day(self, day: Day, diagnostics: list[object]) -> None:
+        day_key = day.isoformat()
+        now = time.time()
+        with self._lock:
+            self._conn.execute("DELETE FROM semantic_merge_diagnostics WHERE day = ?", (day_key,))
+            self._conn.executemany(
+                """
+                INSERT INTO semantic_merge_diagnostics(
+                    day, left_summary_id, right_summary_id, embedding_cosine_similarity,
+                    app_similarity_score, window_similarity_score, keyword_overlap_score,
+                    temporal_gap_seconds, blockers_json, final_merge_score, decision, reasons_json, created_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        day_key,
+                        int(item.left_summary_id),
+                        int(item.right_summary_id),
+                        float(item.semantic_similarity),
+                        float(item.app_similarity),
+                        float(item.window_similarity),
+                        float(item.keyword_overlap),
+                        float(item.gap_seconds),
+                        json.dumps(item.blockers),
+                        float(item.final_score),
+                        item.decision,
+                        json.dumps(item.reasons),
+                        now,
+                    )
+                    for item in diagnostics
+                ],
+            )
+            self._conn.commit()
+
+    def list_effective_summaries_for_day(self, day: Day, *, use_coalesced: bool) -> list[SummaryRecord]:
+        if not use_coalesced:
+            return self.list_summaries_for_day(day)
+        day_key = day.isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, start_ts, end_ts, summary_text, summary_json, created_ts
+                FROM coalesced_summaries
+                WHERE day = ?
+                ORDER BY start_ts ASC, id ASC
+                """,
+                (day_key,),
+            ).fetchall()
+        if not rows:
+            return self.list_summaries_for_day(day)
+        return [
+            SummaryRecord(
+                id=int(row["id"]),
+                job_id=-1,
+                start_ts=float(row["start_ts"]),
+                end_ts=float(row["end_ts"]),
+                summary_text=str(row["summary_text"]),
+                summary_json=json.loads(str(row["summary_json"])),
+                created_ts=float(row["created_ts"]),
+            )
+            for row in rows
+        ]
+
+    def list_semantic_merge_diagnostics(
+        self,
+        day: Day | None,
+        *,
+        decision: str | None = None,
+        text_query: str | None = None,
+        summary_ids: list[int] | None = None,
+        max_merge_score: float | None = None,
+        limit: int = 200,
+    ) -> list[CoalescingDiagnosticRecord]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if day is not None:
+            clauses.append("day = ?")
+            values.append(day.isoformat())
+        if decision:
+            clauses.append("decision = ?")
+            values.append(decision.strip().lower())
+        if text_query:
+            like = f"%{_escape_like_pattern(text_query.strip().lower())}%"
+            clauses.append(
+                "(LOWER(blockers_json) LIKE ? ESCAPE '\\' OR LOWER(reasons_json) LIKE ? ESCAPE '\\')"
+            )
+            values.extend([like, like])
+        if summary_ids:
+            normalized_ids = sorted({int(item) for item in summary_ids if int(item) > 0})
+            if normalized_ids:
+                placeholders = ",".join("?" for _ in normalized_ids)
+                clauses.append(
+                    f"(left_summary_id IN ({placeholders}) OR right_summary_id IN ({placeholders}))"
+                )
+                values.extend([*normalized_ids, *normalized_ids])
+        if max_merge_score is not None:
+            clauses.append("final_merge_score < ?")
+            values.append(float(max_merge_score))
+
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, day, left_summary_id, right_summary_id, embedding_cosine_similarity,
+                    app_similarity_score, window_similarity_score, keyword_overlap_score,
+                    temporal_gap_seconds, blockers_json, final_merge_score, decision, reasons_json, created_ts
+                FROM semantic_merge_diagnostics
+                """
+                + where_clause
+                + """
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                [*values, max(1, int(limit))],
+            ).fetchall()
+        return [
+            CoalescingDiagnosticRecord(
+                id=int(row["id"]),
+                day=datetime.strptime(str(row["day"]), "%Y-%m-%d").date(),
+                left_summary_id=int(row["left_summary_id"]),
+                right_summary_id=int(row["right_summary_id"]),
+                embedding_cosine_similarity=float(row["embedding_cosine_similarity"]),
+                app_similarity_score=float(row["app_similarity_score"]),
+                window_similarity_score=float(row["window_similarity_score"]),
+                keyword_overlap_score=float(row["keyword_overlap_score"]),
+                temporal_gap_seconds=float(row["temporal_gap_seconds"]),
+                blockers_json=json.loads(str(row["blockers_json"])),
+                final_merge_score=float(row["final_merge_score"]),
+                decision=str(row["decision"]),
+                reasons_json=json.loads(str(row["reasons_json"])),
+                created_ts=float(row["created_ts"]),
+            )
+            for row in rows
+        ]
+
+    def get_coalesced_member_count(self, coalesced_summary_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM coalesced_summary_members
+                WHERE coalesced_summary_id = ?
+                """,
+                (coalesced_summary_id,),
+            ).fetchone()
+        return int(row["c"]) if row is not None else 0
 
     def purge_raw_data(self, start_ts: float, end_ts: float) -> list[str]:
         return self.cleanup_service.purge_raw_data(start_ts, end_ts)

@@ -8,6 +8,7 @@ from html import escape
 from typing import Any
 
 from ..core.models import DailySummaryRecord, SummaryRecord
+from .semantic_diagnostics_view_model import CoalescedTraceabilityInfo
 
 
 @dataclass(slots=True)
@@ -18,6 +19,10 @@ class SummaryCardView:
     major_activities: list[str]
     blocked_notes: list[str]
     uncertainty_notes: list[str]
+    is_coalesced: bool = False
+    coalesced_member_count: int = 0
+    coalesced_source_ids: list[int] | None = None
+    confidence_bucket: str | None = None
 
 
 @dataclass(slots=True)
@@ -38,9 +43,13 @@ def build_day_summary_view(
     day: date,
     summaries: list[SummaryRecord],
     daily_summary: DailySummaryRecord | None,
+    traceability_by_summary_id: dict[int, CoalescedTraceabilityInfo] | None = None,
 ) -> DaySummaryView:
     # Sort by the time range the summary covers, not by when the row was generated.
-    cards = [build_summary_card_view(item) for item in sorted(summaries, key=_summary_sort_key, reverse=True)]
+    cards = [
+        build_summary_card_view(item, traceability=traceability_by_summary_id or {})
+        for item in sorted(summaries, key=_summary_sort_key, reverse=True)
+    ]
     recap_created_label: str | None = None
     if daily_summary is not None:
         recap_created_label = datetime.fromtimestamp(daily_summary.created_ts).strftime("%Y-%m-%d %H:%M:%S")
@@ -54,7 +63,10 @@ def build_day_summary_view(
     )
 
 
-def build_summary_card_view(summary: SummaryRecord) -> SummaryCardView:
+def build_summary_card_view(
+    summary: SummaryRecord,
+    traceability: dict[int, CoalescedTraceabilityInfo] | None = None,
+) -> SummaryCardView:
     start = datetime.fromtimestamp(summary.start_ts).strftime("%H:%M:%S")
     end = datetime.fromtimestamp(summary.end_ts).strftime("%H:%M:%S")
 
@@ -66,6 +78,12 @@ def build_summary_card_view(summary: SummaryRecord) -> SummaryCardView:
         keys=["uncertainty", "notes", "assumptions", "uncertainty_notes"],
     )
 
+    coalesced_count_raw = structured.get("coalesced_count")
+    try:
+        coalesced_member_count = int(coalesced_count_raw) if coalesced_count_raw is not None else 0
+    except (TypeError, ValueError):
+        coalesced_member_count = 0
+
     return SummaryCardView(
         summary_id=summary.id,
         time_range=f"{start} - {end}",
@@ -73,6 +91,18 @@ def build_summary_card_view(summary: SummaryRecord) -> SummaryCardView:
         major_activities=major_activities,
         blocked_notes=blocked_notes,
         uncertainty_notes=uncertainty_notes,
+        is_coalesced=bool(structured.get("coalesced_from")),
+        coalesced_member_count=coalesced_member_count,
+        coalesced_source_ids=(
+            traceability.get(int(summary.id or 0)).source_summary_ids
+            if traceability and int(summary.id or 0) in traceability
+            else None
+        ),
+        confidence_bucket=(
+            traceability.get(int(summary.id or 0)).confidence_bucket
+            if traceability and int(summary.id or 0) in traceability
+            else None
+        ),
     )
 
 

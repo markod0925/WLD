@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from pathlib import Path
 
 from ..core.config import AppConfig, load_config
@@ -22,11 +23,27 @@ def main() -> int:
     flush_parser.add_argument("--config", dest="config_path", default=None, help="Path to config.json")
     flush_parser.add_argument("--reason", default="debug-cli", help="Summary job reason label")
 
+    semantic_parser = subparsers.add_parser(
+        "semantic-diag",
+        help="Print semantic merge diagnostics rows for a specific day",
+    )
+    semantic_parser.add_argument("--config", dest="config_path", default=None, help="Path to config.json")
+    semantic_parser.add_argument("--db", dest="db_path", default=None, help="Path to sqlite DB")
+    semantic_parser.add_argument("--day", required=True, help="Day in YYYY-MM-DD format")
+    semantic_parser.add_argument("--limit", type=int, default=100, help="Maximum rows to print")
+
     args = parser.parse_args()
     if args.command == "pending":
         return _run_pending(config_path=args.config_path, db_path=args.db_path)
     if args.command == "flush-buffered":
         return _run_flush(config_path=args.config_path, reason=args.reason)
+    if args.command == "semantic-diag":
+        return _run_semantic_diag(
+            config_path=args.config_path,
+            db_path=args.db_path,
+            day=args.day,
+            limit=args.limit,
+        )
     raise ValueError(f"Unsupported command: {args.command}")
 
 
@@ -107,6 +124,27 @@ def _run_flush(config_path: str | None, reason: str) -> int:
             f"stop={result.stop_reason} created={result.summaries_created} "
             f"failed={result.failed_jobs} cancelled={result.cancelled_jobs} "
             f"pending_summary_jobs={result.pending_summary_jobs}"
+        )
+    return 0
+
+
+def _run_semantic_diag(config_path: str | None, db_path: str | None, day: str, limit: int) -> int:
+    resolved_db_path = _resolve_db_path(config_path=config_path, db_path=db_path)
+    target_day = date.fromisoformat(day)
+    storage = SQLiteStorage(resolved_db_path)
+    try:
+        rows = storage.list_semantic_merge_diagnostics(target_day, limit=limit)
+    finally:
+        storage.close()
+    print(f"DB: {resolved_db_path}")
+    print(f"Day: {target_day.isoformat()}")
+    print(f"Rows: {len(rows)}")
+    for row in rows:
+        blockers = ",".join(row.blockers_json)
+        print(
+            f"- pair={row.left_summary_id}->{row.right_summary_id} decision={row.decision} "
+            f"score={row.final_merge_score:.3f} cosine={row.embedding_cosine_similarity:.3f} "
+            f"gap={row.temporal_gap_seconds:.1f} blockers=[{blockers}]"
         )
     return 0
 
