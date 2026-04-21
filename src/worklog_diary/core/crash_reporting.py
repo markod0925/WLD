@@ -11,6 +11,7 @@ import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from uuid import uuid4
 from types import TracebackType
 
 
@@ -36,6 +37,7 @@ class CrashReporter:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._heartbeat_interval_seconds = 15.0
+        self._marker_lock = threading.Lock()
 
         self._fault_log_stream: object | None = None
         self._installed = False
@@ -58,6 +60,7 @@ class CrashReporter:
         self._installed = True
 
     def mark_clean_exit(self) -> None:
+        self._stop_heartbeat()
         state = self._load_marker_state() or {}
         state.update(
             {
@@ -68,7 +71,6 @@ class CrashReporter:
             }
         )
         self._write_marker_state(state)
-        self._stop_heartbeat()
         self._clean_exit_marked = True
 
     def _enable_faulthandler(self) -> None:
@@ -183,17 +185,19 @@ class CrashReporter:
             self._heartbeat_thread.join(timeout=1.0)
 
     def _load_marker_state(self) -> dict | None:
-        try:
-            if not self.marker_path.exists():
+        with self._marker_lock:
+            try:
+                if not self.marker_path.exists():
+                    return None
+                return json.loads(self.marker_path.read_text(encoding="utf-8"))
+            except Exception:
                 return None
-            return json.loads(self.marker_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
 
     def _write_marker_state(self, state: dict) -> None:
-        temp_path = self.marker_path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-        temp_path.replace(self.marker_path)
+        with self._marker_lock:
+            temp_path = self.marker_path.with_name(f"{self.marker_path.stem}.{os.getpid()}.{uuid4().hex}.tmp")
+            temp_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+            temp_path.replace(self.marker_path)
 
     def _atexit_handler(self) -> None:
         if self._clean_exit_marked:

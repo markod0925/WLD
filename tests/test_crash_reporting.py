@@ -81,6 +81,49 @@ def test_mark_clean_exit_updates_state(tmp_path: Path) -> None:
     assert int(state["pid"]) == os.getpid()
 
 
+def test_mark_clean_exit_stops_heartbeat_before_marker_write(tmp_path: Path, monkeypatch) -> None:
+    reporter = _make_reporter(tmp_path)
+    reporter.app_data_dir.mkdir(parents=True, exist_ok=True)
+
+    steps: list[str] = []
+
+    def _stop() -> None:
+        steps.append("stop")
+
+    def _write(_state: dict) -> None:
+        steps.append("write")
+
+    monkeypatch.setattr(reporter, "_stop_heartbeat", _stop)
+    monkeypatch.setattr(reporter, "_write_marker_state", _write)
+
+    reporter.mark_clean_exit()
+
+    assert steps == ["stop", "write"]
+
+
+def test_marker_writes_are_safe_under_concurrency(tmp_path: Path) -> None:
+    reporter = _make_reporter(tmp_path)
+    reporter.app_data_dir.mkdir(parents=True, exist_ok=True)
+
+    failures: list[Exception] = []
+
+    def _writer(idx: int) -> None:
+        try:
+            for tick in range(50):
+                reporter._write_marker_state({"status": "RUNNING", "idx": idx, "tick": tick})
+        except Exception as exc:  # pragma: no cover - this path should remain unreachable
+            failures.append(exc)
+
+    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert reporter.marker_path.exists()
+
+
 def test_run_protected_logs_and_reraises(caplog) -> None:
     caplog.set_level(logging.CRITICAL)
     logger = logging.getLogger("test.crash.run")
