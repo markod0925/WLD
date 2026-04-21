@@ -699,8 +699,8 @@ class SQLiteStorage(ActivityRepository):
         limit: int = 1000,
     ) -> list[SummaryRecord]:
         started_at = time.perf_counter()
-        lowered_query = f"%{query.strip().lower()}%"
-        clauses = ["LOWER(summary_text) LIKE ?"]
+        lowered_query = f"%{_escape_like_pattern(query.strip().lower())}%"
+        clauses = ["LOWER(summary_text) LIKE ? ESCAPE '\\'"]
         values: list[object] = [lowered_query]
         if start_ts is not None:
             clauses.append("start_ts >= ?")
@@ -744,8 +744,8 @@ class SQLiteStorage(ActivityRepository):
         limit: int = 1000,
     ) -> list[DailySummaryRecord]:
         started_at = time.perf_counter()
-        lowered_query = f"%{query.strip().lower()}%"
-        clauses = ["LOWER(recap_text) LIKE ?"]
+        lowered_query = f"%{_escape_like_pattern(query.strip().lower())}%"
+        clauses = ["LOWER(recap_text) LIKE ? ESCAPE '\\'"]
         values: list[object] = [lowered_query]
         if start_day is not None:
             clauses.append("day >= ?")
@@ -861,3 +861,7 @@ def _day_epoch_bounds(day: Day) -> tuple[float, float]:
     start_dt = datetime.combine(day, DateTimeTime.min, tzinfo=local_tz)
     end_dt = start_dt + timedelta(days=1)
     return start_dt.timestamp(), end_dt.timestamp()
+
+
+def _escape_like_pattern(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

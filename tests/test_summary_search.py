@@ -68,3 +68,31 @@ def test_summary_search_scopes_and_types(tmp_path: Path) -> None:
 def test_format_summary_html_highlights_case_insensitive_matches() -> None:
     rendered = format_summary_html("Alpha alpha ALPHA", "alpHa")
     assert rendered.count("background-color: #fff176") == 3
+
+
+def test_summary_search_treats_like_wildcards_as_literal_text(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    service = SummarySearchService(storage)
+    try:
+        target_day = date(2026, 4, 10)
+        _insert_event_summary(storage, start_ts=_ts(target_day, 10), end_ts=_ts(target_day, 10, 15), text="100% done")
+        _insert_event_summary(storage, start_ts=_ts(target_day, 11), end_ts=_ts(target_day, 11, 15), text="100 done")
+        storage.create_daily_summary(day=target_day, recap_text="Reviewed _id mapping", recap_json=None, source_batch_count=1)
+        storage.create_daily_summary(
+            day=date(2026, 4, 11),
+            recap_text="Reviewed xid mapping",
+            recap_json=None,
+            source_batch_count=1,
+        )
+
+        percent_results = service.search(
+            SummarySearchParams(query="100%", scope=SummarySearchScope.ALL, anchor_day=target_day)
+        )
+        assert [item.text for item in percent_results] == ["100% done"]
+
+        underscore_results = service.search(
+            SummarySearchParams(query="_id", scope=SummarySearchScope.ALL, anchor_day=target_day)
+        )
+        assert [item.text for item in underscore_results] == ["Reviewed _id mapping"]
+    finally:
+        storage.close()
