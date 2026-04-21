@@ -105,3 +105,17 @@ def test_legacy_dedup_threshold_conflict_prefers_canonical_and_logs_warning(tmp_
     assert cfg.screenshot_dedup_phash_threshold == 7
     assert cfg.screenshot_dedup_threshold == 7
     assert any("event=config_legacy_field_conflict" in record.message for record in caplog.records)
+
+
+def test_matching_legacy_dedup_threshold_does_not_log_conflict_or_force_save(caplog) -> None:
+    normalized = config_module.AppConfig()
+    normalized.normalize()
+    payload = normalized.to_dict()
+    payload["screenshot_dedup_phash_threshold"] = 9
+    payload["screenshot_dedup_threshold"] = 9
+
+    caplog.clear()
+    _, needs_save = config_module._build_config_from_mapping(payload, source="in-memory")
+
+    assert needs_save is False
+    assert not any("event=config_legacy_field_conflict" in record.message for record in caplog.records)

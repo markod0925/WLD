@@ -277,16 +277,19 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
             source=source,
         )
         if has_phash_threshold:
-            _LOGGER.warning(
-                "event=config_legacy_field_conflict source=%s canonical_field=%s legacy_field=%s behavior=%s",
-                source or "config",
-                "screenshot_dedup_phash_threshold",
-                "screenshot_dedup_threshold",
-                "prefer_canonical",
-            )
+            canonical_threshold = values["screenshot_dedup_phash_threshold"]
+            if legacy_threshold != canonical_threshold:
+                _LOGGER.warning(
+                    "event=config_legacy_field_conflict source=%s canonical_field=%s legacy_field=%s behavior=%s",
+                    source or "config",
+                    "screenshot_dedup_phash_threshold",
+                    "screenshot_dedup_threshold",
+                    "prefer_canonical",
+                )
+                needs_save = True
         else:
             values["screenshot_dedup_phash_threshold"] = legacy_threshold
-        needs_save = True
+            needs_save = True
 
     values["config_version"] = CONFIG_VERSION
     config = AppConfig(**values)

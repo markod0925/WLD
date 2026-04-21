@@ -30,6 +30,7 @@ from .settings_metadata import (
     UI_SETTINGS_BY_KEY,
     USER_SETTINGS,
     SettingUiMetadata,
+    float_step_decimals,
     modified_debug_keys,
 )
 
@@ -245,7 +246,9 @@ def _create_widget(setting: SettingUiMetadata) -> QWidget:
         widget = QDoubleSpinBox()
         if setting.min_value is not None and setting.max_value is not None:
             widget.setRange(float(setting.min_value), float(setting.max_value))
-        widget.setSingleStep(float(setting.step or 0.1))
+        step = float(setting.step or 0.1)
+        widget.setSingleStep(step)
+        widget.setDecimals(float_step_decimals(step))
         return widget
     if setting.widget == "select":
         widget = QComboBox()

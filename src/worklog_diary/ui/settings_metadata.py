@@ -518,3 +518,10 @@ def modified_debug_keys(values: Mapping[str, object]) -> list[str]:
         if is_debug_value_modified_from_default(setting.key, values[setting.key]):
             changed.append(setting.key)
     return changed
+
+
+def float_step_decimals(step: float) -> int:
+    text = f"{step:.9f}".rstrip("0")
+    if "." not in text:
+        return 0
+    return len(text.split(".", 1)[1])
