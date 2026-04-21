@@ -20,6 +20,7 @@ hiddenimports = collect_submodules("worklog_diary")
 binaries = []
 
 # The LM Studio client imports requests at runtime and the frozen bundle must carry it.
+hiddenimports += ["requests"]
 for package_name in ("requests",):
     try:
         hiddenimports += collect_submodules(package_name)
