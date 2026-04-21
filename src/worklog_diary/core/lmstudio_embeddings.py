@@ -50,7 +50,13 @@ class SummaryEmbeddingProvider:
         canonical = build_canonical_embedding_text(summary)
         canonical_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         cached = self.storage.get_summary_embedding(summary_id)
-        if cached is not None and cached.get("canonical_hash") == canonical_hash:
+        cache_matches_active_client = (
+            cached is not None
+            and cached.get("canonical_hash") == canonical_hash
+            and str(cached.get("model") or "") == self.client.model
+            and str(cached.get("base_url") or "").rstrip("/") == self.client.base_url
+        )
+        if cache_matches_active_client:
             vector = cached.get("embedding")
             if isinstance(vector, list):
                 return [float(v) for v in vector]

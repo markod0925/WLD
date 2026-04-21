@@ -62,6 +62,17 @@ class _FailingEmbedClient:
         raise RuntimeError("down")
 
 
+class _CountingEmbedClient:
+    def __init__(self, *, model: str = "embed-a", base_url: str = "http://localhost/v1") -> None:
+        self.model = model
+        self.base_url = base_url
+        self.calls = 0
+
+    def embed_text(self, text: str) -> list[float]:
+        self.calls += 1
+        return [float(self.calls), 0.0]
+
+
 def _engine(vectors: dict[int, list[float] | None], **kwargs: object) -> SemanticCoalescingEngine:
     kwargs.setdefault("min_merge_score", 0.55)
     config = SemanticCoalescingConfig(enabled=True, **kwargs)
@@ -94,6 +105,33 @@ def test_embedding_provider_safe_degradation(tmp_path: Path) -> None:
         provider = SummaryEmbeddingProvider(storage=storage, client=_FailingEmbedClient())
         assert provider.embedding_for_summary(record) is None
         assert storage.get_summary_embedding(sid) is None
+    finally:
+        storage.close()
+
+
+def test_embedding_provider_recomputes_when_model_or_base_url_changes(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    try:
+        _insert_summary(storage, start_ts=1, end_ts=2, text="a")
+        record = storage.list_summaries(limit=1)[0]
+        client = _CountingEmbedClient()
+        provider = SummaryEmbeddingProvider(storage=storage, client=client)
+
+        vector1 = provider.embedding_for_summary(record)
+        vector2 = provider.embedding_for_summary(record)
+        assert vector1 == [1.0, 0.0]
+        assert vector2 == [1.0, 0.0]
+        assert client.calls == 1
+
+        client.model = "embed-b"
+        vector3 = provider.embedding_for_summary(record)
+        assert vector3 == [2.0, 0.0]
+        assert client.calls == 2
+
+        client.base_url = "http://another-host/v1"
+        vector4 = provider.embedding_for_summary(record)
+        assert vector4 == [3.0, 0.0]
+        assert client.calls == 3
     finally:
         storage.close()
 
