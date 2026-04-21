@@ -6,6 +6,8 @@ This file preserves the technical and implementation details from the end-user R
 
 WorkLog Diary is a local-first Windows desktop tray app that captures work context and periodically generates local summaries via LM Studio.
 
+The local database is encrypted with SQLCipher and the database key is protected with Windows DPAPI. See [ENCRYPTION.md](./ENCRYPTION.md) for the full architecture, threat model, and failure modes.
+
 ## What it does
 
 - Tracks the active foreground window and process over time intervals.
@@ -63,6 +65,7 @@ You can configure this list in settings or config JSON.
 - Python 3.11+
 - Windows desktop session
 - LM Studio running locally (for summarization)
+- SQLCipher-compatible Python binding on Windows builds
 
 ## Installation
 

@@ -9,6 +9,19 @@ from datetime import date as Day, datetime, time as DateTimeTime, timedelta
 from pathlib import Path
 
 from .activity_repository import ActivityRepository
+from .security.db_key_manager import (
+    DatabaseKeyCorruptedError,
+    DatabaseKeyMissingError,
+    DatabaseKeyProtectionError,
+    DatabaseKeyUnprotectError,
+    ensure_database_key,
+)
+from .security.sqlcipher import (
+    SqlCipherKeyMismatchError,
+    SqlCipherOpenError,
+    SqlCipherUnavailableError,
+    open_sqlcipher_connection,
+)
 from .storage_cleanup import StorageCleanupService
 from .storage_diagnostics import StorageDiagnosticsRepository
 from .storage_schema import StorageSchemaManager
@@ -29,20 +42,78 @@ class SQLiteStorage(ActivityRepository):
     """SQLite-backed repository for activity capture and summary records."""
 
     def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = str(Path(db_path))
+        self.db_key_path = str(Path(self.db_path).with_name("db_key.bin"))
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._metrics_lock = threading.Lock()
         self._db_write_window_started = time.perf_counter()
         self._db_write_window_count = 0
         self.logger = logging.getLogger(__name__)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self.schema_manager = StorageSchemaManager(self._conn, self._lock, self.logger)
-        self.diagnostics_repository = StorageDiagnosticsRepository(self._conn, self._lock, self.logger)
-        self.cleanup_service = StorageCleanupService(self._conn, self._lock, self.logger)
-        self.bootstrap()
-        self._recover_incomplete_state()
+        self._conn = None
+        db_exists = Path(self.db_path).exists()
+        key_exists = Path(self.db_key_path).exists()
+        try:
+            if not key_exists and not db_exists:
+                self.logger.info(
+                    "event=db_key_bootstrap status=creating db_path=%s key_path=%s",
+                    self.db_path,
+                    self.db_key_path,
+                )
+            elif not key_exists:
+                self.logger.error(
+                    "event=db_key_missing status=error db_path=%s key_path=%s",
+                    self.db_path,
+                    self.db_key_path,
+                )
+            key_bytes = ensure_database_key(self.db_path, self.db_key_path)
+            if not key_exists and not db_exists:
+                self.logger.info(
+                    "event=db_key_generated status=ok db_path=%s key_path=%s",
+                    self.db_path,
+                    self.db_key_path,
+                )
+            self._conn = open_sqlcipher_connection(self.db_path, key_bytes)
+            self._conn.row_factory = sqlite3.Row
+            self.schema_manager = StorageSchemaManager(self._conn, self._lock, self.logger)
+            self.diagnostics_repository = StorageDiagnosticsRepository(self._conn, self._lock, self.logger)
+            self.cleanup_service = StorageCleanupService(self._conn, self._lock, self.logger)
+            self.bootstrap()
+            self._recover_incomplete_state()
+            self.logger.info(
+                "event=db_open status=ok db_path=%s key_path=%s encrypted=true",
+                self.db_path,
+                self.db_key_path,
+            )
+        except (
+            DatabaseKeyMissingError,
+            DatabaseKeyCorruptedError,
+            DatabaseKeyProtectionError,
+            DatabaseKeyUnprotectError,
+            SqlCipherUnavailableError,
+            SqlCipherKeyMismatchError,
+            SqlCipherOpenError,
+        ) as exc:
+            self.logger.error(
+                "event=db_open status=error db_path=%s key_path=%s error_type=%s error=%s",
+                self.db_path,
+                self.db_key_path,
+                exc.__class__.__name__,
+                exc,
+            )
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            raise
+        except Exception:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            raise
 
     def close(self) -> None:
         with self._lock:

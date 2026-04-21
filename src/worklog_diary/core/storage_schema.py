@@ -244,7 +244,12 @@ class StorageSchemaManager:
                 len(open_rows),
                 interrupted_count,
             )
-        self._log_db_query_timing("startup_recovery", started_at, rows=len(open_rows) + interrupted_count)
+        duration_ms = (time.perf_counter() - started_at) * 1000.0
+        self._logger.info(
+            "event=db_query_timing operation=startup_recovery duration_ms=%.3f rows=%s",
+            duration_ms,
+            len(open_rows) + interrupted_count,
+        )
 
     def ensure_daily_summaries_schema(self) -> None:
         row = self._conn.execute(

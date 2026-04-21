@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
 
 ROOT = Path(os.path.dirname(os.path.abspath("WLD.spec")))
@@ -17,11 +17,22 @@ datas = [
 ]
 
 hiddenimports = collect_submodules("worklog_diary")
+binaries = []
+
+for package_name in ("sqlcipher3", "pysqlcipher3"):
+    try:
+        hiddenimports += collect_submodules(package_name)
+    except Exception:
+        pass
+    try:
+        binaries += collect_dynamic_libs(package_name)
+    except Exception:
+        pass
 
 a = Analysis(
     [str(ROOT / "wld_launcher.py")],
     pathex=[str(SRC)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
