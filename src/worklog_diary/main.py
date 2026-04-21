@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import signal
 import sys
 import time
 
 from .app import create_services, run_desktop_app
+from .core.crash_reporting import run_protected
 
 
 
@@ -15,28 +17,33 @@ def main() -> int:
     parser.add_argument("--headless", action="store_true", help="Run without tray UI")
     args = parser.parse_args()
 
-    if not args.headless:
-        return run_desktop_app(config_path=args.config_path)
+    logger = logging.getLogger(__name__)
 
-    services = create_services(config_path=args.config_path)
-    services.start_monitoring()
+    def _run() -> int:
+        if not args.headless:
+            return run_desktop_app(config_path=args.config_path)
 
-    stop_requested = False
+        services = create_services(config_path=args.config_path)
+        services.start_monitoring()
 
-    def _handle_signal(_signum: int, _frame: object) -> None:
-        nonlocal stop_requested
-        stop_requested = True
+        stop_requested = False
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+        def _handle_signal(_signum: int, _frame: object) -> None:
+            nonlocal stop_requested
+            stop_requested = True
 
-    try:
-        while not stop_requested:
-            time.sleep(0.5)
-    finally:
-        services.shutdown()
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
 
-    return 0
+        try:
+            while not stop_requested:
+                time.sleep(0.5)
+        finally:
+            services.shutdown()
+
+        return 0
+
+    return run_protected("app_main_loop", logger, _run)
 
 
 if __name__ == "__main__":

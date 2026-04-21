@@ -70,8 +70,14 @@ class SessionMonitor:
         if hwnd:
             try:
                 ctypes.windll.user32.PostMessageW(int(hwnd), 0x0010, 0, 0)  # WM_CLOSE
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.warning(
+                    "[CRASH] stage=session_monitor_stop_post_message status=error pid=%s thread=%s error_type=%s error=%s",
+                    os.getpid(),
+                    threading.current_thread().name,
+                    exc.__class__.__name__,
+                    exc,
+                )
 
         thread.join(timeout=5.0)
 
@@ -199,12 +205,24 @@ class SessionMonitor:
             if registered:
                 try:
                     wtsapi32.WTSUnRegisterSessionNotification(hwnd)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.logger.warning(
+                        "[CRASH] stage=session_monitor_unregister_notification status=error pid=%s thread=%s error_type=%s error=%s",
+                        os.getpid(),
+                        threading.current_thread().name,
+                        exc.__class__.__name__,
+                        exc,
+                    )
             try:
                 user32.UnregisterClassW(self._window_class_name, h_instance)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.warning(
+                    "[CRASH] stage=session_monitor_unregister_class status=error pid=%s thread=%s error_type=%s error=%s",
+                    os.getpid(),
+                    threading.current_thread().name,
+                    exc.__class__.__name__,
+                    exc,
+                )
             self._hwnd = None
             self._wnd_proc_ref = None
 

@@ -86,6 +86,7 @@ class StorageCleanupService:
             referenced_paths = {_normalized_path_key(str(row["file_path"])) for row in rows}
 
         removed = 0
+        failed = 0
         for directory in candidate_dirs:
             if not directory.exists():
                 continue
@@ -97,8 +98,19 @@ class StorageCleanupService:
                 try:
                     os.remove(file_path)
                     removed += 1
-                except Exception:
+                except Exception as exc:
+                    failed += 1
+                    self._logger.warning(
+                        "[CRASH] stage=orphan_file_delete status=error pid=%s thread=%s error_type=%s error=%s path=%s",
+                        os.getpid(),
+                        threading.current_thread().name,
+                        exc.__class__.__name__,
+                        exc,
+                        file_path,
+                    )
                     continue
+        if failed:
+            self._logger.warning("[CRASH] stage=orphan_cleanup status=error pid=%s failed_deletes=%s", os.getpid(), failed)
         return removed
 
     def _log_db_query_timing(self, operation: str, started_at: float, *, rows: int | None = None) -> None:
