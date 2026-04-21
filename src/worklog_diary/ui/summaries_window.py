@@ -8,9 +8,12 @@ from PySide6.QtCore import QDate, QTimer, Signal
 from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (
     QCalendarWidget,
+    QComboBox,
+    QDateEdit,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -20,10 +23,23 @@ from PySide6.QtWidgets import (
 )
 
 from worklog_diary.core.lmstudio_logging import get_failed_stage
+from worklog_diary.core.summary_search import (
+    SummarySearchParams,
+    SummarySearchResult,
+    SummarySearchScope,
+    SummarySearchService,
+    SummarySearchType,
+)
 
 from ..core.monitoring_components import DiagnosticsService
 from ..core.services import MonitoringServices
-from .summaries_view_model import DaySummaryView, SummaryCardView, build_calendar_highlight_days, build_day_summary_view
+from .summaries_view_model import (
+    DaySummaryView,
+    SummaryCardView,
+    build_calendar_highlight_days,
+    build_day_summary_view,
+    format_summary_html,
+)
 
 
 class SummariesWindow(QWidget):
@@ -38,6 +54,7 @@ class SummariesWindow(QWidget):
         super().__init__()
         self.services = services
         self.diagnostics_service = diagnostics_service
+        self.search_service = SummarySearchService(services.storage)
         self.logger = logging.getLogger(__name__)
         self.setWindowTitle("WorkLog Diary Summaries")
         self.resize(1100, 700)
@@ -70,6 +87,41 @@ class SummariesWindow(QWidget):
         self.generate_recap_button.clicked.connect(self._generate_daily_recap)
         tools.addWidget(self.generate_recap_button)
         tools.addStretch(1)
+
+        search_tools = QHBoxLayout()
+        root.addLayout(search_tools)
+        search_tools.addWidget(QLabel("Search summaries"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Type text to search event/day summaries...")
+        self.search_input.returnPressed.connect(self._run_search)
+        search_tools.addWidget(self.search_input, 2)
+
+        self.search_scope_combo = QComboBox()
+        self.search_scope_combo.addItem("Day", SummarySearchScope.DAY)
+        self.search_scope_combo.addItem("Month", SummarySearchScope.MONTH)
+        self.search_scope_combo.addItem("Year", SummarySearchScope.YEAR)
+        self.search_scope_combo.addItem("All", SummarySearchScope.ALL)
+        self.search_scope_combo.currentIndexChanged.connect(self._sync_search_anchor_visibility)
+        search_tools.addWidget(self.search_scope_combo)
+
+        self.search_anchor_date = QDateEdit()
+        self.search_anchor_date.setCalendarPopup(True)
+        self.search_anchor_date.setDate(_day_to_qdate(self._selected_day))
+        self.search_anchor_date.dateChanged.connect(self._sync_search_anchor_label)
+        self.search_anchor_label = QLabel()
+        search_tools.addWidget(self.search_anchor_date)
+        search_tools.addWidget(self.search_anchor_label)
+
+        self.search_button = QPushButton("Search")
+        self.search_button.clicked.connect(self._run_search)
+        search_tools.addWidget(self.search_button)
+
+        self.clear_search_button = QPushButton("Clear")
+        self.clear_search_button.clicked.connect(self._clear_search)
+        search_tools.addWidget(self.clear_search_button)
+
+        self.search_status_label = QLabel("Enter a query and press Enter or Search.")
+        root.addWidget(self.search_status_label)
 
         body = QHBoxLayout()
         root.addLayout(body, 1)
@@ -110,6 +162,8 @@ class SummariesWindow(QWidget):
         self.summary_cards_layout.setContentsMargins(0, 0, 0, 0)
         self.summary_cards_layout.setSpacing(10)
         self.summary_scroll.setWidget(self.summary_cards_host)
+        self._sync_search_anchor_visibility()
+        self._sync_search_anchor_label()
 
     def refresh(self) -> None:
         selected_day = self._selected_day
@@ -144,7 +198,9 @@ class SummariesWindow(QWidget):
         self._highlighted_days = highlighted
 
     def _on_calendar_selection_changed(self) -> None:
-        self._load_day(_qdate_to_day(self.calendar.selectedDate()))
+        selected = _qdate_to_day(self.calendar.selectedDate())
+        self.search_anchor_date.setDate(_day_to_qdate(selected))
+        self._load_day(selected)
 
     def _load_day(self, day: date) -> None:
         self._selected_day = day
@@ -162,6 +218,7 @@ class SummariesWindow(QWidget):
         self._last_refresh_signature = self._build_refresh_signature(day)
 
     def _render_day_view(self, view: DaySummaryView) -> None:
+        self.search_status_label.setText("Enter a query and press Enter or Search.")
         self.selected_date_label.setText(f"Selected date: {view.day.isoformat()}")
 
         if view.has_daily_recap:
@@ -177,7 +234,7 @@ class SummariesWindow(QWidget):
         self.no_data_label.setVisible(len(view.cards) == 0)
 
         for card in view.cards:
-            self.summary_cards_layout.addWidget(_build_summary_card_widget(card))
+            self.summary_cards_layout.addWidget(_build_summary_card_widget(card, highlight_query=None))
         self.summary_cards_layout.addStretch(1)
 
         self.generate_recap_button.setEnabled(not self._daily_recap_inflight and len(view.cards) > 0)
@@ -288,8 +345,84 @@ class SummariesWindow(QWidget):
             return bool(self.diagnostics_service.get_health_snapshot()["flush_drain_active"])
         return bool(getattr(self.services, "is_drain_active", False))
 
+    def _run_search(self) -> None:
+        query = self.search_input.text().strip()
+        if not query:
+            self._clear_search()
+            return
 
-def _build_summary_card_widget(card: SummaryCardView) -> QFrame:
+        scope = self.search_scope_combo.currentData()
+        if not isinstance(scope, SummarySearchScope):
+            scope = SummarySearchScope.DAY
+        anchor_day = _qdate_to_day(self.search_anchor_date.date())
+        params = SummarySearchParams(query=query, scope=scope, anchor_day=anchor_day)
+        results = self.search_service.search(params)
+        self._render_search_results(results=results, query=query, scope=scope, anchor_day=anchor_day)
+
+    def _clear_search(self) -> None:
+        self.search_input.clear()
+        self.refresh()
+
+    def _render_search_results(
+        self,
+        *,
+        results: list[SummarySearchResult],
+        query: str,
+        scope: SummarySearchScope,
+        anchor_day: date,
+    ) -> None:
+        self._clear_summary_cards()
+        self.daily_recap_status_label.setText("Daily recap: hidden while searching")
+        self.daily_recap_text.clear()
+        scope_label = self.search_scope_combo.currentText()
+        self.selected_date_label.setText(f"Search results ({scope_label.lower()})")
+        self.no_data_label.setVisible(False)
+        if not results:
+            self.search_status_label.setText(f'No matches for "{query}" in {scope_label.lower()} scope.')
+            self.summary_cards_layout.addWidget(QLabel("No summaries matched your query."))
+            self.summary_cards_layout.addStretch(1)
+            return
+
+        self.search_status_label.setText(
+            f'{len(results)} match(es) for "{query}" in {scope_label.lower()} scope anchored at {anchor_day.isoformat()}.'
+        )
+        for item in results:
+            summary_type = "event" if item.summary_type == SummarySearchType.EVENT else "day"
+            if summary_type == "event":
+                timestamp_label = f"Event day: {item.day.isoformat()}"
+            else:
+                timestamp_label = f"Daily recap day: {item.day.isoformat()}"
+            card = SummaryCardView(
+                summary_id=item.source_id,
+                time_range=timestamp_label,
+                summary_text=item.text,
+                major_activities=[f"Type: {summary_type}"],
+                blocked_notes=[],
+                uncertainty_notes=[],
+            )
+            self.summary_cards_layout.addWidget(_build_summary_card_widget(card, highlight_query=query))
+        self.summary_cards_layout.addStretch(1)
+
+    def _sync_search_anchor_visibility(self) -> None:
+        scope = self.search_scope_combo.currentData()
+        self.search_anchor_date.setVisible(scope != SummarySearchScope.ALL)
+        self.search_anchor_label.setVisible(scope != SummarySearchScope.ALL)
+        self._sync_search_anchor_label()
+
+    def _sync_search_anchor_label(self, *_: object) -> None:
+        scope = self.search_scope_combo.currentData()
+        anchor_day = _qdate_to_day(self.search_anchor_date.date())
+        if scope == SummarySearchScope.MONTH:
+            self.search_anchor_label.setText(f"Anchor month: {anchor_day.strftime('%Y-%m')}")
+        elif scope == SummarySearchScope.YEAR:
+            self.search_anchor_label.setText(f"Anchor year: {anchor_day.strftime('%Y')}")
+        elif scope == SummarySearchScope.DAY:
+            self.search_anchor_label.setText(f"Anchor day: {anchor_day.isoformat()}")
+        else:
+            self.search_anchor_label.setText("")
+
+
+def _build_summary_card_widget(card: SummaryCardView, highlight_query: str | None) -> QFrame:
     frame = QFrame()
     frame.setFrameShape(QFrame.Shape.StyledPanel)
     frame.setFrameShadow(QFrame.Shadow.Raised)
@@ -298,7 +431,10 @@ def _build_summary_card_widget(card: SummaryCardView) -> QFrame:
     layout.setContentsMargins(10, 10, 10, 10)
 
     layout.addWidget(QLabel(f"Time range: {card.time_range}"))
-    layout.addWidget(QLabel(f"Summary: {card.summary_text or '(empty)'}"))
+    summary_label = QLabel()
+    summary_label.setWordWrap(True)
+    summary_label.setText(format_summary_html(card.summary_text or "(empty)", highlight_query))
+    layout.addWidget(summary_label)
 
     if card.major_activities:
         layout.addWidget(QLabel(_format_list_block("Major activities", card.major_activities)))
