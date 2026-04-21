@@ -30,12 +30,24 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+          python -m pip install -e .
           python -m pip install pyinstaller
 
       - name: Build application
         run: |
           $ErrorActionPreference = 'Stop'
-          pyinstaller --noconfirm --clean WLD.spec
+          python -m PyInstaller --noconfirm --clean WLD.spec
+
+      - name: Smoke test packaged app
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $exePath = Join-Path $env:GITHUB_WORKSPACE 'dist\WLD\WLD.exe'
+          if (-not (Test-Path $exePath)) {
+            throw "Expected build output not found: $exePath"
+          }
+
+          & $exePath --help | Out-Null
 
       - name: Package dist/WLD
         run: |

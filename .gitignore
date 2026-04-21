@@ -6,4 +6,4 @@ __pycache__/
 /build
 /dist
 .cymbal/index.db
-.cymbal/index.db
+..cymbalindex.db

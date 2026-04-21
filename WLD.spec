@@ -19,6 +19,13 @@ datas = [
 hiddenimports = collect_submodules("worklog_diary")
 binaries = []
 
+# The LM Studio client imports requests at runtime and the frozen bundle must carry it.
+for package_name in ("requests",):
+    try:
+        hiddenimports += collect_submodules(package_name)
+    except Exception:
+        pass
+
 for package_name in ("sqlcipher3", "pysqlcipher3"):
     try:
         hiddenimports += collect_submodules(package_name)

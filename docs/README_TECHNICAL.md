@@ -109,13 +109,13 @@ pip install pyinstaller
 Build the portable app from the repository root:
 
 ```powershell
-pyinstaller --noconfirm --clean WLD.spec
+python -m PyInstaller --noconfirm --clean WLD.spec
 ```
 
 If PyInstaller cannot clean `build/WLD/` because Windows has a file lock on `localpycs`, close any running `WLD.exe` instance and retry. If the folder still cannot be removed, use a fresh work directory for that build:
 
 ```powershell
-pyinstaller --noconfirm --clean --workpath build-pyi --distpath dist-pyi WLD.spec
+python -m PyInstaller --noconfirm --clean --workpath build-pyi --distpath dist-pyi WLD.spec
 ```
 
 That creates `dist/WLD/` with the executable and bundled runtime files. The main items are:
@@ -133,6 +133,8 @@ On first launch, the frozen app creates a portable `data/` directory next to `WL
 - `data/logs/worklog_diary.log`
 
 To test on another Windows PC, copy the entire `dist/WLD/` folder to the target machine and launch `WLD.exe` from that folder. Keep the full folder structure intact so the executable stays adjacent to its `data/` directory.
+
+After building, run `dist/WLD/WLD.exe --help` once to confirm the frozen app can start and import its runtime dependencies before you publish a release zip.
 
 The bundled app still uses the same LM Studio settings as the dev build. LM Studio must be installed and running on the target PC, and the local OpenAI-compatible endpoint must match the configured `lmstudio_base_url` and `lmstudio_model`.
 
