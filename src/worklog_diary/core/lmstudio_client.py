@@ -7,9 +7,10 @@ import re
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import requests
+if TYPE_CHECKING:
+    import requests
 
 from .batching import SummaryBatch
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
@@ -398,7 +399,7 @@ class LMStudioClient:
             )
         return records
 
-    def _post_chat_completion(self, payload: dict[str, Any], *, endpoint: str) -> requests.Response:
+    def _post_chat_completion(self, payload: dict[str, Any], *, endpoint: str) -> "requests.Response":
         start = time.perf_counter()
         log_llm_stage(
             self.logger,
@@ -409,6 +410,9 @@ class LMStudioClient:
             timeout=self.timeout_seconds,
         )
         try:
+            # Import lazily so frozen startup does not fail before the LLM client is used.
+            import requests
+
             response = requests.post(
                 endpoint,
                 json=payload,

@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_submodules
 
 
 ROOT = Path(os.path.dirname(os.path.abspath("WLD.spec")))
@@ -23,9 +23,12 @@ binaries = []
 hiddenimports += ["requests"]
 for package_name in ("requests",):
     try:
-        hiddenimports += collect_submodules(package_name)
+        package_datas, package_binaries, package_hiddenimports = collect_all(package_name)
+        datas += package_datas
+        binaries += package_binaries
+        hiddenimports += package_hiddenimports
     except Exception:
-        pass
+        hiddenimports.append(package_name)
 
 for package_name in ("sqlcipher3", "pysqlcipher3"):
     try:
