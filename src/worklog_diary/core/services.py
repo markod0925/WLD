@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import date
 
 from .config import AppConfig, app_data_dir_source, is_frozen_executable, save_config
+from .crash_reporting import CrashReporter
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
 from .logging_setup import configure_logging
 from .lmstudio_logging import get_failed_stage
@@ -39,6 +40,9 @@ class MonitoringServices:
             self.config.config_path,
         )
         self.logger.info("event=runtime_paths_source source=%s", app_data_dir_source())
+
+        self.crash_reporter = CrashReporter(self.config.app_data_dir, self.config.log_dir, self.logger)
+        self.crash_reporter.install()
 
         self.registry = ServiceRegistry(self.config)
         self._services: MonitoringServiceBundle = self.registry.build_bundle()
@@ -84,6 +88,7 @@ class MonitoringServices:
             self.flush_coordinator,
             self.logger,
         )
+        self._shutdown_completed = False
 
     def set_error_notification_sink(self, sink: Callable[[str, str], None] | None) -> None:
         self.error_notifier.set_sink(sink)
@@ -228,8 +233,12 @@ class MonitoringServices:
             raise
 
     def shutdown(self) -> None:
+        if self._shutdown_completed:
+            return
+        self._shutdown_completed = True
         self._services.shutdown_event.set()
         self.cancel_flush_drain()
         self.stop_monitoring()
         self.summarizer.stop()
         self.storage.close()
+        self.crash_reporter.mark_clean_exit()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -50,7 +51,13 @@ class FlushScheduler:
                     self.logger.info("event=summary_flush_triggered reason=scheduled")
                     self.flush_callback("scheduled")
                 except Exception as exc:
-                    self.logger.exception("Scheduled flush failed: %s", exc)
+                    self.logger.exception(
+                        "[CRASH] stage=scheduled_flush status=error pid=%s thread=%s error_type=%s error=%s",
+                        os.getpid(),
+                        threading.current_thread().name,
+                        exc.__class__.__name__,
+                        exc,
+                    )
                 next_run = time.time() + self.interval_seconds
                 self.state.set_flush_times(last_flush_ts=self.state.snapshot().last_flush_ts, next_flush_ts=next_run)
 
