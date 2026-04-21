@@ -107,6 +107,35 @@ class SummaryRecord:
     created_ts: float
 
 
+
+
+@dataclass(slots=True)
+class CoalescingDiagnosticRecord:
+    id: int | None
+    day: date
+    left_summary_id: int
+    right_summary_id: int
+    embedding_cosine_similarity: float
+    app_similarity_score: float
+    window_similarity_score: float
+    keyword_overlap_score: float
+    temporal_gap_seconds: float
+    blockers_json: list[str]
+    final_merge_score: float
+    decision: str
+    reasons_json: list[str]
+    created_ts: float
+
+
+@dataclass(slots=True)
+class CoalescedSummaryRecord:
+    id: int | None
+    start_ts: float
+    end_ts: float
+    summary_text: str
+    summary_json: dict[str, Any]
+    created_ts: float
+    source_summary_ids: list[int]
 @dataclass(slots=True)
 class DailySummaryRecord:
     id: int | None

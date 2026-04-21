@@ -22,6 +22,8 @@ from .session_monitor import SessionMonitor
 from .storage import SQLiteStorage
 from .summarizer import Summarizer
 from .summary_dedup import SummaryDeduplicator
+from .lmstudio_embeddings import LMStudioEmbeddingClient, SummaryEmbeddingProvider
+from .semantic_coalescing import SemanticCoalescer, SemanticCoalescingConfig, SemanticCoalescingEngine
 from .text_reconstructor import TextReconstructionService, TextReconstructor
 from .window_tracker import ForegroundWindowTrackerService
 
@@ -127,6 +129,38 @@ class ServiceRegistry:
             timeout_seconds=self.config.request_timeout_seconds,
             prompt_builder=LMStudioPromptBuilder(max_prompt_chars=self.config.lmstudio_max_prompt_chars),
         )
+        embedding_client = LMStudioEmbeddingClient(
+            base_url=self.config.semantic_embedding_base_url,
+            model=self.config.semantic_embedding_model,
+            timeout_seconds=self.config.request_timeout_seconds,
+        )
+        embedding_provider = SummaryEmbeddingProvider(storage=storage, client=embedding_client)
+        semantic_config = SemanticCoalescingConfig(
+            enabled=self.config.semantic_coalescing_enabled,
+            embedding_base_url=self.config.semantic_embedding_base_url,
+            embedding_model=self.config.semantic_embedding_model,
+            max_candidate_gap_seconds=self.config.semantic_max_candidate_gap_seconds,
+            max_neighbor_count=self.config.semantic_max_neighbor_count,
+            min_cosine_similarity=self.config.semantic_min_cosine_similarity,
+            min_merge_score=self.config.semantic_min_merge_score,
+            same_app_boost=self.config.semantic_same_app_boost,
+            window_title_boost=self.config.semantic_window_title_boost,
+            keyword_overlap_boost=self.config.semantic_keyword_overlap_boost,
+            temporal_gap_penalty_weight=self.config.semantic_temporal_gap_penalty_weight,
+            app_switch_penalty=self.config.semantic_app_switch_penalty,
+            lock_boundary_blocks_merge=self.config.semantic_lock_boundary_blocks_merge,
+            pause_boundary_blocks_merge=self.config.semantic_pause_boundary_blocks_merge,
+            transition_keywords=list(self.config.semantic_transition_keywords),
+            store_merge_diagnostics=self.config.semantic_store_merge_diagnostics,
+            recompute_missing_embeddings_on_startup=self.config.semantic_recompute_missing_embeddings_on_startup,
+        )
+        semantic_engine = SemanticCoalescingEngine(config=semantic_config, embedding_provider=embedding_provider)
+        semantic_coalescer = SemanticCoalescer(
+            storage=storage,
+            engine=semantic_engine,
+            diagnostics_enabled=self.config.semantic_store_merge_diagnostics,
+        )
+
         summary_deduplicator = SummaryDeduplicator(
             suppress_threshold=self.config.summary_similarity_suppress_threshold,
             merge_threshold=self.config.summary_similarity_merge_threshold,
@@ -141,6 +175,7 @@ class ServiceRegistry:
             error_notifier=error_notifier,
             shutdown_event=shutdown_event,
             summary_deduplicator=summary_deduplicator,
+            semantic_coalescer=semantic_coalescer,
         )
 
         return MonitoringServiceBundle(

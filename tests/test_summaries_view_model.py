@@ -8,6 +8,7 @@ from worklog_diary.ui.summaries_view_model import (
     build_day_summary_view,
     build_summary_card_view,
 )
+from worklog_diary.ui.semantic_diagnostics_view_model import CoalescedTraceabilityInfo
 
 
 def test_build_calendar_highlight_days_deduplicates_days() -> None:
@@ -36,6 +37,50 @@ def test_build_summary_card_view_extracts_structured_fields() -> None:
     assert card.major_activities == ["implemented calendar view", "added recap button"]
     assert card.blocked_notes == ["browser activity excluded"]
     assert card.uncertainty_notes == ["minor uncertainty around model verbosity"]
+    assert card.is_coalesced is False
+    assert card.coalesced_member_count == 0
+
+
+def test_build_summary_card_view_marks_coalesced_summary() -> None:
+    record = SummaryRecord(
+        id=2,
+        job_id=-1,
+        start_ts=300.0,
+        end_ts=500.0,
+        summary_text="merged",
+        summary_json={
+            "coalesced_from": [10, 11, 12],
+            "coalesced_count": 3,
+            "key_points": ["merged card"],
+        },
+        created_ts=600.0,
+    )
+    card = build_summary_card_view(record)
+    assert card.is_coalesced is True
+    assert card.coalesced_member_count == 3
+
+
+def test_build_summary_card_view_applies_traceability_confidence() -> None:
+    record = SummaryRecord(
+        id=3,
+        job_id=-1,
+        start_ts=1.0,
+        end_ts=2.0,
+        summary_text="merged",
+        summary_json={"coalesced_from": [1, 2], "coalesced_count": 2},
+        created_ts=3.0,
+    )
+    traceability = {
+        3: CoalescedTraceabilityInfo(
+            source_summary_ids=[1, 2],
+            representative_score=0.93,
+            confidence_bucket="High",
+            diagnostics_count=1,
+        )
+    }
+    card = build_summary_card_view(record, traceability=traceability)
+    assert card.coalesced_source_ids == [1, 2]
+    assert card.confidence_bucket == "High"
 
 
 def test_build_day_summary_view_combines_day_cards_and_recap_state() -> None:

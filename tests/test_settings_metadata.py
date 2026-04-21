@@ -10,6 +10,9 @@ from worklog_diary.ui.settings_metadata import (
     UI_SETTINGS_BY_KEY,
     USER_SETTINGS,
     modified_debug_keys,
+    SEMANTIC_PRESET_DESCRIPTIONS,
+    semantic_preset_name_for_values,
+    semantic_preset_values,
 )
 
 
@@ -73,6 +76,23 @@ def test_settings_are_grouped_by_exposure_level() -> None:
         "screenshot_dedup_ssim_threshold",
         "screenshot_dedup_resize_width",
         "screenshot_dedup_compare_recent_count",
+        "semantic_coalescing_enabled",
+        "semantic_embedding_base_url",
+        "semantic_embedding_model",
+        "semantic_max_candidate_gap_seconds",
+        "semantic_max_neighbor_count",
+        "semantic_min_cosine_similarity",
+        "semantic_min_merge_score",
+        "semantic_same_app_boost",
+        "semantic_window_title_boost",
+        "semantic_keyword_overlap_boost",
+        "semantic_temporal_gap_penalty_weight",
+        "semantic_app_switch_penalty",
+        "semantic_lock_boundary_blocks_merge",
+        "semantic_pause_boundary_blocks_merge",
+        "semantic_transition_keywords",
+        "semantic_store_merge_diagnostics",
+        "semantic_recompute_missing_embeddings_on_startup",
         "screenshot_min_keep_interval_seconds",
     }
 
@@ -100,3 +120,30 @@ def test_modified_debug_keys_detects_changes() -> None:
 
     changed = unchanged | {"summary_cooldown_seconds": 300, "screenshot_dedup_enabled": False}
     assert set(modified_debug_keys(changed)) == {"summary_cooldown_seconds", "screenshot_dedup_enabled"}
+
+
+def test_semantic_preset_mapping() -> None:
+    off = semantic_preset_values("off")
+    assert off["semantic_coalescing_enabled"] is False
+
+    conservative = semantic_preset_values("conservative")
+    assert conservative["semantic_coalescing_enabled"] is True
+    assert conservative["semantic_min_cosine_similarity"] == 0.90
+    assert conservative["semantic_min_merge_score"] == 0.85
+
+    aggressive = semantic_preset_values("aggressive")
+    assert aggressive["semantic_coalescing_enabled"] is True
+    assert aggressive["semantic_min_cosine_similarity"] < conservative["semantic_min_cosine_similarity"]
+    assert aggressive["semantic_min_merge_score"] < conservative["semantic_min_merge_score"]
+
+    assert semantic_preset_name_for_values(off) == "off"
+    assert semantic_preset_name_for_values(conservative) == "conservative"
+    assert semantic_preset_name_for_values(aggressive) == "aggressive"
+    custom = dict(conservative) | {"semantic_min_merge_score": 0.88}
+    assert semantic_preset_name_for_values(custom) == "custom"
+
+
+def test_semantic_preset_descriptions_present() -> None:
+    assert "recommended default" in SEMANTIC_PRESET_DESCRIPTIONS["conservative"].lower()
+    assert "broader" in SEMANTIC_PRESET_DESCRIPTIONS["aggressive"].lower()
+    assert "disables" in SEMANTIC_PRESET_DESCRIPTIONS["off"].lower()

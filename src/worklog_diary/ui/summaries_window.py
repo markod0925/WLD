@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from datetime import date
 
 from PySide6.QtCore import QDate, QTimer, Signal
@@ -20,6 +21,11 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QDialog,
+    QTableWidget,
+    QTableWidgetItem,
+    QDialogButtonBox,
+    QCheckBox,
 )
 
 from worklog_diary.core.lmstudio_logging import get_failed_stage
@@ -40,6 +46,8 @@ from .summaries_view_model import (
     build_day_summary_view,
     format_summary_html,
 )
+from .semantic_diagnostics_view_model import build_semantic_diagnostics_rows
+from .semantic_diagnostics_view_model import build_coalesced_traceability_map
 
 
 class SummariesWindow(QWidget):
@@ -86,6 +94,10 @@ class SummariesWindow(QWidget):
         self.generate_recap_button = QPushButton("Generate Daily Recap")
         self.generate_recap_button.clicked.connect(self._generate_daily_recap)
         tools.addWidget(self.generate_recap_button)
+
+        self.coalescing_diag_button = QPushButton("Semantic Diagnostics")
+        self.coalescing_diag_button.clicked.connect(self._open_semantic_diagnostics)
+        tools.addWidget(self.coalescing_diag_button)
         tools.addStretch(1)
 
         search_tools = QHBoxLayout()
@@ -143,6 +155,8 @@ class SummariesWindow(QWidget):
 
         self.daily_recap_status_label = QLabel()
         right.addWidget(self.daily_recap_status_label)
+        self.semantic_status_label = QLabel()
+        right.addWidget(self.semantic_status_label)
 
         self.daily_recap_text = QTextEdit()
         self.daily_recap_text.setReadOnly(True)
@@ -204,9 +218,17 @@ class SummariesWindow(QWidget):
 
     def _load_day(self, day: date) -> None:
         self._selected_day = day
-        summaries = self.services.storage.list_summaries_for_day(day, limit=1000)
+        use_coalesced = bool(self.services.config.semantic_coalescing_enabled)
+        summaries = self.services.storage.list_effective_summaries_for_day(day, use_coalesced=use_coalesced)
         daily_summary = self.services.storage.get_daily_summary_for_day(day)
-        view = build_day_summary_view(day=day, summaries=summaries, daily_summary=daily_summary)
+        diagnostics = self.services.storage.list_semantic_merge_diagnostics(day, decision="merge", limit=2000)
+        traceability = build_coalesced_traceability_map(summaries, diagnostics)
+        view = build_day_summary_view(
+            day=day,
+            summaries=summaries,
+            daily_summary=daily_summary,
+            traceability_by_summary_id=traceability,
+        )
 
         self.logger.info(
             "event=calendar_summary_load day=%s summary_count=%s has_daily_recap=%s",
@@ -230,11 +252,20 @@ class SummariesWindow(QWidget):
             self.daily_recap_status_label.setText("Daily recap: not generated")
             self.daily_recap_text.clear()
 
+        diagnostics = self.services.storage.list_semantic_merge_diagnostics(view.day, decision="merge", limit=1000)
+        self.semantic_status_label.setText(f"Semantic coalescing: {len(diagnostics)} merge(s) for this day")
+
         self._clear_summary_cards()
         self.no_data_label.setVisible(len(view.cards) == 0)
 
         for card in view.cards:
-            self.summary_cards_layout.addWidget(_build_summary_card_widget(card, highlight_query=None))
+            self.summary_cards_layout.addWidget(
+                _build_summary_card_widget(
+                    card,
+                    highlight_query=None,
+                    on_inspect=(lambda source_ids: self._open_semantic_diagnostics(source_summary_ids=source_ids)),
+                )
+            )
         self.summary_cards_layout.addStretch(1)
 
         self.generate_recap_button.setEnabled(not self._daily_recap_inflight and len(view.cards) > 0)
@@ -249,7 +280,8 @@ class SummariesWindow(QWidget):
 
     def _build_refresh_signature(self, day: date) -> tuple[object, ...]:
         summary_days = tuple(self.services.storage.list_summary_days(limit=3660))
-        summaries = self.services.storage.list_summaries_for_day(day, limit=1000)
+        use_coalesced = bool(self.services.config.semantic_coalescing_enabled)
+        summaries = self.services.storage.list_effective_summaries_for_day(day, use_coalesced=use_coalesced)
         daily_summary = self.services.storage.get_daily_summary_for_day(day)
         daily_signature = (
             None
@@ -399,6 +431,8 @@ class SummariesWindow(QWidget):
                 major_activities=[f"Type: {summary_type}"],
                 blocked_notes=[],
                 uncertainty_notes=[],
+                is_coalesced=False,
+                coalesced_member_count=0,
             )
             self.summary_cards_layout.addWidget(_build_summary_card_widget(card, highlight_query=query))
         self.summary_cards_layout.addStretch(1)
@@ -421,8 +455,105 @@ class SummariesWindow(QWidget):
         else:
             self.search_anchor_label.setText("")
 
+    def _open_semantic_diagnostics(self, *, source_summary_ids: list[int] | None = None) -> None:
+        selected_day = self._selected_day
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Semantic diagnostics — {selected_day.isoformat()}")
+        dialog.resize(1040, 540)
+        layout = QVBoxLayout(dialog)
+        header = QLabel("Read-only semantic coalescing diagnostics.", dialog)
+        header.setWordWrap(True)
+        layout.addWidget(header)
 
-def _build_summary_card_widget(card: SummaryCardView, highlight_query: str | None) -> QFrame:
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Day:", dialog))
+        day_edit = QDateEdit(dialog)
+        day_edit.setCalendarPopup(True)
+        day_edit.setDate(_day_to_qdate(selected_day))
+        filter_row.addWidget(day_edit)
+
+        filter_row.addWidget(QLabel("Decision:", dialog))
+        decision_combo = QComboBox(dialog)
+        decision_combo.addItem("All", "")
+        decision_combo.addItem("Merge", "merge")
+        decision_combo.addItem("No merge", "no_merge")
+        filter_row.addWidget(decision_combo)
+
+        filter_row.addWidget(QLabel("Contains:", dialog))
+        text_filter = QLineEdit(dialog)
+        text_filter.setPlaceholderText("blocker/reason text...")
+        filter_row.addWidget(text_filter, 1)
+        low_score_only = QCheckBox("Low score merges only", dialog)
+        filter_row.addWidget(low_score_only)
+
+        apply_button = QPushButton("Apply", dialog)
+        filter_row.addWidget(apply_button)
+        layout.addLayout(filter_row)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(9)
+        table.setHorizontalHeaderLabels(
+            [
+                "Pair",
+                "Decision",
+                "Score",
+                "Cosine",
+                "App",
+                "Window",
+                "Gap(s)",
+                "Blockers",
+                "Reasons",
+            ]
+        )
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(table)
+
+        footer = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        footer.rejected.connect(dialog.reject)
+        footer.accepted.connect(dialog.accept)
+        layout.addWidget(footer)
+
+        def reload_rows() -> None:
+            target_day = _qdate_to_day(day_edit.date())
+            decision_value = decision_combo.currentData()
+            decision = decision_value if isinstance(decision_value, str) and decision_value else None
+            query = text_filter.text().strip() or None
+            diagnostics = self.services.storage.list_semantic_merge_diagnostics(
+                target_day,
+                decision=decision,
+                text_query=query,
+                summary_ids=source_summary_ids,
+                max_merge_score=(self.services.config.semantic_min_merge_score if low_score_only.isChecked() else None),
+                limit=500,
+            )
+            rows = build_semantic_diagnostics_rows(diagnostics)
+            table.setRowCount(len(rows))
+            for row_idx, row in enumerate(rows):
+                table.setItem(row_idx, 0, QTableWidgetItem(row.pair_label))
+                table.setItem(row_idx, 1, QTableWidgetItem(row.decision))
+                table.setItem(row_idx, 2, QTableWidgetItem(row.score_label))
+                table.setItem(row_idx, 3, QTableWidgetItem(row.cosine_label))
+                table.setItem(row_idx, 4, QTableWidgetItem(row.app_label))
+                table.setItem(row_idx, 5, QTableWidgetItem(row.window_label))
+                table.setItem(row_idx, 6, QTableWidgetItem(row.gap_label))
+                table.setItem(row_idx, 7, QTableWidgetItem(row.blockers_label))
+                table.setItem(row_idx, 8, QTableWidgetItem(row.reasons_label))
+            table.resizeColumnsToContents()
+            header.setText(f"Read-only semantic coalescing diagnostics ({len(rows)} row(s)).")
+
+        apply_button.clicked.connect(reload_rows)
+        text_filter.returnPressed.connect(reload_rows)
+        low_score_only.toggled.connect(reload_rows)
+        table.setSortingEnabled(True)
+        reload_rows()
+        dialog.exec()
+
+
+def _build_summary_card_widget(
+    card: SummaryCardView,
+    highlight_query: str | None,
+    on_inspect: Callable[[list[int]], None] | None = None,
+) -> QFrame:
     frame = QFrame()
     frame.setFrameShape(QFrame.Shape.StyledPanel)
     frame.setFrameShadow(QFrame.Shadow.Raised)
@@ -430,7 +561,16 @@ def _build_summary_card_widget(card: SummaryCardView, highlight_query: str | Non
     layout = QVBoxLayout(frame)
     layout.setContentsMargins(10, 10, 10, 10)
 
-    layout.addWidget(QLabel(f"Time range: {card.time_range}"))
+    header_text = f"Time range: {card.time_range}"
+    if card.is_coalesced:
+        count = max(card.coalesced_member_count, 2)
+        confidence = f" | {card.confidence_bucket}" if card.confidence_bucket else ""
+        header_text = f"{header_text}   [Coalesced ×{count}{confidence}]"
+    layout.addWidget(QLabel(header_text))
+    if card.is_coalesced and card.coalesced_source_ids and on_inspect is not None:
+        inspect_button = QPushButton("Inspect merge diagnostics")
+        inspect_button.clicked.connect(lambda *_: on_inspect(card.coalesced_source_ids or []))
+        layout.addWidget(inspect_button)
     summary_label = QLabel()
     summary_label.setWordWrap(True)
     summary_label.setText(format_summary_html(card.summary_text or "(empty)", highlight_query))

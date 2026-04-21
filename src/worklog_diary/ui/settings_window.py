@@ -29,9 +29,12 @@ from .settings_metadata import (
     DEFAULTS,
     UI_SETTINGS_BY_KEY,
     USER_SETTINGS,
+    SEMANTIC_PRESET_DESCRIPTIONS,
     SettingUiMetadata,
     float_step_decimals,
     modified_debug_keys,
+    semantic_preset_name_for_values,
+    semantic_preset_values,
 )
 
 
@@ -55,13 +58,55 @@ class DebugSettingsDialog(QDialog):
         self._summary_label = QLabel("", self)
         layout.addWidget(self._summary_label)
 
+        semantic_group = QGroupBox("Semantic coalescing", self)
+        semantic_form = QFormLayout(semantic_group)
+        self._preset_combo = QComboBox(semantic_group)
+        self._preset_combo.addItem("Off", "off")
+        self._preset_combo.addItem("Conservative", "conservative")
+        self._preset_combo.addItem("Aggressive", "aggressive")
+        self._preset_combo.addItem("Custom", "custom")
+        self._preset_combo.currentIndexChanged.connect(self._apply_semantic_preset)
+        self._preset_combo.setToolTip(
+            "\n".join(
+                [
+                    f"Off: {SEMANTIC_PRESET_DESCRIPTIONS['off']}",
+                    f"Conservative: {SEMANTIC_PRESET_DESCRIPTIONS['conservative']}",
+                    f"Aggressive: {SEMANTIC_PRESET_DESCRIPTIONS['aggressive']}",
+                ]
+            )
+        )
+        semantic_form.addRow(QLabel("Preset profile"), self._preset_combo)
+        semantic_note = QLabel(
+            "Preset updates core safety thresholds. Raw semantic fields below remain editable.",
+            semantic_group,
+        )
+        semantic_note.setWordWrap(True)
+        semantic_form.addRow("", semantic_note)
+        self._semantic_status_label = QLabel("", semantic_group)
+        semantic_form.addRow("Status", self._semantic_status_label)
+        layout.addWidget(semantic_group)
+
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         container = QWidget(scroll)
         self.form = QFormLayout(container)
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        for setting in DEBUG_SETTINGS:
+        semantic_settings = [setting for setting in DEBUG_SETTINGS if setting.key.startswith("semantic_")]
+        other_settings = [setting for setting in DEBUG_SETTINGS if not setting.key.startswith("semantic_")]
+
+        for setting in semantic_settings:
+            label = self._label_with_info(setting.key)
+            self._row_containers[setting.key] = label
+            self.form.addRow(label, self._widgets[setting.key])
+            _connect_value_changed(self._widgets[setting.key], self._refresh_modified_state)
+
+        if semantic_settings and other_settings:
+            divider = QLabel("Other debug parameters", container)
+            divider.setStyleSheet("font-weight: 600; padding-top: 6px;")
+            self.form.addRow(divider, QLabel("", container))
+
+        for setting in other_settings:
             label = self._label_with_info(setting.key)
             self._row_containers[setting.key] = label
             self.form.addRow(label, self._widgets[setting.key])
@@ -82,6 +127,7 @@ class DebugSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
         self._refresh_modified_state()
+        self._refresh_semantic_status()
 
     def _label_with_info(self, config_key: str) -> QWidget:
         metadata = UI_SETTINGS_BY_KEY[config_key]
@@ -121,6 +167,40 @@ class DebugSettingsDialog(QDialog):
             else:
                 widget.setStyleSheet("")
                 row.setStyleSheet("")
+        self._refresh_semantic_status()
+
+    def _apply_semantic_preset(self) -> None:
+        preset_value = self._preset_combo.currentData()
+        if not isinstance(preset_value, str):
+            return
+        if preset_value == "custom":
+            self._refresh_semantic_status()
+            return
+        values = semantic_preset_values(preset_value)
+        for key, value in values.items():
+            setting = next((item for item in DEBUG_SETTINGS if item.key == key), None)
+            widget = self._widgets.get(key)
+            if setting is None or widget is None:
+                continue
+            _set_widget_value(widget, value, setting)
+        self._refresh_modified_state()
+
+    def _refresh_semantic_status(self) -> None:
+        current_values = {
+            setting.key: _read_widget_value(self._widgets[setting.key], setting)
+            for setting in DEBUG_SETTINGS
+            if setting.key.startswith("semantic_")
+        }
+        preset = semantic_preset_name_for_values(current_values)
+        index = self._preset_combo.findData(preset)
+        if index >= 0:
+            self._preset_combo.blockSignals(True)
+            self._preset_combo.setCurrentIndex(index)
+            self._preset_combo.blockSignals(False)
+        if preset == "custom":
+            self._semantic_status_label.setText("Custom semantic coalescing parameters")
+        else:
+            self._semantic_status_label.setText(f"Using {preset.capitalize()} preset")
 
 
 class SettingsWindow(QWidget):

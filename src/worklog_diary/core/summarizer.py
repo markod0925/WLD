@@ -14,6 +14,7 @@ from .lmstudio_client import LMStudioClient
 from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, safe_error
 from .storage import SQLiteStorage
 from .summary_dedup import SummaryDeduplicator
+from .semantic_coalescing import SemanticCoalescer
 
 
 @dataclass(slots=True)
@@ -39,6 +40,7 @@ class Summarizer:
         error_notifier: ErrorNotificationManager | None = None,
         shutdown_event: threading.Event | None = None,
         summary_deduplicator: SummaryDeduplicator | None = None,
+        semantic_coalescer: SemanticCoalescer | None = None,
     ) -> None:
         self.storage = storage
         self.batch_builder = batch_builder
@@ -46,6 +48,7 @@ class Summarizer:
         self.logger = logging.getLogger(__name__)
         self.error_notifier = error_notifier or ErrorNotificationManager()
         self.summary_deduplicator = summary_deduplicator or SummaryDeduplicator()
+        self.semantic_coalescer = semantic_coalescer
 
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -224,7 +227,8 @@ class Summarizer:
         return self._run_summary_job(job_id=job_id, batch=batch, reason=reason)
 
     def generate_daily_recap_for_day(self, day: date) -> tuple[int, bool]:
-        summaries = self.storage.list_summaries_for_day(day)
+        use_coalesced = bool(self.semantic_coalescer and self.semantic_coalescer.enabled)
+        summaries = self.storage.list_effective_summaries_for_day(day, use_coalesced=use_coalesced)
         if not summaries:
             raise ValueError(f"No summaries available for day {day.isoformat()}")
 
@@ -411,6 +415,12 @@ class Summarizer:
             self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
             self.storage.purge_raw_data(batch.start_ts, batch.end_ts)
             self.storage.update_summary_job(job_id, status="succeeded")
+            if self.semantic_coalescer is not None and self.semantic_coalescer.enabled:
+                try:
+                    day = date.fromtimestamp(batch.start_ts)
+                    self.semantic_coalescer.refresh_day(day)
+                except Exception:
+                    self.logger.exception("event=semantic_coalescing_failed day=%s", date.fromtimestamp(batch.start_ts).isoformat())
             self.error_notifier.resolve_many(
                 "summary_generation_failure",
                 "lmstudio_connection",

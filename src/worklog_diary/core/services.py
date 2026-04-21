@@ -18,6 +18,7 @@ from .monitoring_components import (
     ServiceRegistry,
 )
 from .summary_dedup import SummaryDeduplicator
+from .semantic_coalescing import SemanticCoalescingConfig
 
 
 class MonitoringServices:
@@ -172,6 +173,30 @@ class MonitoringServices:
             cooldown_seconds=self.config.summary_cooldown_seconds,
             recent_compare_count=self.config.recent_summary_compare_count,
         )
+        if self.summarizer.semantic_coalescer is not None:
+            self.summarizer.semantic_coalescer.engine.config = SemanticCoalescingConfig(
+                enabled=self.config.semantic_coalescing_enabled,
+                embedding_base_url=self.config.semantic_embedding_base_url,
+                embedding_model=self.config.semantic_embedding_model,
+                max_candidate_gap_seconds=self.config.semantic_max_candidate_gap_seconds,
+                max_neighbor_count=self.config.semantic_max_neighbor_count,
+                min_cosine_similarity=self.config.semantic_min_cosine_similarity,
+                min_merge_score=self.config.semantic_min_merge_score,
+                same_app_boost=self.config.semantic_same_app_boost,
+                window_title_boost=self.config.semantic_window_title_boost,
+                keyword_overlap_boost=self.config.semantic_keyword_overlap_boost,
+                temporal_gap_penalty_weight=self.config.semantic_temporal_gap_penalty_weight,
+                app_switch_penalty=self.config.semantic_app_switch_penalty,
+                lock_boundary_blocks_merge=self.config.semantic_lock_boundary_blocks_merge,
+                pause_boundary_blocks_merge=self.config.semantic_pause_boundary_blocks_merge,
+                transition_keywords=list(self.config.semantic_transition_keywords),
+                store_merge_diagnostics=self.config.semantic_store_merge_diagnostics,
+                recompute_missing_embeddings_on_startup=self.config.semantic_recompute_missing_embeddings_on_startup,
+            )
+            self.summarizer.semantic_coalescer.diagnostics_enabled = self.config.semantic_store_merge_diagnostics
+            embedding_client = self.summarizer.semantic_coalescer.engine.embedding_provider.client
+            embedding_client.base_url = self.config.semantic_embedding_base_url.rstrip("/")
+            embedding_client.model = self.config.semantic_embedding_model
         self.summarizer.update_max_parallel_jobs(self.config.max_parallel_summary_jobs)
         self.scheduler.interval_seconds = max(30, self.config.flush_interval_seconds)
         self.flush_coordinator.flush_interval_seconds = max(30, self.config.flush_interval_seconds)
