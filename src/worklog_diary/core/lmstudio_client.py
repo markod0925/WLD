@@ -147,7 +147,14 @@ class LMStudioClient:
         endpoint = f"{self.base_url}/chat/completions"
         job_id = f"daily_recap:{day.isoformat()}"
         text_chars = sum(len(summary.summary_text) for summary in summaries)
-        summary_chunks = self._split_daily_recap_chunks(day=day, summaries=summaries)
+        summary_chunks = self._split_daily_recap_chunks(
+            day=day,
+            summaries=summaries,
+            endpoint=endpoint,
+            job_id=job_id,
+            text_chars=text_chars,
+            total_summaries=len(summaries),
+        )
         chunk_count = len(summary_chunks)
         log_llm_stage(
             self.logger,
@@ -200,7 +207,14 @@ class LMStudioClient:
             current = intermediate
             while len(current) > 1:
                 aggregate_summaries = self._to_intermediate_summary_records(current)
-                aggregate_chunks = self._split_daily_recap_chunks(day=day, summaries=aggregate_summaries)
+                aggregate_chunks = self._split_daily_recap_chunks(
+                    day=day,
+                    summaries=aggregate_summaries,
+                    endpoint=endpoint,
+                    job_id=job_id,
+                    text_chars=sum(len(item.summary_text) for item in aggregate_summaries),
+                    total_summaries=len(aggregate_summaries),
+                )
                 if len(aggregate_chunks) >= len(current):
                     structured = self._merge_structured_responses_locally(current)
                     structured.metadata["intermediate_chunk_count"] = chunk_count
@@ -332,14 +346,33 @@ class LMStudioClient:
                 "payload_build",
             ) from exc
 
-    def _split_daily_recap_chunks(self, *, day: date, summaries: list[SummaryRecord]) -> list[list[SummaryRecord]]:
+    def _split_daily_recap_chunks(
+        self,
+        *,
+        day: date,
+        summaries: list[SummaryRecord],
+        endpoint: str | None = None,
+        job_id: str | None = None,
+        text_chars: int | None = None,
+        total_summaries: int | None = None,
+    ) -> list[list[SummaryRecord]]:
         if not summaries:
             return [[]]
         chunks: list[list[SummaryRecord]] = []
         current: list[SummaryRecord] = []
         for summary in summaries:
             candidate = [*current, summary]
-            prompt = self.prompt_builder.build_daily_recap_prompt(day=day, summaries=candidate)
+            if endpoint is not None and job_id is not None and text_chars is not None and total_summaries is not None:
+                prompt = self._build_daily_recap_prompt_result(
+                    day=day,
+                    summaries=candidate,
+                    endpoint=endpoint,
+                    job_id=job_id,
+                    text_chars=text_chars,
+                    total_summaries=total_summaries,
+                )
+            else:
+                prompt = self.prompt_builder.build_daily_recap_prompt(day=day, summaries=candidate)
             if len(prompt.prompt_text) <= self.prompt_builder.max_prompt_chars or not current:
                 current = candidate
                 continue

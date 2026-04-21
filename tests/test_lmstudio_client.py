@@ -295,3 +295,28 @@ def test_lmstudio_client_daily_recap_rechunks_aggregation_when_needed(monkeypatc
     assert parsed["metadata"]["aggregation_fallback"] == "local_merge_no_progress"
     assert parsed["metadata"]["aggregation_rounds"] == 0
     assert len(calls) == parsed["metadata"]["intermediate_chunk_count"]
+
+
+def test_lmstudio_client_wraps_chunk_planning_prompt_errors() -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+
+    def raise_prompt_error(*_args: object, **_kwargs: object) -> None:
+        raise TypeError("bad prompt input")
+
+    client.prompt_builder.build_daily_recap_prompt = raise_prompt_error  # type: ignore[method-assign]
+    summaries = [
+        SummaryRecord(
+            id=1,
+            job_id=1,
+            start_ts=1.0,
+            end_ts=2.0,
+            summary_text="worked",
+            summary_json={"summary_text": "worked"},
+            created_ts=3.0,
+        )
+    ]
+
+    with pytest.raises(LMStudioServiceUnavailableError) as exc_info:
+        client.summarize_daily_recap(day=date(2026, 4, 20), summaries=summaries)
+
+    assert getattr(exc_info.value, "failed_stage", None) == "payload_build"
