@@ -690,6 +690,85 @@ class SQLiteStorage(ActivityRepository):
         self._log_db_query_timing("count_batch_summaries_for_day", started_at, rows=1)
         return count
 
+    def search_event_summaries(
+        self,
+        *,
+        query: str,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+        limit: int = 1000,
+    ) -> list[SummaryRecord]:
+        started_at = time.perf_counter()
+        lowered_query = f"%{_escape_like_pattern(query.strip().lower())}%"
+        clauses = ["LOWER(summary_text) LIKE ? ESCAPE '\\'"]
+        values: list[object] = [lowered_query]
+        if start_ts is not None:
+            clauses.append("start_ts >= ?")
+            values.append(start_ts)
+        if end_ts is not None:
+            clauses.append("start_ts < ?")
+            values.append(end_ts)
+        values.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT id, job_id, start_ts, end_ts, summary_text, summary_json, created_ts
+                FROM summaries
+                WHERE {' AND '.join(clauses)}
+                ORDER BY start_ts DESC, id DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        result = [
+            SummaryRecord(
+                id=int(row["id"]),
+                job_id=int(row["job_id"]),
+                start_ts=float(row["start_ts"]),
+                end_ts=float(row["end_ts"]),
+                summary_text=str(row["summary_text"]),
+                summary_json=json.loads(str(row["summary_json"])),
+                created_ts=float(row["created_ts"]),
+            )
+            for row in rows
+        ]
+        self._log_db_query_timing("search_event_summaries", started_at, rows=len(result))
+        return result
+
+    def search_daily_summaries(
+        self,
+        *,
+        query: str,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+        limit: int = 1000,
+    ) -> list[DailySummaryRecord]:
+        started_at = time.perf_counter()
+        lowered_query = f"%{_escape_like_pattern(query.strip().lower())}%"
+        clauses = ["LOWER(recap_text) LIKE ? ESCAPE '\\'"]
+        values: list[object] = [lowered_query]
+        if start_day is not None:
+            clauses.append("day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("day < ?")
+            values.append(end_day_exclusive.isoformat())
+        values.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT id, day, created_ts, recap_text, recap_json, source_batch_count
+                FROM daily_summaries
+                WHERE {' AND '.join(clauses)}
+                ORDER BY day DESC, id DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        result = [_row_to_daily_summary_record(row) for row in rows]
+        self._log_db_query_timing("search_daily_summaries", started_at, rows=len(result))
+        return result
+
     def create_daily_summary(
         self,
         day: Day,
@@ -782,3 +861,7 @@ def _day_epoch_bounds(day: Day) -> tuple[float, float]:
     start_dt = datetime.combine(day, DateTimeTime.min, tzinfo=local_tz)
     end_dt = start_dt + timedelta(days=1)
     return start_dt.timestamp(), end_dt.timestamp()
+
+
+def _escape_like_pattern(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

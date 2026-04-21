@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
+from html import escape
 from typing import Any
 
 from ..core.models import DailySummaryRecord, SummaryRecord
@@ -109,3 +111,28 @@ def _flatten_string_values(value: Any) -> list[str]:
         return [compact]
     compact = str(value).strip()
     return [compact] if compact else []
+
+
+def format_summary_html(text: str, query: str | None) -> str:
+    if not query:
+        return f"Summary: {escape(text)}"
+    cleaned_query = query.strip()
+    if not cleaned_query:
+        return f"Summary: {escape(text)}"
+    pattern = re.compile(re.escape(cleaned_query), re.IGNORECASE)
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return f"Summary: {escape(text)}"
+
+    chunks: list[str] = []
+    cursor = 0
+    for match in matches:
+        start, end = match.span()
+        if start > cursor:
+            chunks.append(escape(text[cursor:start]))
+        matched = escape(text[start:end])
+        chunks.append(f"<span style='background-color: #fff176; color: #000;'>{matched}</span>")
+        cursor = end
+    if cursor < len(text):
+        chunks.append(escape(text[cursor:]))
+    return "Summary: " + "".join(chunks)
