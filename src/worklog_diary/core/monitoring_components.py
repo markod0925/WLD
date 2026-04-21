@@ -12,6 +12,7 @@ from .config import AppConfig
 from .error_notifications import ErrorNotificationManager
 from .keyboard_capture import KeyboardCaptureService
 from .lmstudio_client import LMStudioClient
+from .lmstudio_prompt import LMStudioPromptBuilder
 from .lmstudio_logging import get_failed_stage
 from .models import SharedState
 from .privacy import PrivacyPolicyEngine
@@ -124,6 +125,7 @@ class ServiceRegistry:
             base_url=self.config.lmstudio_base_url,
             model=self.config.lmstudio_model,
             timeout_seconds=self.config.request_timeout_seconds,
+            prompt_builder=LMStudioPromptBuilder(max_prompt_chars=self.config.lmstudio_max_prompt_chars),
         )
         summary_deduplicator = SummaryDeduplicator(
             suppress_threshold=self.config.summary_similarity_suppress_threshold,

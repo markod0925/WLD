@@ -13,6 +13,7 @@ def test_app_config_default_settings_match_ui_defaults() -> None:
     assert cfg.capture_mode == "active_window"
     assert cfg.max_text_segments_per_summary == 400
     assert cfg.request_timeout_seconds == 600
+    assert cfg.lmstudio_max_prompt_chars == 20000
     assert cfg.screenshot_dedup_enabled is True
     assert cfg.screenshot_dedup_threshold == 6
     assert cfg.screenshot_min_keep_interval_seconds == 120
