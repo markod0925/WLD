@@ -82,3 +82,26 @@ def test_load_config_rejects_future_config_version(tmp_path: Path) -> None:
         assert "Unsupported config_version" in str(exc)
     else:
         raise AssertionError("load_config() should reject future config versions")
+
+
+def test_legacy_dedup_threshold_maps_to_canonical_when_canonical_missing(tmp_path: Path) -> None:
+    payload = config_module.AppConfig().to_dict()
+    payload.pop("screenshot_dedup_phash_threshold", None)
+    payload["screenshot_dedup_threshold"] = 13
+
+    cfg = config_module.AppConfig.from_dict(payload, source=str(tmp_path / "config.json"))
+    assert cfg.screenshot_dedup_phash_threshold == 13
+    assert cfg.screenshot_dedup_threshold == 13
+
+
+def test_legacy_dedup_threshold_conflict_prefers_canonical_and_logs_warning(tmp_path: Path, caplog) -> None:
+    payload = config_module.AppConfig().to_dict()
+    payload["screenshot_dedup_phash_threshold"] = 7
+    payload["screenshot_dedup_threshold"] = 15
+
+    caplog.clear()
+    cfg = config_module.AppConfig.from_dict(payload, source=str(tmp_path / "config.json"))
+
+    assert cfg.screenshot_dedup_phash_threshold == 7
+    assert cfg.screenshot_dedup_threshold == 7
+    assert any("event=config_legacy_field_conflict" in record.message for record in caplog.records)

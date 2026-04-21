@@ -268,12 +268,24 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
             continue
         values[field_name] = converter(data[field_name], field_name, source=source)
 
-    if "screenshot_dedup_phash_threshold" not in data and "screenshot_dedup_threshold" in data:
-        values["screenshot_dedup_phash_threshold"] = _coerce_int(
+    has_phash_threshold = "screenshot_dedup_phash_threshold" in data
+    has_legacy_threshold = "screenshot_dedup_threshold" in data
+    if has_legacy_threshold:
+        legacy_threshold = _coerce_int(
             data["screenshot_dedup_threshold"],
             "screenshot_dedup_threshold",
             source=source,
         )
+        if has_phash_threshold:
+            _LOGGER.warning(
+                "event=config_legacy_field_conflict source=%s canonical_field=%s legacy_field=%s behavior=%s",
+                source or "config",
+                "screenshot_dedup_phash_threshold",
+                "screenshot_dedup_threshold",
+                "prefer_canonical",
+            )
+        else:
+            values["screenshot_dedup_phash_threshold"] = legacy_threshold
         needs_save = True
 
     values["config_version"] = CONFIG_VERSION
