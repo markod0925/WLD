@@ -8,7 +8,7 @@ from worklog_diary.core.services import MonitoringServices
 
 
 class SuccessfulClient:
-    def summarize_batch(self, _batch: object) -> tuple[str, dict]:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
         return "ok", {"summary_text": "ok", "key_points": [], "blocked_activity": []}
 
 

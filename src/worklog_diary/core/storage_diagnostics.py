@@ -91,14 +91,27 @@ class StorageDiagnosticsRepository:
                 "running": int(
                     self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'running'").fetchone()["c"]
                 ),
+                "completed": int(
+                    self._conn.execute(
+                        "SELECT COUNT(1) AS c FROM summary_jobs WHERE status IN ('completed', 'succeeded')"
+                    ).fetchone()["c"]
+                ),
                 "failed": int(
                     self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'failed'").fetchone()["c"]
                 ),
+                "timed_out": int(
+                    self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'timed_out'").fetchone()["c"]
+                ),
                 "succeeded": int(
-                    self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'succeeded'").fetchone()["c"]
+                    self._conn.execute(
+                        "SELECT COUNT(1) AS c FROM summary_jobs WHERE status IN ('completed', 'succeeded')"
+                    ).fetchone()["c"]
                 ),
                 "cancelled": int(
                     self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'cancelled'").fetchone()["c"]
+                ),
+                "abandoned": int(
+                    self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs WHERE status = 'abandoned'").fetchone()["c"]
                 ),
             }
 
@@ -107,6 +120,7 @@ class StorageDiagnosticsRepository:
             "pending_counts": self.get_pending_counts(),
             "pending_ranges": pending_ranges,
             "summary_jobs": summary_jobs,
+            "daily_summaries": table_counts["daily_summaries"],
         }
         self._log_db_query_timing("get_diagnostics_snapshot", started_at)
         return result

@@ -154,13 +154,14 @@ def test_llm_trace_success(tmp_path: Path, caplog: pytest.LogCaptureFixture, mon
         assert "stage=submission_decision status=proceed" in output
         assert "stage=payload_build status=start" in output
         assert "stage=payload_build status=ok" in output
-        assert "stage=http_start status=start" in output
-        assert "stage=http_response status=ok" in output
+        assert "stage=request_submit status=start" in output
+        assert "stage=request_success status=ok" in output
         assert "stage=response_parse status=start" in output
         assert "stage=response_parse status=ok" in output
         assert "stage=summary_store status=start" in output
         assert "stage=summary_store status=ok" in output
-        assert "stage=job_complete status=ok" in output
+        assert "stage=summary_job_started status=ok" in output
+        assert "stage=summary_job_completed status=ok" in output
     finally:
         summarizer.stop()
         storage.close()
@@ -183,10 +184,10 @@ def test_llm_trace_connection_failure(tmp_path: Path, caplog: pytest.LogCaptureF
         assert "stage=job_created status=ok" in output
         assert "stage=submission_decision status=proceed" in output
         assert "stage=payload_build status=ok" in output
-        assert "stage=http_start status=start" in output
+        assert "stage=request_submit status=start" in output
         assert "stage=http_response status=error" in output
         assert "error_type=ConnectionError" in output
-        assert "stage=job_failed status=error" in output
+        assert "stage=summary_job_failed status=error" in output
         assert "failed_stage=http_response" in output
     finally:
         summarizer.stop()
@@ -205,12 +206,12 @@ def test_llm_trace_timeout(tmp_path: Path, caplog: pytest.LogCaptureFixture, mon
 
     try:
         assert summarizer.flush_pending(reason="test") is None
-        assert summarizer.storage.get_summary_job_status_counts()["failed"] == 1
+        assert summarizer.storage.get_summary_job_status_counts()["timed_out"] == 1
         output = _stage_lines(caplog)
-        assert "stage=http_start status=start" in output
+        assert "stage=request_submit status=start" in output
         assert "stage=http_response status=error" in output
         assert "error_type=Timeout" in output
-        assert "stage=job_failed status=error" in output
+        assert "stage=summary_job_failed status=error" in output
         assert "failed_stage=http_response" in output
     finally:
         summarizer.stop()
@@ -228,10 +229,10 @@ def test_llm_trace_parse_failure(tmp_path: Path, caplog: pytest.LogCaptureFixtur
         assert summarizer.flush_pending(reason="test") is None
         assert summarizer.storage.get_summary_job_status_counts()["failed"] == 1
         output = _stage_lines(caplog)
-        assert "stage=http_response status=ok" in output
+        assert "stage=request_success status=ok" in output
         assert "stage=response_parse status=start" in output
         assert "stage=response_parse status=error" in output
-        assert "stage=job_failed status=error" in output
+        assert "stage=summary_job_failed status=error" in output
         assert "failed_stage=response_parse" in output
     finally:
         summarizer.stop()

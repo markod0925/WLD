@@ -88,6 +88,17 @@ class StorageSchemaManager:
             end_ts REAL NOT NULL,
             status TEXT NOT NULL,
             error TEXT,
+            job_type TEXT NOT NULL DEFAULT 'event_summary',
+            target_day TEXT,
+            queued_at REAL NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL DEFAULT 0,
+            started_at REAL,
+            finished_at REAL,
+            timeout_s REAL NOT NULL DEFAULT 0,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            input_chars INTEGER NOT NULL DEFAULT 0,
+            input_token_estimate INTEGER,
+            priority INTEGER NOT NULL DEFAULT 100,
             created_ts REAL NOT NULL,
             updated_ts REAL NOT NULL
         );
@@ -177,6 +188,7 @@ class StorageSchemaManager:
         with self._lock:
             journal_mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
             self._conn.executescript(schema)
+            self.ensure_summary_jobs_schema()
             self.ensure_daily_summaries_schema()
             self.ensure_screenshots_schema()
             self.ensure_semantic_coalescing_schema()
@@ -220,35 +232,67 @@ class StorageSchemaManager:
                     ],
                 )
 
-            interrupted_jobs = self._conn.execute(
-                "SELECT COUNT(1) AS c FROM summary_jobs WHERE status IN ('running', 'queued')"
-            ).fetchone()
-            interrupted_count = int(interrupted_jobs["c"]) if interrupted_jobs else 0
-            if interrupted_count:
+            running_jobs = self._conn.execute(
+                "SELECT id, job_type, target_day FROM summary_jobs WHERE status = 'running'"
+            ).fetchall()
+            queued_jobs = self._conn.execute(
+                "SELECT id, job_type, target_day FROM summary_jobs WHERE status = 'queued'"
+            ).fetchall()
+
+            for row in running_jobs:
                 self._conn.execute(
                     """
                     UPDATE summary_jobs
-                    SET status = 'failed',
-                        error = COALESCE(error, 'Interrupted during application shutdown'),
+                    SET status = 'abandoned',
+                        error = COALESCE(error, ?),
+                        finished_at = ?,
                         updated_ts = ?
-                    WHERE status IN ('running', 'queued')
+                    WHERE id = ?
                     """,
-                    (now,),
+                    ("Recovered abandoned running job after restart.", now, now, int(row["id"])),
+                )
+
+            for row in queued_jobs:
+                self._conn.execute(
+                    """
+                    UPDATE summary_jobs
+                    SET status = 'cancelled',
+                        error = COALESCE(error, ?),
+                        finished_at = ?,
+                        updated_ts = ?
+                    WHERE id = ?
+                    """,
+                    ("Recovered queued job during startup and cancelled it.", now, now, int(row["id"])),
                 )
 
             self._conn.commit()
 
-        if open_rows or interrupted_count:
+        if open_rows or running_jobs or queued_jobs:
             self._logger.warning(
-                "event=startup_recovery closed_open_intervals=%s interrupted_jobs=%s",
+                "event=startup_recovery closed_open_intervals=%s abandoned_jobs=%s cancelled_jobs=%s",
                 len(open_rows),
-                interrupted_count,
+                len(running_jobs),
+                len(queued_jobs),
             )
+            for row in running_jobs:
+                self._logger.info(
+                    "event=startup_recovery_job status=abandoned job_id=%s job_type=%s target_day=%s",
+                    int(row["id"]),
+                    str(row["job_type"]),
+                    row["target_day"],
+                )
+            for row in queued_jobs:
+                self._logger.info(
+                    "event=startup_recovery_job status=cancelled job_id=%s job_type=%s target_day=%s",
+                    int(row["id"]),
+                    str(row["job_type"]),
+                    row["target_day"],
+                )
         duration_ms = (time.perf_counter() - started_at) * 1000.0
         self._logger.info(
             "event=db_query_timing operation=startup_recovery duration_ms=%.3f rows=%s",
             duration_ms,
-            len(open_rows) + interrupted_count,
+            len(open_rows) + len(running_jobs) + len(queued_jobs),
         )
 
     def ensure_daily_summaries_schema(self) -> None:
@@ -266,6 +310,47 @@ class StorageSchemaManager:
             self._conn.execute(
                 "ALTER TABLE daily_summaries ADD COLUMN source_batch_count INTEGER NOT NULL DEFAULT 0"
             )
+
+    def ensure_summary_jobs_schema(self) -> None:
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'summary_jobs'"
+        ).fetchone()
+        if row is None:
+            return
+
+        columns = {
+            str(item["name"])
+            for item in self._conn.execute("PRAGMA table_info(summary_jobs)").fetchall()
+        }
+        if "job_type" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT 'event_summary'")
+        if "target_day" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN target_day TEXT")
+        if "queued_at" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN queued_at REAL NOT NULL DEFAULT 0")
+        if "created_at" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
+        if "started_at" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN started_at REAL")
+        if "finished_at" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN finished_at REAL")
+        if "timeout_s" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN timeout_s REAL NOT NULL DEFAULT 0")
+        if "attempt" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+        if "input_chars" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN input_chars INTEGER NOT NULL DEFAULT 0")
+        if "input_token_estimate" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN input_token_estimate INTEGER")
+        if "priority" not in columns:
+            self._conn.execute("ALTER TABLE summary_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 100")
+        self._conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_jobs_day_target
+            ON summary_jobs(job_type, target_day)
+            WHERE job_type = 'day_summary' AND target_day IS NOT NULL
+            """
+        )
 
     def ensure_screenshots_schema(self) -> None:
         row = self._conn.execute(

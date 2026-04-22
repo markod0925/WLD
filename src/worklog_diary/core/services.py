@@ -6,7 +6,7 @@ from datetime import date
 
 from .config import AppConfig, app_data_dir_source, is_frozen_executable, save_config
 from .crash_reporting import CrashReporter
-from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
+from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError
 from .logging_setup import configure_logging
 from .lmstudio_logging import get_failed_stage
 from .monitoring_components import (
@@ -166,6 +166,10 @@ class MonitoringServices:
         self.lmstudio_client.base_url = self.config.lmstudio_base_url.rstrip("/")
         self.lmstudio_client.model = self.config.lmstudio_model
         self.lmstudio_client.timeout_seconds = self.config.request_timeout_seconds
+        self.lmstudio_client.daily_timeout_seconds = max(
+            self.config.request_timeout_seconds * 2,
+            self.config.request_timeout_seconds,
+        )
         self.lmstudio_client.prompt_builder.max_prompt_chars = self.config.lmstudio_max_prompt_chars
         self.summarizer.summary_deduplicator = SummaryDeduplicator(
             suppress_threshold=self.config.summary_similarity_suppress_threshold,
@@ -241,6 +245,8 @@ class MonitoringServices:
         except LMStudioConnectionError:
             raise
         except LMStudioServiceUnavailableError:
+            raise
+        except LMStudioTimeoutError:
             raise
         except Exception as exc:
             self.error_notifier.notify(

@@ -7,20 +7,26 @@ import re
 from contextlib import contextmanager
 from typing import Any
 
-_llm_job_id: contextvars.ContextVar[object | None] = contextvars.ContextVar("llm_job_id", default=None)
+_llm_job_context: contextvars.ContextVar[dict[str, object | None] | None] = contextvars.ContextVar(
+    "llm_job_context",
+    default=None,
+)
 
 
 @contextmanager
-def llm_job_context(job_id: object | None):
-    token = _llm_job_id.set(job_id)
+def llm_job_context(job_id: object | None, **metadata: object | None):
+    payload = {"job_id": job_id}
+    payload.update(metadata)
+    token = _llm_job_context.set(payload)
     try:
         yield
     finally:
-        _llm_job_id.reset(token)
+        _llm_job_context.reset(token)
 
 
 def get_llm_job_id(default: object | None = None) -> object | None:
-    job_id = _llm_job_id.get()
+    context = _llm_job_context.get()
+    job_id = None if context is None else context.get("job_id")
     return default if job_id is None else job_id
 
 
@@ -65,8 +71,23 @@ def log_llm_stage(
     **fields: Any,
 ) -> None:
     parts = ["[LLM]", f"stage={stage}", f"status={status}"]
-    current_job_id = get_llm_job_id(job_id)
-    parts.append(f"job_id={_format_value(current_job_id if current_job_id is not None else 'none')}")
+    context = _llm_job_context.get() or {}
+    current_job_id = job_id if job_id is not None else context.get("job_id")
+    current_job_type = context.get("job_type")
+    if current_job_id is not None:
+        parts.append(f"job_id={_format_value(current_job_id)}")
+    else:
+        parts.append("job_id=none")
+
+    for key in ("job_type", "timeout_s", "attempt", "input_chars", "input_token_estimate", "queue_size", "queue_wait_s"):
+        value = fields.pop(key, context.get(key))
+        if value is None:
+            continue
+        parts.append(f"{key}={_format_value(value)}")
+
+    if current_job_type is not None and not any(part.startswith("job_type=") for part in parts):
+        parts.append(f"job_type={_format_value(current_job_type)}")
+
     for key, value in fields.items():
         if value is None:
             continue

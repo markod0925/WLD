@@ -127,6 +127,7 @@ class ServiceRegistry:
             base_url=self.config.lmstudio_base_url,
             model=self.config.lmstudio_model,
             timeout_seconds=self.config.request_timeout_seconds,
+            daily_timeout_seconds=max(self.config.request_timeout_seconds * 2, self.config.request_timeout_seconds),
             prompt_builder=LMStudioPromptBuilder(max_prompt_chars=self.config.lmstudio_max_prompt_chars),
         )
         embedding_client = LMStudioEmbeddingClient(
@@ -487,7 +488,7 @@ class FlushCoordinator:
             end_counts = self.services.storage.get_summary_job_status_counts()
             result = FlushDrainResult(
                 stop_reason=stop_reason,
-                summaries_created=max(0, end_counts.get("succeeded", 0) - start_counts.get("succeeded", 0)),
+                summaries_created=max(0, end_counts.get("completed", 0) - start_counts.get("completed", 0)),
                 failed_jobs=max(0, end_counts.get("failed", 0) - start_counts.get("failed", 0)),
                 cancelled_jobs=max(0, end_counts.get("cancelled", 0) - start_counts.get("cancelled", 0)),
                 pending_summary_jobs=int(self.services.summarizer.get_runtime_status()["pending_summary_jobs"]),
@@ -570,16 +571,34 @@ class DiagnosticsService:
             "manual_pause": lifecycle["manual_pause"],
             "lifecycle_phase": lifecycle["lifecycle_phase"],
             "summary_running": int(runtime["running_jobs"]) > 0,
+            "llm_queue_running": int(runtime["llm_queue_running_jobs"]) > 0,
             "flush_drain_active": bool(drain["drain_active"]),
             "unrecoverable_summary_error": runtime["unrecoverable_error"],
         }
 
     def get_diagnostics_snapshot(self) -> dict:
-        return self.services.storage.get_diagnostics_snapshot()
+        try:
+            return self.services.storage.get_diagnostics_snapshot()
+        except Exception:
+            return {
+                "table_counts": {},
+                "pending_counts": {},
+                "pending_ranges": {},
+                "summary_jobs": {},
+            }
 
     def get_status(self) -> dict:
         snapshot = self.services.state.snapshot()
-        pending = self.services.storage.get_pending_counts()
+        try:
+            pending = self.services.storage.get_pending_counts()
+        except Exception:
+            pending = {
+                "intervals": 0,
+                "key_events": 0,
+                "processed_key_events": 0,
+                "text_segments": 0,
+                "screenshots": 0,
+            }
         summary_runtime = self.services.summarizer.get_runtime_status()
         lifecycle = self.lifecycle_manager.snapshot()
         drain = self.flush_coordinator.snapshot()
@@ -621,6 +640,12 @@ class DiagnosticsService:
                 "completed": int(summary_runtime["completed_jobs"]),
                 "failed": int(summary_runtime["failed_jobs"]),
                 "cancelled": int(summary_runtime["cancelled_jobs"]),
+            },
+            "llm_queue": {
+                "queued": int(summary_runtime["llm_queue_queued_jobs"]),
+                "running": int(summary_runtime["llm_queue_running_jobs"]),
+                "pending": int(summary_runtime["llm_queue_pending_jobs"]),
+                "max_concurrent": int(summary_runtime["llm_queue_max_concurrent_jobs"]),
             },
             "flush_drain_active": bool(drain["drain_active"]),
             "flush_drain_reason": drain["drain_reason"],

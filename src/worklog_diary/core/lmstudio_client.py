@@ -7,13 +7,14 @@ import re
 import time
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     import requests
 
 from .batching import SummaryBatch
-from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
+from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError
+from .llm_job_queue import LLMJobQueue
 from .lmstudio_prompt import LMStudioPromptBuilder, PromptBuildResult
 from .models import SummaryRecord
 from .lmstudio_logging import (
@@ -60,17 +61,51 @@ class LMStudioClient:
         base_url: str,
         model: str,
         timeout_seconds: int = 600,
+        daily_timeout_seconds: int | None = None,
         prompt_builder: LMStudioPromptBuilder | None = None,
         max_response_attempts: int = 2,
+        job_queue: LLMJobQueue | None = None,
     ) -> None:
+        self.logger = logging.getLogger(__name__)
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.daily_timeout_seconds = daily_timeout_seconds if daily_timeout_seconds is not None else max(
+            self.timeout_seconds * 2,
+            self.timeout_seconds,
+        )
         self.prompt_builder = prompt_builder or LMStudioPromptBuilder()
         self.max_response_attempts = max(1, int(max_response_attempts))
-        self.logger = logging.getLogger(__name__)
+        self.job_queue = job_queue or LLMJobQueue(logger=self.logger)
 
-    def summarize_batch(self, batch: SummaryBatch) -> tuple[str, dict[str, Any]]:
+    def summarize_batch(
+        self,
+        batch: SummaryBatch,
+        *,
+        job_id: object | None = None,
+        job_type: str = "event_summary",
+        attempt: int = 1,
+        priority: int = 100,
+        on_started: Callable[[object], None] | None = None,
+        on_cancelled: Callable[[object, str], None] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        timeout_s = self.timeout_seconds
+        text_chars = sum(len(segment.text) for segment in batch.text_segments)
+        token_estimate = _estimate_token_count(text_chars)
+        return self.job_queue.submit(
+            job_type=job_type,
+            job_id=job_id,
+            timeout_s=timeout_s,
+            attempt=attempt,
+            input_chars=text_chars,
+            input_token_estimate=token_estimate,
+            priority=priority,
+            on_started=on_started,
+            on_cancelled=on_cancelled,
+            operation=lambda: self._summarize_batch_impl(batch=batch, timeout_s=timeout_s),
+        )
+
+    def _summarize_batch_impl(self, batch: SummaryBatch, *, timeout_s: int) -> tuple[str, dict[str, Any]]:
         endpoint = f"{self.base_url}/chat/completions"
         text_chars = sum(len(segment.text) for segment in batch.text_segments)
         screenshot_count = len(batch.screenshots)
@@ -141,10 +176,45 @@ class LMStudioClient:
             response_kind="summary",
             prompt_result=prompt_result,
             endpoint=endpoint,
+            timeout_s=timeout_s,
         )
         return structured.summary_text, structured.to_dict()
 
-    def summarize_daily_recap(self, day: date, summaries: list[SummaryRecord]) -> tuple[str, dict[str, Any]]:
+    def summarize_daily_recap(
+        self,
+        day: date,
+        summaries: list[SummaryRecord],
+        *,
+        job_id: object | None = None,
+        job_type: str = "day_summary",
+        attempt: int = 1,
+        priority: int = 100,
+        on_started: Callable[[object], None] | None = None,
+        on_cancelled: Callable[[object, str], None] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        timeout_s = self.daily_timeout_seconds
+        text_chars = sum(len(summary.summary_text) for summary in summaries)
+        token_estimate = _estimate_token_count(text_chars)
+        return self.job_queue.submit(
+            job_type=job_type,
+            job_id=job_id,
+            timeout_s=timeout_s,
+            attempt=attempt,
+            input_chars=text_chars,
+            input_token_estimate=token_estimate,
+            priority=priority,
+            on_started=on_started,
+            on_cancelled=on_cancelled,
+            operation=lambda: self._summarize_daily_recap_impl(day=day, summaries=summaries, timeout_s=timeout_s),
+        )
+
+    def _summarize_daily_recap_impl(
+        self,
+        *,
+        day: date,
+        summaries: list[SummaryRecord],
+        timeout_s: int,
+    ) -> tuple[str, dict[str, Any]]:
         endpoint = f"{self.base_url}/chat/completions"
         job_id = f"daily_recap:{day.isoformat()}"
         text_chars = sum(len(summary.summary_text) for summary in summaries)
@@ -193,6 +263,7 @@ class LMStudioClient:
             job_id=job_id,
             text_chars=text_chars,
             total_summaries=len(summaries),
+            timeout_s=timeout_s,
             response_kind_prefix="daily_recap_chunk",
             chunk_label_prefix="source",
             system_message=(
@@ -229,6 +300,7 @@ class LMStudioClient:
                     job_id=job_id,
                     text_chars=sum(len(item.summary_text) for item in aggregate_summaries),
                     total_summaries=len(aggregate_summaries),
+                    timeout_s=timeout_s,
                     response_kind_prefix=f"daily_recap_reduce_r{reduction_round}",
                     chunk_label_prefix=f"reduce-{reduction_round}",
                     system_message=(
@@ -272,6 +344,7 @@ class LMStudioClient:
         job_id: str,
         text_chars: int,
         total_summaries: int,
+        timeout_s: int,
         response_kind_prefix: str,
         chunk_label_prefix: str,
         system_message: str,
@@ -311,6 +384,7 @@ class LMStudioClient:
                 response_kind=response_kind,
                 prompt_result=prompt_result,
                 endpoint=endpoint,
+                timeout_s=timeout_s,
             )
             responses.append(structured)
         return responses
@@ -399,15 +473,21 @@ class LMStudioClient:
             )
         return records
 
-    def _post_chat_completion(self, payload: dict[str, Any], *, endpoint: str) -> "requests.Response":
+    def _post_chat_completion(
+        self,
+        payload: dict[str, Any],
+        *,
+        endpoint: str,
+        timeout_s: int,
+    ) -> "requests.Response":
         start = time.perf_counter()
         log_llm_stage(
             self.logger,
-            "http_start",
+            "request_submit",
             "start",
             endpoint=endpoint,
             url=endpoint,
-            timeout=self.timeout_seconds,
+            timeout_s=timeout_s,
         )
         try:
             # Import lazily so frozen startup does not fail before the LLM client is used.
@@ -416,7 +496,7 @@ class LMStudioClient:
             response = requests.post(
                 endpoint,
                 json=payload,
-                timeout=self.timeout_seconds,
+                timeout=timeout_s,
             )
         except requests.Timeout as exc:
             elapsed_s = time.perf_counter() - start
@@ -429,11 +509,11 @@ class LMStudioClient:
                 elapsed_s=elapsed_s,
                 error_type="Timeout",
                 error=safe_error(exc),
-                timeout=self.timeout_seconds,
+                timeout_s=timeout_s,
                 exc_info=True,
             )
             raise set_failed_stage(
-                LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running."),
+                LMStudioTimeoutError("Request timed out while waiting for LM Studio."),
                 "http_response",
             ) from exc
         except requests.ConnectionError as exc:
@@ -496,11 +576,12 @@ class LMStudioClient:
 
         log_llm_stage(
             self.logger,
-            "http_response",
+            "request_success",
             "ok",
             endpoint=endpoint,
             elapsed_s=elapsed_s,
             http_status=http_status,
+            timeout_s=timeout_s,
         )
         return response
 
@@ -530,13 +611,14 @@ class LMStudioClient:
         response_kind: str,
         prompt_result: PromptBuildResult,
         endpoint: str,
+        timeout_s: int,
     ) -> LMStudioStructuredResponse:
         last_error: str | None = None
         last_response_text = ""
         current_payload = payload
 
         for attempt in range(1, self.max_response_attempts + 1):
-            response = self._post_chat_completion(current_payload, endpoint=endpoint)
+            response = self._post_chat_completion(current_payload, endpoint=endpoint, timeout_s=timeout_s)
             raw_response_text = getattr(response, "text", "")
             log_llm_stage(
                 self.logger,
@@ -586,6 +668,15 @@ class LMStudioClient:
                 )
                 if attempt >= self.max_response_attempts:
                     break
+                log_llm_stage(
+                    self.logger,
+                    "retry_scheduled",
+                    "ok",
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    response_kind=response_kind,
+                    error=last_error,
+                )
                 current_payload = self._retry_payload(current_payload, response_kind=response_kind, error=last_error)
 
         raise set_failed_stage(
@@ -687,3 +778,9 @@ def _file_to_data_uri(path: str) -> str | None:
     suffix = file_path.suffix.lower()
     mime = "image/png" if suffix == ".png" else "image/jpeg"
     return f"data:{mime};base64,{b64}"
+
+
+def _estimate_token_count(chars: int) -> int | None:
+    if chars <= 0:
+        return None
+    return max(1, (chars + 3) // 4)

@@ -17,7 +17,7 @@ class SlowClient:
         self.active = 0
         self.max_active = 0
 
-    def summarize_batch(self, _batch: object) -> tuple[str, dict]:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
         with self._lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)

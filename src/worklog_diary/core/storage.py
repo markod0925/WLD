@@ -38,6 +38,18 @@ from .models import (
 )
 
 
+_SUMMARY_JOB_TERMINAL_STATUSES = {
+    "completed",
+    "succeeded",
+    "failed",
+    "timed_out",
+    "cancelled",
+    "abandoned",
+}
+
+_SUMMARY_JOB_ACTIVE_STATUSES = {"queued", "running"}
+
+
 class SQLiteStorage(ActivityRepository):
     """SQLite-backed repository for activity capture and summary records."""
 
@@ -566,43 +578,290 @@ class SQLiteStorage(ActivityRepository):
         self._record_db_write()
         self._log_db_query_timing("mark_intervals_summarized", started_at)
 
-    def create_summary_job(self, start_ts: float, end_ts: float, status: str = "running") -> int:
+    def create_summary_job(
+        self,
+        start_ts: float,
+        end_ts: float,
+        status: str = "queued",
+        *,
+        job_type: str = "event_summary",
+        target_day: Day | str | None = None,
+        timeout_s: float = 0,
+        attempt: int = 1,
+        input_chars: int = 0,
+        input_token_estimate: int | None = None,
+        priority: int = 100,
+    ) -> int:
         now = time.time()
-        started_at = time.perf_counter()
+        query_started_at = time.perf_counter()
+        stored_status = _normalize_summary_job_status(status)
+        day_key = _normalize_day_key(target_day)
         with self._lock:
+            if day_key is not None:
+                existing = self._conn.execute(
+                    """
+                    SELECT id
+                    FROM summary_jobs
+                    WHERE job_type = 'day_summary' AND target_day = ?
+                    """,
+                    (day_key,),
+                ).fetchone()
+                if existing is not None:
+                    job_id = int(existing["id"])
+                    self._log_db_query_timing("create_summary_job", query_started_at, rows=1)
+                    return job_id
+
+            started_at = now if stored_status in _SUMMARY_JOB_TERMINAL_STATUSES or stored_status == "running" else None
+            finished_at = now if stored_status in _SUMMARY_JOB_TERMINAL_STATUSES else None
             cursor = self._conn.execute(
                 """
-                INSERT INTO summary_jobs(start_ts, end_ts, status, error, created_ts, updated_ts)
-                VALUES (?, ?, ?, NULL, ?, ?)
+                INSERT INTO summary_jobs(
+                    start_ts, end_ts, status, error, job_type, target_day, queued_at, created_at, started_at,
+                    finished_at, timeout_s, attempt, input_chars, input_token_estimate, priority, created_ts, updated_ts
+                )
+                VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (start_ts, end_ts, status, now, now),
+                (
+                    start_ts,
+                    end_ts,
+                    stored_status,
+                    job_type,
+                    day_key,
+                    now,
+                    now,
+                    started_at,
+                    finished_at,
+                    timeout_s,
+                    max(1, int(attempt)),
+                    max(0, int(input_chars)),
+                    input_token_estimate,
+                    priority,
+                    now,
+                    now,
+                ),
             )
             self._conn.commit()
             job_id = int(cursor.lastrowid)
         self._record_db_write()
-        self._log_db_query_timing("create_summary_job", started_at, rows=1)
+        self._log_db_query_timing("create_summary_job", query_started_at, rows=1)
         return job_id
 
-    def update_summary_job(self, job_id: int, status: str, error: str | None = None) -> None:
+    def update_summary_job(
+        self,
+        job_id: int,
+        status: str,
+        error: str | None = None,
+        *,
+        job_type: str | None = None,
+        started_at: float | None = None,
+        finished_at: float | None = None,
+        timeout_s: float | None = None,
+        attempt: int | None = None,
+        input_chars: int | None = None,
+        input_token_estimate: int | None = None,
+        priority: int | None = None,
+    ) -> None:
         now = time.time()
-        started_at = time.perf_counter()
+        query_started_at = time.perf_counter()
+        stored_status = _normalize_summary_job_status(status)
+        updates = ["status = ?", "error = ?", "updated_ts = ?"]
+        values: list[object] = [stored_status, error, now]
+        if job_type is not None:
+            updates.append("job_type = ?")
+            values.append(job_type)
+        if started_at is not None:
+            updates.append("started_at = ?")
+            values.append(started_at)
+        elif stored_status == "running":
+            updates.append("started_at = ?")
+            values.append(now)
+        if finished_at is not None:
+            updates.append("finished_at = ?")
+            values.append(finished_at)
+        elif stored_status in _SUMMARY_JOB_TERMINAL_STATUSES:
+            updates.append("finished_at = ?")
+            values.append(now)
+        if timeout_s is not None:
+            updates.append("timeout_s = ?")
+            values.append(timeout_s)
+        if attempt is not None:
+            updates.append("attempt = ?")
+            values.append(max(1, int(attempt)))
+        if input_chars is not None:
+            updates.append("input_chars = ?")
+            values.append(max(0, int(input_chars)))
+        if input_token_estimate is not None:
+            updates.append("input_token_estimate = ?")
+            values.append(input_token_estimate)
+        if priority is not None:
+            updates.append("priority = ?")
+            values.append(priority)
         with self._lock:
             self._conn.execute(
-                "UPDATE summary_jobs SET status = ?, error = ?, updated_ts = ? WHERE id = ?",
-                (status, error, now, job_id),
+                f"UPDATE summary_jobs SET {', '.join(updates)} WHERE id = ?",
+                [*values, job_id],
             )
             self._conn.commit()
         self._record_db_write()
-        self._log_db_query_timing("update_summary_job", started_at, rows=1)
+        self._log_db_query_timing("update_summary_job", query_started_at, rows=1)
+
+    def create_or_reuse_daily_summary_job(
+        self,
+        day: Day,
+        start_ts: float,
+        end_ts: float,
+        *,
+        status: str = "queued",
+        timeout_s: float = 0,
+        attempt: int = 1,
+        input_chars: int = 0,
+        input_token_estimate: int | None = None,
+        priority: int = 100,
+    ) -> tuple[int, bool]:
+        day_key = day.isoformat()
+        now = time.time()
+        stored_status = _normalize_summary_job_status(status)
+        query_started_at = time.perf_counter()
+        with self._lock:
+            existing = self._conn.execute(
+                """
+                SELECT id, status, attempt
+                FROM summary_jobs
+                WHERE job_type = 'day_summary' AND target_day = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (day_key,),
+            ).fetchone()
+            if existing is None:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO summary_jobs(
+                        start_ts, end_ts, status, error, job_type, target_day, queued_at, created_at, started_at,
+                        finished_at, timeout_s, attempt, input_chars, input_token_estimate, priority, created_ts, updated_ts
+                    )
+                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        start_ts,
+                        end_ts,
+                        stored_status,
+                        "day_summary",
+                        day_key,
+                        now,
+                        now,
+                        now if stored_status == "running" or stored_status in _SUMMARY_JOB_TERMINAL_STATUSES else None,
+                        now if stored_status in _SUMMARY_JOB_TERMINAL_STATUSES else None,
+                        timeout_s,
+                        max(1, int(attempt)),
+                        max(0, int(input_chars)),
+                        input_token_estimate,
+                        priority,
+                        now,
+                        now,
+                    ),
+                )
+                self._conn.commit()
+                job_id = int(cursor.lastrowid)
+                self._record_db_write()
+                self._log_db_query_timing("create_or_reuse_daily_summary_job", query_started_at, rows=1)
+                return job_id, False
+
+            job_id = int(existing["id"])
+            existing_status = _normalize_summary_job_status(str(existing["status"]))
+            if existing_status in _SUMMARY_JOB_ACTIVE_STATUSES:
+                self._log_db_query_timing("create_or_reuse_daily_summary_job", query_started_at, rows=1)
+                return job_id, True
+
+            next_attempt = max(1, int(existing["attempt"]) + 1, int(attempt))
+            self._conn.execute(
+                """
+                UPDATE summary_jobs
+                SET status = 'queued',
+                    error = NULL,
+                    start_ts = ?,
+                    end_ts = ?,
+                    queued_at = ?,
+                    started_at = NULL,
+                    finished_at = NULL,
+                    timeout_s = ?,
+                    attempt = ?,
+                    input_chars = ?,
+                    input_token_estimate = ?,
+                    priority = ?,
+                    updated_ts = ?
+                WHERE id = ?
+                """,
+                (
+                    start_ts,
+                    end_ts,
+                    now,
+                    timeout_s,
+                    next_attempt,
+                    max(0, int(input_chars)),
+                    input_token_estimate,
+                    priority,
+                    now,
+                    job_id,
+                ),
+            )
+            self._conn.commit()
+        self._record_db_write()
+        self._log_db_query_timing("create_or_reuse_daily_summary_job", query_started_at, rows=1)
+        return job_id, True
+
+    def get_summary_job(self, job_id: int) -> dict[str, object] | None:
+        started_at = time.perf_counter()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, start_ts, end_ts, status, error, job_type, target_day, queued_at, created_at, started_at,
+                       finished_at, timeout_s, attempt, input_chars, input_token_estimate, priority, created_ts, updated_ts
+                FROM summary_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            self._log_db_query_timing("get_summary_job", started_at, rows=0)
+            return None
+        result = _row_to_summary_job_dict(row)
+        self._log_db_query_timing("get_summary_job", started_at, rows=1)
+        return result
+
+    def get_daily_summary_job_for_day(self, day: Day) -> dict[str, object] | None:
+        day_key = day.isoformat()
+        started_at = time.perf_counter()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, start_ts, end_ts, status, error, job_type, target_day, queued_at, created_at, started_at,
+                       finished_at, timeout_s, attempt, input_chars, input_token_estimate, priority, created_ts, updated_ts
+                FROM summary_jobs
+                WHERE job_type = 'day_summary' AND target_day = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (day_key,),
+            ).fetchone()
+        if row is None:
+            self._log_db_query_timing("get_daily_summary_job_for_day", started_at, rows=0)
+            return None
+        result = _row_to_summary_job_dict(row)
+        self._log_db_query_timing("get_daily_summary_job_for_day", started_at, rows=1)
+        return result
 
     def get_summary_job_status_counts(self) -> dict[str, int]:
         started_at = time.perf_counter()
         counts = {
             "queued": 0,
             "running": 0,
+            "completed": 0,
             "succeeded": 0,
             "failed": 0,
+            "timed_out": 0,
             "cancelled": 0,
+            "abandoned": 0,
         }
         with self._lock:
             rows = self._conn.execute(
@@ -610,8 +869,15 @@ class SQLiteStorage(ActivityRepository):
             ).fetchall()
         for row in rows:
             status = str(row["status"])
-            if status in counts:
-                counts[status] = int(row["c"])
+            count = int(row["c"])
+            if status == "succeeded":
+                counts["succeeded"] += count
+                counts["completed"] += count
+            elif status == "completed":
+                counts["completed"] += count
+                counts["succeeded"] += count
+            elif status in counts:
+                counts[status] += count
         self._log_db_query_timing("get_summary_job_status_counts", started_at, rows=len(rows))
         return counts
 
@@ -624,7 +890,7 @@ class SQLiteStorage(ActivityRepository):
         summary_json: dict,
     ) -> int:
         now = time.time()
-        started_at = time.perf_counter()
+        query_started_at = time.perf_counter()
         with self._lock:
             cursor = self._conn.execute(
                 """
@@ -636,7 +902,7 @@ class SQLiteStorage(ActivityRepository):
             self._conn.commit()
             summary_id = int(cursor.lastrowid)
         self._record_db_write()
-        self._log_db_query_timing("insert_summary", started_at, rows=1)
+        self._log_db_query_timing("insert_summary", query_started_at, rows=1)
         return summary_id
 
     def update_summary_record(
@@ -849,7 +1115,7 @@ class SQLiteStorage(ActivityRepository):
     ) -> tuple[DailySummaryRecord, bool]:
         day_key = day.isoformat()
         now = time.time()
-        started_at = time.perf_counter()
+        query_started_at = time.perf_counter()
         recap_json_str = json.dumps(recap_json) if recap_json is not None else None
         with self._lock:
             existing = self._conn.execute("SELECT id FROM daily_summaries WHERE day = ?", (day_key,)).fetchone()
@@ -879,7 +1145,7 @@ class SQLiteStorage(ActivityRepository):
             raise RuntimeError(f"Failed to create daily summary for {day_key}")
         record = _row_to_daily_summary_record(row)
         self._record_db_write()
-        self._log_db_query_timing("create_daily_summary", started_at, rows=1)
+        self._log_db_query_timing("create_daily_summary", query_started_at, rows=1)
         return record, existing is not None
 
     def get_daily_summary_for_day(self, day: Day) -> DailySummaryRecord | None:
@@ -1160,6 +1426,44 @@ def _row_to_daily_summary_record(row: sqlite3.Row) -> DailySummaryRecord:
         source_batch_count=int(row["source_batch_count"]),
         created_ts=float(row["created_ts"]),
     )
+
+
+def _row_to_summary_job_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": int(row["id"]),
+        "start_ts": float(row["start_ts"]),
+        "end_ts": float(row["end_ts"]),
+        "status": str(row["status"]),
+        "error": None if row["error"] is None else str(row["error"]),
+        "job_type": str(row["job_type"]),
+        "target_day": None if row["target_day"] is None else str(row["target_day"]),
+        "queued_at": float(row["queued_at"]),
+        "created_at": float(row["created_at"]),
+        "started_at": None if row["started_at"] is None else float(row["started_at"]),
+        "finished_at": None if row["finished_at"] is None else float(row["finished_at"]),
+        "timeout_s": float(row["timeout_s"]),
+        "attempt": int(row["attempt"]),
+        "input_chars": int(row["input_chars"]),
+        "input_token_estimate": None if row["input_token_estimate"] is None else int(row["input_token_estimate"]),
+        "priority": int(row["priority"]),
+        "created_ts": float(row["created_ts"]),
+        "updated_ts": float(row["updated_ts"]),
+    }
+
+
+def _normalize_summary_job_status(status: str) -> str:
+    normalized = status.strip().lower()
+    if normalized == "succeeded":
+        return "completed"
+    return normalized
+
+
+def _normalize_day_key(value: Day | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, Day):
+        return value.isoformat()
+    return str(value)
 
 
 def _day_epoch_bounds(day: Day) -> tuple[float, float]:

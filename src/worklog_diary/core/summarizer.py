@@ -5,13 +5,14 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from .batching import BatchBuilder, SummaryBatch
 from .error_notifications import ErrorNotificationManager
-from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError
+from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError
 from .lmstudio_client import LMStudioClient
 from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, safe_error
+from .llm_job_queue import LLMJobCancelledError, LLMJobMetadata
 from .storage import SQLiteStorage
 from .summary_dedup import SummaryDeduplicator
 from .semantic_coalescing import SemanticCoalescer
@@ -55,6 +56,7 @@ class Summarizer:
         self._queue: deque[_QueuedSummaryJob] = deque()
         self._reserved_ranges: dict[int, tuple[float, float]] = {}
         self._running_jobs: set[int] = set()
+        self._daily_recap_inflight: set[str] = set()
         self._workers: list[_WorkerHandle] = []
         self._retired_workers: list[_WorkerHandle] = []
         self._shutdown_event = shutdown_event or threading.Event()
@@ -72,6 +74,9 @@ class Summarizer:
             for handle in self._retired_workers:
                 handle.stop_event.set()
             self._condition.notify_all()
+        job_queue = self._get_lmstudio_job_queue()
+        if job_queue is not None:
+            job_queue.stop()
         for handle in self._workers + self._retired_workers:
             handle.thread.join(timeout=2)
         self._workers.clear()
@@ -129,12 +134,24 @@ class Summarizer:
                         "submission_decision",
                         "skip",
                         job_id="none",
+                        job_type="event_summary",
                         reason="no_content",
                         detail="no_pending_data",
                     )
                     break
 
-                job_id = self.storage.create_summary_job(batch.start_ts, batch.end_ts, status="queued")
+                input_chars = sum(len(segment.text) for segment in batch.text_segments)
+                timeout_s = self._lmstudio_timeout_seconds()
+                job_id = self.storage.create_summary_job(
+                    batch.start_ts,
+                    batch.end_ts,
+                    status="queued",
+                    job_type="event_summary",
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                )
                 self._queue.append(_QueuedSummaryJob(job_id=job_id, batch=batch, reason=reason))
                 self._reserved_ranges[job_id] = (batch.start_ts, batch.end_ts)
                 created += 1
@@ -144,11 +161,15 @@ class Summarizer:
                     "job_created",
                     "ok",
                     job_id=job_id,
+                    job_type="event_summary",
+                    timeout_s=timeout_s,
+                    attempt=1,
                     reason=reason,
                     start_ts=batch.start_ts,
                     end_ts=batch.end_ts,
                     screenshots=len(batch.screenshots),
-                    text_chars=sum(len(segment.text) for segment in batch.text_segments),
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
                     queue_size=len(self._queue),
                 )
 
@@ -164,6 +185,20 @@ class Summarizer:
             self._queue.clear()
             for item in cancelled:
                 self.storage.update_summary_job(item.job_id, status="cancelled", error=reason)
+                input_chars = sum(len(segment.text) for segment in item.batch.text_segments)
+                log_llm_stage(
+                    self.logger,
+                    "job_cancelled",
+                    "skip",
+                    job_id=item.job_id,
+                    job_type="event_summary",
+                    timeout_s=self._lmstudio_timeout_seconds(),
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                    reason=reason,
+                    queue_size=len(self._queue),
+                )
                 self._reserved_ranges.pop(item.job_id, None)
             self._condition.notify_all()
             return len(cancelled)
@@ -181,17 +216,30 @@ class Summarizer:
             max_parallel = self._max_parallel_jobs
             unrecoverable_error = self._unrecoverable_error
 
-        persisted_counts = self.storage.get_summary_job_status_counts()
+        try:
+            persisted_counts = self.storage.get_summary_job_status_counts()
+        except Exception:
+            persisted_counts = {}
+        llm_queue = self._get_lmstudio_queue_snapshot()
         return {
             "queued_jobs": queued_jobs,
             "running_jobs": running_jobs,
             "pending_summary_jobs": queued_jobs + running_jobs,
-            "completed_jobs": int(persisted_counts.get("succeeded", 0)),
+            "completed_jobs": int(persisted_counts.get("completed", persisted_counts.get("succeeded", 0))),
             "failed_jobs": int(persisted_counts.get("failed", 0)),
+            "timed_out_jobs": int(persisted_counts.get("timed_out", 0)),
             "cancelled_jobs": int(persisted_counts.get("cancelled", 0)),
+            "abandoned_jobs": int(persisted_counts.get("abandoned", 0)),
             "max_parallel_summary_jobs": max_parallel,
             "has_unrecoverable_error": unrecoverable_error is not None,
             "unrecoverable_error": unrecoverable_error,
+            "llm_queue_queued_jobs": int(llm_queue["queued_jobs"]),
+            "llm_queue_running_jobs": int(llm_queue["running_jobs"]),
+            "llm_queue_pending_jobs": int(llm_queue["pending_jobs"]),
+            "llm_queue_max_concurrent_jobs": int(llm_queue["max_concurrent_jobs"]),
+            "llm_queue_accepting_jobs": bool(llm_queue["accepting_jobs"]),
+            "llm_queue_closing": bool(llm_queue["closing"]),
+            "llm_queue_closed": bool(llm_queue["closed"]),
         }
 
     def flush_pending(self, reason: str = "manual", *, force_flush: bool = False) -> int | None:
@@ -207,54 +255,327 @@ class Summarizer:
                 "submission_decision",
                 "skip",
                 job_id="none",
+                job_type="event_summary",
                 reason="no_content",
                 detail="no_pending_data",
             )
             return None
 
-        job_id = self.storage.create_summary_job(batch.start_ts, batch.end_ts, status="running")
+        input_chars = sum(len(segment.text) for segment in batch.text_segments)
+        timeout_s = self._lmstudio_timeout_seconds()
+        job_id = self.storage.create_summary_job(
+            batch.start_ts,
+            batch.end_ts,
+            status="queued",
+            job_type="event_summary",
+            timeout_s=timeout_s,
+            attempt=1,
+            input_chars=input_chars,
+            input_token_estimate=_estimate_token_count(input_chars),
+        )
         log_llm_stage(
             self.logger,
             "job_created",
             "ok",
             job_id=job_id,
+            job_type="event_summary",
+            timeout_s=timeout_s,
+            attempt=1,
             reason=reason,
             start_ts=batch.start_ts,
             end_ts=batch.end_ts,
             screenshots=len(batch.screenshots),
-            text_chars=sum(len(segment.text) for segment in batch.text_segments),
+            input_chars=input_chars,
+            input_token_estimate=_estimate_token_count(input_chars),
         )
         return self._run_summary_job(job_id=job_id, batch=batch, reason=reason)
 
     def generate_daily_recap_for_day(self, day: date) -> tuple[int, bool]:
-        use_coalesced = bool(self.semantic_coalescer and self.semantic_coalescer.enabled)
-        summaries = self.storage.list_effective_summaries_for_day(day, use_coalesced=use_coalesced)
-        if not summaries:
-            raise ValueError(f"No summaries available for day {day.isoformat()}")
+        day_key = day.isoformat()
+        with self._condition:
+            while day_key in self._daily_recap_inflight:
+                self._condition.wait(timeout=0.5)
+            self._daily_recap_inflight.add(day_key)
 
         try:
-            with llm_job_context(f"daily_recap:{day.isoformat()}"):
-                recap_text, recap_json = self.lm_client.summarize_daily_recap(day=day, summaries=summaries)
-        except LMStudioConnectionError as exc:
-            self._notify_lmstudio_error("lmstudio_connection", str(exc), key=f"{self._lmstudio_identity()}|connection")
-            raise
-        except LMStudioServiceUnavailableError as exc:
-            self._notify_lmstudio_error(
-                "lmstudio_service_unavailable",
-                str(exc),
-                key=f"{self._lmstudio_identity()}|unavailable",
-            )
-            raise
-        else:
-            self.error_notifier.resolve_many("lmstudio_connection", "lmstudio_service_unavailable")
+            existing_daily_summary = self.storage.get_daily_summary_for_day(day)
+            if existing_daily_summary is not None:
+                existing_job = self.storage.get_daily_summary_job_for_day(day)
+                if existing_job is not None and str(existing_job["status"]) != "completed":
+                    started_at = existing_job["started_at"] if existing_job["started_at"] is not None else existing_job["queued_at"]
+                    self.storage.update_summary_job(
+                        int(existing_job["id"]),
+                        status="completed",
+                        job_type="day_summary",
+                        started_at=float(started_at) if started_at is not None else existing_daily_summary.created_ts,
+                        finished_at=existing_daily_summary.created_ts,
+                        timeout_s=float(existing_job["timeout_s"]),
+                        attempt=int(existing_job["attempt"]),
+                        input_chars=int(existing_job["input_chars"]),
+                        input_token_estimate=existing_job["input_token_estimate"],
+                        priority=int(existing_job["priority"]),
+                    )
+                    self.logger.info(
+                        "event=daily_summary_job_reconciled day=%s job_id=%s daily_summary_id=%s",
+                        day_key,
+                        int(existing_job["id"]),
+                        int(existing_daily_summary.id or 0),
+                    )
+                else:
+                    self.logger.info(
+                        "event=daily_summary_job_reused day=%s daily_summary_id=%s",
+                        day_key,
+                        int(existing_daily_summary.id or 0),
+                    )
+                return int(existing_daily_summary.id or 0), False
 
-        daily_summary, replaced = self.storage.create_daily_summary(
-            day=day,
-            recap_text=recap_text,
-            recap_json=recap_json if isinstance(recap_json, dict) else None,
-            source_batch_count=len(summaries),
-        )
-        return int(daily_summary.id or 0), replaced
+            use_coalesced = bool(self.semantic_coalescer and self.semantic_coalescer.enabled)
+            summaries = self.storage.list_effective_summaries_for_day(day, use_coalesced=use_coalesced)
+            if not summaries:
+                raise ValueError(f"No summaries available for day {day.isoformat()}")
+
+            input_chars = sum(len(summary.summary_text) for summary in summaries)
+            timeout_s = self._lmstudio_daily_timeout_seconds()
+            day_start = datetime.combine(day, datetime.min.time())
+            day_end = day_start + timedelta(days=1)
+            job_id, reused = self.storage.create_or_reuse_daily_summary_job(
+                day=day,
+                start_ts=day_start.timestamp(),
+                end_ts=day_end.timestamp(),
+                status="queued",
+                timeout_s=timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+            )
+            log_llm_stage(
+                self.logger,
+                "job_created",
+                "ok",
+                job_id=job_id,
+                job_type="day_summary",
+                timeout_s=timeout_s,
+                attempt=1,
+                day=day_key,
+                source_summaries=len(summaries),
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+                reused=reused,
+            )
+
+            def _on_started(metadata: LLMJobMetadata) -> None:
+                queue_wait_s = max(0.0, metadata.started_at - metadata.queued_at) if metadata.started_at is not None else 0.0
+                self.storage.update_summary_job(
+                    job_id,
+                    status="running",
+                    job_type="day_summary",
+                    started_at=metadata.started_at,
+                    timeout_s=timeout_s,
+                    attempt=metadata.attempt,
+                    input_chars=metadata.input_chars,
+                    input_token_estimate=metadata.input_token_estimate,
+                    priority=metadata.priority,
+                )
+                log_llm_stage(
+                    self.logger,
+                    "daily_summary_job_started",
+                    "ok",
+                    job_id=job_id,
+                    job_type="day_summary",
+                    timeout_s=timeout_s,
+                    attempt=metadata.attempt,
+                    day=day_key,
+                    source_summaries=len(summaries),
+                    input_chars=metadata.input_chars,
+                    input_token_estimate=metadata.input_token_estimate,
+                    queue_wait_s=queue_wait_s,
+                )
+
+            def _on_cancelled(metadata: LLMJobMetadata, cancel_reason: str) -> None:
+                self.storage.update_summary_job(
+                    job_id,
+                    status="cancelled",
+                    error=cancel_reason,
+                    job_type="day_summary",
+                    finished_at=metadata.finished_at,
+                    timeout_s=timeout_s,
+                    attempt=metadata.attempt,
+                    input_chars=metadata.input_chars,
+                    input_token_estimate=metadata.input_token_estimate,
+                    priority=metadata.priority,
+                )
+                log_llm_stage(
+                    self.logger,
+                    "daily_summary_job_cancelled",
+                    "skip",
+                    job_id=job_id,
+                    job_type="day_summary",
+                    timeout_s=timeout_s,
+                    attempt=metadata.attempt,
+                    day=day_key,
+                    source_summaries=len(summaries),
+                    reason=cancel_reason,
+                )
+
+            try:
+                with llm_job_context(
+                    f"daily_recap:{day.isoformat()}",
+                    job_type="day_summary",
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                ):
+                    recap_text, recap_json = self.lm_client.summarize_daily_recap(
+                        day=day,
+                        summaries=summaries,
+                        job_id=job_id,
+                        job_type="day_summary",
+                        on_started=_on_started,
+                        on_cancelled=_on_cancelled,
+                    )
+            except LLMJobCancelledError as exc:
+                raise
+            except LMStudioTimeoutError as exc:
+                self._notify_lmstudio_error(
+                    "lmstudio_timeout",
+                    str(exc),
+                    key=f"{self._lmstudio_identity()}|timeout",
+                )
+                self.storage.update_summary_job(
+                    job_id,
+                    status="timed_out",
+                    error=str(exc),
+                    job_type="day_summary",
+                    finished_at=time.time(),
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                )
+                raise
+            except LMStudioConnectionError as exc:
+                self._notify_lmstudio_error("lmstudio_connection", str(exc), key=f"{self._lmstudio_identity()}|connection")
+                self.storage.update_summary_job(
+                    job_id,
+                    status="failed",
+                    error=str(exc),
+                    job_type="day_summary",
+                    finished_at=time.time(),
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                )
+                raise
+            except LMStudioServiceUnavailableError as exc:
+                self._notify_lmstudio_error(
+                    "lmstudio_service_unavailable",
+                    str(exc),
+                    key=f"{self._lmstudio_identity()}|unavailable",
+                )
+                self.storage.update_summary_job(
+                    job_id,
+                    status="failed",
+                    error=str(exc),
+                    job_type="day_summary",
+                    finished_at=time.time(),
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                )
+                raise
+            else:
+                self.error_notifier.resolve_many("lmstudio_connection", "lmstudio_service_unavailable", "lmstudio_timeout")
+
+            log_llm_stage(
+                self.logger,
+                "daily_summary_store",
+                "start",
+                job_id=job_id,
+                job_type="day_summary",
+                timeout_s=timeout_s,
+                attempt=1,
+                day=day_key,
+                source_summaries=len(summaries),
+            )
+            try:
+                daily_summary, replaced = self.storage.create_daily_summary(
+                    day=day,
+                    recap_text=recap_text,
+                    recap_json=recap_json if isinstance(recap_json, dict) else None,
+                    source_batch_count=len(summaries),
+                )
+            except Exception as exc:
+                self.storage.update_summary_job(
+                    job_id,
+                    status="failed",
+                    error="Daily summary persistence failed.",
+                    job_type="day_summary",
+                    finished_at=time.time(),
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                )
+                log_llm_stage(
+                    self.logger,
+                    "daily_summary_store",
+                    "error",
+                    level=logging.ERROR,
+                    job_id=job_id,
+                    job_type="day_summary",
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    day=day_key,
+                    source_summaries=len(summaries),
+                    error_type=exc.__class__.__name__,
+                    error=safe_error(exc),
+                    exc_info=True,
+                )
+                raise
+            log_llm_stage(
+                self.logger,
+                "daily_summary_store",
+                "ok",
+                job_id=job_id,
+                job_type="day_summary",
+                timeout_s=timeout_s,
+                attempt=1,
+                day=day_key,
+                source_summaries=len(summaries),
+                daily_summary_id=daily_summary.id,
+                replaced=replaced,
+            )
+            self.storage.update_summary_job(
+                job_id,
+                status="completed",
+                job_type="day_summary",
+                finished_at=time.time(),
+                timeout_s=timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+            )
+            log_llm_stage(
+                self.logger,
+                "daily_summary_job_completed",
+                "ok",
+                job_id=job_id,
+                job_type="day_summary",
+                timeout_s=timeout_s,
+                attempt=1,
+                day=day_key,
+                source_summaries=len(summaries),
+                daily_summary_id=daily_summary.id,
+                replaced=replaced,
+            )
+            return int(daily_summary.id or 0), replaced
+        finally:
+            with self._condition:
+                self._daily_recap_inflight.discard(day_key)
+                self._condition.notify_all()
 
     def _worker_loop(self, worker_stop_event: threading.Event) -> None:
         while not self._stop_event.is_set() and not self._shutdown_event.is_set():
@@ -272,9 +593,16 @@ class Summarizer:
                 if self._queue:
                     queued_job = self._queue.popleft()
                     self._running_jobs.add(queued_job.job_id)
+                    input_chars = sum(len(segment.text) for segment in queued_job.batch.text_segments)
                     self.logger.info(
-                        "event=summary_job_dequeued job_id=%s queue_size=%s running_jobs=%s",
+                        (
+                            "event=summary_job_dequeued job_id=%s job_type=event_summary timeout_s=%s "
+                            "input_chars=%s input_token_estimate=%s queue_size=%s running_jobs=%s"
+                        ),
                         queued_job.job_id,
+                    self._lmstudio_timeout_seconds(),
+                        input_chars,
+                        _estimate_token_count(input_chars),
                         len(self._queue),
                         len(self._running_jobs),
                     )
@@ -282,7 +610,6 @@ class Summarizer:
             if queued_job is None:
                 continue
 
-            self.storage.update_summary_job(queued_job.job_id, status="running")
             self._run_summary_job(job_id=queued_job.job_id, batch=queued_job.batch, reason=queued_job.reason)
 
             with self._condition:
@@ -293,20 +620,104 @@ class Summarizer:
             if worker_stop_event.is_set():
                 return
 
-    def _run_summary_job(self, job_id: int, batch: SummaryBatch, reason: str) -> int | None:
+    def _run_summary_job(
+        self,
+        job_id: int,
+        batch: SummaryBatch,
+        reason: str,
+        *,
+        job_type: str = "event_summary",
+        timeout_s: int | None = None,
+    ) -> int | None:
+        started_at = time.perf_counter()
+        input_chars = sum(len(segment.text) for segment in batch.text_segments)
+        request_timeout_s = timeout_s if timeout_s is not None else self._lmstudio_timeout_seconds()
         log_llm_stage(
             self.logger,
             "submission_decision",
             "proceed",
             job_id=job_id,
+            job_type=job_type,
+            timeout_s=request_timeout_s,
+            attempt=1,
             reason="ready",
             job_reason=reason,
             screenshots=len(batch.screenshots),
-            text_chars=sum(len(segment.text) for segment in batch.text_segments),
+            input_chars=input_chars,
+            input_token_estimate=_estimate_token_count(input_chars),
         )
+
+        def _on_started(metadata: LLMJobMetadata) -> None:
+            queue_wait_s = max(0.0, metadata.started_at - metadata.queued_at) if metadata.started_at is not None else 0.0
+            self.storage.update_summary_job(
+                job_id,
+                status="running",
+                job_type=job_type,
+                started_at=metadata.started_at,
+                timeout_s=request_timeout_s,
+                attempt=metadata.attempt,
+                input_chars=metadata.input_chars,
+                input_token_estimate=metadata.input_token_estimate,
+                priority=metadata.priority,
+            )
+            log_llm_stage(
+                self.logger,
+                "summary_job_started",
+                "ok",
+                job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=metadata.attempt,
+                reason=reason,
+                screenshots=len(batch.screenshots),
+                input_chars=metadata.input_chars,
+                input_token_estimate=metadata.input_token_estimate,
+                queue_wait_s=queue_wait_s,
+            )
+
+        def _on_cancelled(metadata: LLMJobMetadata, cancel_reason: str) -> None:
+            self.storage.update_summary_job(
+                job_id,
+                status="cancelled",
+                error=cancel_reason,
+                job_type=job_type,
+                finished_at=metadata.finished_at,
+                timeout_s=request_timeout_s,
+                attempt=metadata.attempt,
+                input_chars=metadata.input_chars,
+                input_token_estimate=metadata.input_token_estimate,
+                priority=metadata.priority,
+            )
+            log_llm_stage(
+                self.logger,
+                "summary_job_cancelled",
+                "skip",
+                job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=metadata.attempt,
+                reason=cancel_reason,
+                screenshots=len(batch.screenshots),
+                input_chars=metadata.input_chars,
+                input_token_estimate=metadata.input_token_estimate,
+            )
+
         try:
-            with llm_job_context(job_id):
-                summary_text, summary_json = self.lm_client.summarize_batch(batch)
+            with llm_job_context(
+                job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+            ):
+                summary_text, summary_json = self.lm_client.summarize_batch(
+                    batch,
+                    job_id=job_id,
+                    job_type=job_type,
+                    on_started=_on_started,
+                    on_cancelled=_on_cancelled,
+                )
             summary_payload = self._enrich_summary_payload(batch, summary_text, summary_json, reason=reason)
             recent_summaries = self.storage.list_summaries(limit=self.summary_deduplicator.recent_compare_count)
             dedup_decision = self.summary_deduplicator.evaluate(
@@ -336,6 +747,9 @@ class Summarizer:
                         "summary_store",
                         "start",
                         job_id=job_id,
+                        job_type=job_type,
+                        timeout_s=request_timeout_s,
+                        attempt=1,
                         action="merge_previous",
                         summary_id=merged_record.id,
                     )
@@ -350,6 +764,9 @@ class Summarizer:
                         "summary_store",
                         "ok",
                         job_id=job_id,
+                        job_type=job_type,
+                        timeout_s=request_timeout_s,
+                        attempt=1,
                         action="merge_previous",
                         summary_id=summary_id,
                         matched_summary_id=dedup_decision.matched_summary_id,
@@ -361,6 +778,9 @@ class Summarizer:
                         "summary_store",
                         "start",
                         job_id=job_id,
+                        job_type=job_type,
+                        timeout_s=request_timeout_s,
+                        attempt=1,
                         action="insert",
                     )
                     summary_id = self.storage.insert_summary(
@@ -375,6 +795,9 @@ class Summarizer:
                         "summary_store",
                         "ok",
                         job_id=job_id,
+                        job_type=job_type,
+                        timeout_s=request_timeout_s,
+                        attempt=1,
                         action="insert",
                         summary_id=summary_id,
                     )
@@ -384,6 +807,9 @@ class Summarizer:
                     "summary_store",
                     "skip",
                     job_id=job_id,
+                    job_type=job_type,
+                    timeout_s=request_timeout_s,
+                    attempt=1,
                     reason=dedup_decision.reason,
                     matched_summary_id=dedup_decision.matched_summary_id,
                     similarity=dedup_decision.similarity,
@@ -394,6 +820,9 @@ class Summarizer:
                     "summary_store",
                     "start",
                     job_id=job_id,
+                    job_type=job_type,
+                    timeout_s=request_timeout_s,
+                    attempt=1,
                     action="insert",
                 )
                 summary_id = self.storage.insert_summary(
@@ -408,13 +837,25 @@ class Summarizer:
                     "summary_store",
                     "ok",
                     job_id=job_id,
+                    job_type=job_type,
+                    timeout_s=request_timeout_s,
+                    attempt=1,
                     action="insert",
                     summary_id=summary_id,
                 )
 
             self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
             self.storage.purge_raw_data(batch.start_ts, batch.end_ts)
-            self.storage.update_summary_job(job_id, status="succeeded")
+            self.storage.update_summary_job(
+                job_id,
+                status="completed",
+                job_type=job_type,
+                finished_at=time.time(),
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+            )
             if self.semantic_coalescer is not None and self.semantic_coalescer.enabled:
                 try:
                     day = date.fromtimestamp(batch.start_ts)
@@ -425,17 +866,65 @@ class Summarizer:
                 "summary_generation_failure",
                 "lmstudio_connection",
                 "lmstudio_service_unavailable",
+                "lmstudio_timeout",
             )
             log_llm_stage(
                 self.logger,
-                "job_complete",
+                "summary_job_completed",
                 "ok",
                 job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
                 summary_id=summary_id,
+                elapsed_s=time.perf_counter() - started_at,
             )
             return summary_id
+        except LLMJobCancelledError as exc:
+            return None
+        except LMStudioTimeoutError as exc:
+            self.storage.update_summary_job(
+                job_id,
+                status="timed_out",
+                error="LM Studio request timed out.",
+                job_type=job_type,
+                finished_at=time.time(),
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+            )
+            self._unrecoverable_error = "Timeout error: LM Studio request timed out."
+            self._notify_lmstudio_error("lmstudio_timeout", str(exc), key=f"{self._lmstudio_identity()}|timeout")
+            log_llm_stage(
+                self.logger,
+                "summary_job_failed",
+                "error",
+                level=logging.ERROR,
+                job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+                failed_stage=get_failed_stage(exc, default="http_response"),
+                error_type=exc.__class__.__name__,
+                error=safe_error(exc),
+                exc_info=True,
+            )
+            return None
         except LMStudioConnectionError as exc:
-            self.storage.update_summary_job(job_id, status="failed", error="LM Studio is unreachable.")
+            self.storage.update_summary_job(
+                job_id,
+                status="failed",
+                error="LM Studio is unreachable.",
+                job_type=job_type,
+                finished_at=time.time(),
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+            )
             self._unrecoverable_error = "Connection error: Unable to reach LM Studio. Check that it is running."
             self._notify_lmstudio_error(
                 "lmstudio_connection",
@@ -444,10 +933,15 @@ class Summarizer:
             )
             log_llm_stage(
                 self.logger,
-                "job_failed",
+                "summary_job_failed",
                 "error",
                 level=logging.ERROR,
                 job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
                 failed_stage=get_failed_stage(exc, default="http_response"),
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
@@ -459,6 +953,12 @@ class Summarizer:
                 job_id,
                 status="failed",
                 error="LM Studio returned an unavailable response.",
+                job_type=job_type,
+                finished_at=time.time(),
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
             )
             self._unrecoverable_error = "Service unavailable: LM Studio could not generate a response."
             self._notify_lmstudio_error(
@@ -468,10 +968,15 @@ class Summarizer:
             )
             log_llm_stage(
                 self.logger,
-                "job_failed",
+                "summary_job_failed",
                 "error",
                 level=logging.ERROR,
                 job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
                 failed_stage=get_failed_stage(exc, default="response_parse"),
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
@@ -479,7 +984,17 @@ class Summarizer:
             )
             return None
         except Exception as exc:
-            self.storage.update_summary_job(job_id, status="failed", error="Summary generation failed.")
+            self.storage.update_summary_job(
+                job_id,
+                status="failed",
+                error="Summary generation failed.",
+                job_type=job_type,
+                finished_at=time.time(),
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
+            )
             with self._lock:
                 self._unrecoverable_error = "Summary generation failed."
             self.error_notifier.notify(
@@ -489,10 +1004,15 @@ class Summarizer:
             )
             log_llm_stage(
                 self.logger,
-                "job_failed",
+                "summary_job_failed",
                 "error",
                 level=logging.ERROR,
                 job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
+                input_chars=input_chars,
+                input_token_estimate=_estimate_token_count(input_chars),
                 failed_stage=get_failed_stage(exc, default="summary_store"),
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
@@ -592,3 +1112,50 @@ class Summarizer:
         base_url = getattr(self.lm_client, "base_url", "lmstudio")
         model = getattr(self.lm_client, "model", "unknown-model")
         return f"{base_url}|{model}"
+
+    def _lmstudio_timeout_seconds(self) -> int:
+        timeout_seconds = getattr(self.lm_client, "timeout_seconds", 600)
+        try:
+            return max(1, int(timeout_seconds))
+        except (TypeError, ValueError):
+            return 600
+
+    def _lmstudio_daily_timeout_seconds(self) -> int:
+        daily_timeout_seconds = getattr(self.lm_client, "daily_timeout_seconds", None)
+        if daily_timeout_seconds is not None:
+            try:
+                return max(1, int(daily_timeout_seconds))
+            except (TypeError, ValueError):
+                pass
+        timeout_seconds = self._lmstudio_timeout_seconds()
+        return max(timeout_seconds, timeout_seconds * 2)
+
+    def _get_lmstudio_job_queue(self):
+        return getattr(self.lm_client, "job_queue", None)
+
+    def _get_lmstudio_queue_snapshot(self) -> dict[str, int | bool]:
+        job_queue = self._get_lmstudio_job_queue()
+        if job_queue is not None:
+            return job_queue.snapshot()
+        with self._lock:
+            queued_jobs = len(self._queue)
+            running_jobs = len(self._running_jobs)
+            max_parallel_jobs = self._max_parallel_jobs
+            accepting_jobs = not (self._stop_event.is_set() or self._shutdown_event.is_set())
+            closing = not accepting_jobs
+        return {
+            "queued_jobs": queued_jobs,
+            "running_jobs": running_jobs,
+            "pending_jobs": queued_jobs + running_jobs,
+            "max_concurrent_jobs": max_parallel_jobs,
+            "accepting_jobs": accepting_jobs,
+            "closing": closing,
+            "closed": closing,
+            "stopped": closing,
+        }
+
+
+def _estimate_token_count(chars: int) -> int | None:
+    if chars <= 0:
+        return None
+    return max(1, (chars + 3) // 4)

@@ -5,6 +5,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 
 from worklog_diary.core.lmstudio_embeddings import SummaryEmbeddingProvider
+from worklog_diary.core.llm_job_queue import LLMJobMetadata
 from worklog_diary.core.models import SummaryRecord
 from worklog_diary.core.semantic_coalescing import (
     SemanticCoalescer,
@@ -58,7 +59,7 @@ class _FailingEmbedClient:
     model = "embed"
     base_url = "http://localhost"
 
-    def embed_text(self, text: str) -> list[float]:
+    def embed_text(self, text: str, *_args: object, **_kwargs: object) -> list[float]:
         raise RuntimeError("down")
 
 
@@ -68,7 +69,7 @@ class _CountingEmbedClient:
         self.base_url = base_url
         self.calls = 0
 
-    def embed_text(self, text: str) -> list[float]:
+    def embed_text(self, text: str, *_args: object, **_kwargs: object) -> list[float]:
         self.calls += 1
         return [float(self.calls), 0.0]
 
@@ -229,10 +230,32 @@ def test_semantic_diagnostics_filters(tmp_path: Path) -> None:
 
 def test_daily_summary_uses_coalesced_when_enabled(tmp_path: Path) -> None:
     storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+
     class _Client:
-        def summarize_batch(self, batch: object) -> tuple[str, dict]:
+        def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
             return "", {}
-        def summarize_daily_recap(self, day: date, summaries: list[SummaryRecord]) -> tuple[str, dict]:
+
+        def summarize_daily_recap(self, *args: object, **_kwargs: object) -> tuple[str, dict]:
+            summaries = _kwargs.get("summaries")
+            if summaries is None and len(args) > 1:
+                summaries = args[1]
+            if summaries is None:
+                summaries = []
+            on_started = _kwargs.get("on_started")
+            if callable(on_started):
+                on_started(
+                    LLMJobMetadata(
+                        job_id=_kwargs.get("job_id", "test-job"),
+                        job_type=str(_kwargs.get("job_type", "day_summary")),
+                        queued_at=0.0,
+                        started_at=0.0,
+                        timeout_s=float(_kwargs.get("timeout_s", 600)),
+                        attempt=int(_kwargs.get("attempt", 1)),
+                        input_chars=int(_kwargs.get("input_chars", 0)),
+                        input_token_estimate=_kwargs.get("input_token_estimate"),
+                        priority=int(_kwargs.get("priority", 100)),
+                    )
+                )
             return f"count={len(summaries)}", {"count": len(summaries)}
 
     try:

@@ -7,7 +7,7 @@ import requests
 
 from worklog_diary.core.batching import BatchBuilder, SummaryBatch
 from worklog_diary.core.error_notifications import ErrorNotificationManager
-from worklog_diary.core.errors import LMStudioConnectionError
+from worklog_diary.core.errors import LMStudioConnectionError, LMStudioTimeoutError
 from worklog_diary.core.lmstudio_client import LMStudioClient
 from worklog_diary.core.models import ForegroundInfo, KeyEvent, TextSegment
 from worklog_diary.core.storage import SQLiteStorage
@@ -15,12 +15,12 @@ from worklog_diary.core.summarizer import Summarizer
 
 
 class SuccessfulClient:
-    def summarize_batch(self, _batch: object) -> tuple[str, dict]:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
         return "done", {"summary_text": "done", "key_points": [], "blocked_activity": []}
 
 
 class FailingConnectionClient:
-    def summarize_batch(self, _batch: object) -> tuple[str, dict]:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
         raise LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running.")
 
 
@@ -136,7 +136,7 @@ def test_lmstudio_client_maps_timeout_to_connection_error(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(requests, "post", fake_post)
 
-    with pytest.raises(LMStudioConnectionError) as exc_info:
+    with pytest.raises(LMStudioTimeoutError) as exc_info:
         client.summarize_batch(batch)
 
-    assert "Connection error" in str(exc_info.value)
+    assert "timed out" in str(exc_info.value)

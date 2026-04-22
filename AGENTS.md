@@ -1,5 +1,7 @@
 ## Code Exploration Policy
 Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bash for code exploration.
+- **To run tests**: use the already available project `.venv` (for example, `.venv/bin/pytest` or `.venv/bin/python -m pytest`).
+- **To add Python packages**: install them into the already available project `.venv`; do not use the system Python environment.
 - **New to a repo?**: `cymbal structure --db .\.cymbal\index.db` — entry points, hotspots, central packages. Start here.
 - **To understand a symbol**: `cymbal investigate <symbol> --db .\.cymbal\index.db` — returns source, callers, impact, or members based on what the symbol is.
 - **To understand multiple symbols**: `cymbal investigate Foo Bar Baz --db .\.cymbal\index.db` — batch mode, one invocation.
