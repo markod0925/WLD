@@ -149,9 +149,9 @@ class BatchBuilder:
                 if not _overlaps_any_range(item.start_ts, item.end_ts or item.start_ts, excluded_ranges)
             ]
             text_segments = [
-            item for item in text_segments if not _overlaps_any_range(item.start_ts, item.end_ts, excluded_ranges)
-        ]
-        screenshots = [item for item in screenshots if not _overlaps_any_range(item.ts, item.ts, excluded_ranges)]
+                item for item in text_segments if not _overlaps_any_range(item.start_ts, item.end_ts, excluded_ranges)
+            ]
+            screenshots = [item for item in screenshots if not _overlaps_any_range(item.ts, item.ts, excluded_ranges)]
 
         observations = build_activity_observations(
             intervals=intervals,
@@ -167,21 +167,48 @@ class BatchBuilder:
             screenshot_ssim_threshold=self.activity_segment_screenshot_ssim_threshold,
         ).segment(observations, force_flush=force_flush)
 
-        ready_segment = next((segment for segment in segments if segment.is_closed), None)
-        if ready_segment is None:
+        closed_segments = [segment for segment in segments if segment.is_closed]
+        selected_segments: list[ActivitySegment] = []
+        accumulated_duration = 0.0
+        for segment in closed_segments:
+            selected_segments.append(segment)
+            accumulated_duration += segment.duration_seconds
+            if accumulated_duration >= self.activity_segment_min_duration_seconds:
+                break
+
+        if not selected_segments or accumulated_duration < self.activity_segment_min_duration_seconds:
             if not force_flush or not segments:
                 _LOGGER.info(
-                    "event=activity_segment_pending reason=%s detail=%s segment_count=%s",
+                    (
+                        "event=activity_segment_pending reason=%s detail=%s segment_count=%s "
+                        "accumulated_closed_duration_seconds=%.3f required_duration_seconds=%.3f"
+                    ),
                     "force_flush_requested" if force_flush else "open_segment_not_mature",
-                    "no_closed_segment_ready",
+                    "no_closed_segment_ready_or_min_duration_not_met",
                     len(segments),
+                    accumulated_duration,
+                    self.activity_segment_min_duration_seconds,
                 )
                 return None
-            ready_segment = segments[-1]
+            forced_segment = segments[-1]
+            if forced_segment.duration_seconds < self.activity_segment_min_duration_seconds:
+                _LOGGER.info(
+                    (
+                        "event=activity_segment_selected reason=force_flush_requested detail=min_duration_bypassed "
+                        "segment_count=%s selected_duration_seconds=%.3f required_duration_seconds=%.3f"
+                    ),
+                    len(segments),
+                    forced_segment.duration_seconds,
+                    self.activity_segment_min_duration_seconds,
+                )
+            selected_segments = [forced_segment]
+            accumulated_duration = forced_segment.duration_seconds
+        ready_segment = selected_segments[-1]
         _LOGGER.info(
             (
                 "event=activity_segment_selected segment_id=%s reason=%s start_ts=%.3f end_ts=%.3f "
-                "duration_seconds=%.3f process=%s title=%s observations=%s screenshots=%s text_segments=%s"
+                "duration_seconds=%.3f process=%s title=%s observations=%s screenshots=%s text_segments=%s "
+                "selected_segment_count=%s accumulated_duration_seconds=%.3f"
             ),
             ready_segment.segment_id,
             ready_segment.closure_reason,
@@ -193,6 +220,8 @@ class BatchBuilder:
             ready_segment.observation_count,
             ready_segment.screenshot_count,
             ready_segment.text_segment_count,
+            len(selected_segments),
+            accumulated_duration,
         )
 
         segment_end = ready_segment.end_ts
@@ -209,12 +238,15 @@ class BatchBuilder:
             min_keep_interval_seconds=self.min_keep_interval_seconds,
         )
 
+        ordered_segments = [ready_segment]
+        ordered_segments.extend(segment for segment in selected_segments if segment.segment_id != ready_segment.segment_id)
+
         return build_batch_from_pending(
             intervals=intervals,
             blocked_intervals=blocked_intervals,
             text_segments=text_segments,
             screenshots=screenshots,
-            activity_segments=[ready_segment],
+            activity_segments=ordered_segments,
         )
 
     @staticmethod

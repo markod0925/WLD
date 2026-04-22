@@ -131,7 +131,12 @@ def test_batch_builder_works_with_fake_repository() -> None:
         screenshots=[],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert batch.start_ts == 10.0
@@ -152,7 +157,10 @@ def test_batch_builder_honors_excluded_ranges_with_fake_repository() -> None:
         screenshots=[],
     )
 
-    batch = BatchBuilder(storage=repo).build_pending_batch(excluded_ranges=[(9.0, 21.0)])
+    batch = BatchBuilder(storage=repo, activity_segment_min_duration_seconds=0.0).build_pending_batch(
+        force_flush=True,
+        excluded_ranges=[(9.0, 21.0)]
+    )
 
     assert batch is not None
     assert len(batch.active_intervals) == 1
@@ -175,9 +183,12 @@ def test_batch_builder_expands_text_limit_after_excluding_ranges() -> None:
         screenshots=[],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=1, max_screenshots=3).build_pending_batch(
-        excluded_ranges=[(11.0, 14.0)]
-    )
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=1,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(excluded_ranges=[(11.0, 14.0)], force_flush=True)
 
     assert batch is not None
     assert len(batch.text_segments) == 1
@@ -196,7 +207,12 @@ def test_batch_builder_filters_consecutive_identical_screenshots() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 1
@@ -214,7 +230,12 @@ def test_batch_builder_keeps_visually_distinct_screenshots() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 2
@@ -231,7 +252,12 @@ def test_batch_builder_keeps_screenshots_when_window_title_changes() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 2
@@ -249,7 +275,111 @@ def test_batch_builder_respects_max_screenshot_count_after_dedup() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 3
+
+
+def test_batch_builder_skips_short_closed_segments_below_min_duration() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=0.0, end_ts=30.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+        ActiveInterval(id=2, start_ts=31.0, end_ts=70.0, hwnd=2, pid=2, process_name="b.exe", window_title="B", blocked=False),
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(
+        storage=repo,
+        activity_segment_min_duration_seconds=180.0,
+        activity_segment_idle_gap_seconds=300.0,
+    ).build_pending_batch()
+
+    assert batch is None
+
+
+def test_batch_builder_selects_first_closed_segment_meeting_min_duration() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=0.0, end_ts=30.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+        ActiveInterval(id=2, start_ts=31.0, end_ts=70.0, hwnd=2, pid=2, process_name="b.exe", window_title="B", blocked=False),
+        ActiveInterval(id=3, start_ts=71.0, end_ts=320.0, hwnd=2, pid=2, process_name="b.exe", window_title="B", blocked=False),
+        ActiveInterval(id=4, start_ts=321.0, end_ts=360.0, hwnd=3, pid=3, process_name="c.exe", window_title="C", blocked=False),
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(
+        storage=repo,
+        activity_segment_min_duration_seconds=180.0,
+        activity_segment_idle_gap_seconds=300.0,
+    ).build_pending_batch()
+
+    assert batch is not None
+    assert batch.start_ts == 0.0
+    assert batch.end_ts == 320.0
+    assert [item.id for item in batch.active_intervals] == [1, 2, 3]
+
+
+def test_batch_builder_accumulates_short_closed_segments_until_min_duration() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=0.0, end_ts=50.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+        ActiveInterval(id=2, start_ts=51.0, end_ts=100.0, hwnd=2, pid=2, process_name="b.exe", window_title="B", blocked=False),
+        ActiveInterval(id=3, start_ts=101.0, end_ts=150.0, hwnd=3, pid=3, process_name="c.exe", window_title="C", blocked=False),
+        ActiveInterval(id=4, start_ts=151.0, end_ts=190.0, hwnd=4, pid=4, process_name="d.exe", window_title="D", blocked=False),
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(
+        storage=repo,
+        activity_segment_min_duration_seconds=120.0,
+        activity_segment_idle_gap_seconds=300.0,
+    ).build_pending_batch()
+
+    assert batch is not None
+    assert batch.start_ts == 0.0
+    assert batch.end_ts == 150.0
+    assert [item.id for item in batch.active_intervals] == [1, 2, 3]
+    assert len(batch.activity_segments) == 3
+    assert batch.activity_segments[0].end_ts == 150.0
+    assert [segment.end_ts for segment in batch.activity_segments[1:]] == [50.0, 100.0]
+
+
+def test_batch_builder_force_flush_includes_short_pending_segment() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=0.0, end_ts=45.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(
+        storage=repo,
+        activity_segment_min_duration_seconds=180.0,
+        activity_segment_idle_gap_seconds=300.0,
+    ).build_pending_batch(force_flush=True)
+
+    assert batch is not None
+    assert batch.start_ts == 0.0
+    assert batch.end_ts == 45.0
+    assert [item.id for item in batch.active_intervals] == [1]
