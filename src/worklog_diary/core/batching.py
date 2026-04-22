@@ -238,12 +238,15 @@ class BatchBuilder:
             min_keep_interval_seconds=self.min_keep_interval_seconds,
         )
 
+        ordered_segments = [ready_segment]
+        ordered_segments.extend(segment for segment in selected_segments if segment.segment_id != ready_segment.segment_id)
+
         return build_batch_from_pending(
             intervals=intervals,
             blocked_intervals=blocked_intervals,
             text_segments=text_segments,
             screenshots=screenshots,
-            activity_segments=selected_segments,
+            activity_segments=ordered_segments,
         )
 
     @staticmethod

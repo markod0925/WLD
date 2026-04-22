@@ -327,6 +327,8 @@ def test_batch_builder_accumulates_short_closed_segments_until_min_duration() ->
     assert batch.end_ts == 150.0
     assert [item.id for item in batch.active_intervals] == [1, 2, 3]
     assert len(batch.activity_segments) == 3
+    assert batch.activity_segments[0].end_ts == 150.0
+    assert [segment.end_ts for segment in batch.activity_segments[1:]] == [50.0, 100.0]
 
 
 def test_batch_builder_force_flush_includes_short_pending_segment() -> None:
