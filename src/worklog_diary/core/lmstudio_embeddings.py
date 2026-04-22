@@ -6,7 +6,10 @@ import logging
 import time
 from typing import Any
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - exercised in frozen builds without optional deps
+    requests = None
 
 from .models import SummaryRecord
 from .summary_canonicalization import build_canonical_embedding_text
@@ -20,6 +23,9 @@ class LMStudioEmbeddingClient:
         self.logger = logging.getLogger(__name__)
 
     def embed_text(self, text: str) -> list[float]:
+        if requests is None:
+            raise RuntimeError("The optional dependency 'requests' is not available")
+
         response = requests.post(
             f"{self.base_url}/embeddings",
             json={"model": self.model, "input": text},
