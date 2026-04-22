@@ -131,7 +131,12 @@ def test_batch_builder_works_with_fake_repository() -> None:
         screenshots=[],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert batch.start_ts == 10.0
@@ -152,7 +157,10 @@ def test_batch_builder_honors_excluded_ranges_with_fake_repository() -> None:
         screenshots=[],
     )
 
-    batch = BatchBuilder(storage=repo).build_pending_batch(excluded_ranges=[(9.0, 21.0)])
+    batch = BatchBuilder(storage=repo, activity_segment_min_duration_seconds=0.0).build_pending_batch(
+        force_flush=True,
+        excluded_ranges=[(9.0, 21.0)]
+    )
 
     assert batch is not None
     assert len(batch.active_intervals) == 1
@@ -175,9 +183,12 @@ def test_batch_builder_expands_text_limit_after_excluding_ranges() -> None:
         screenshots=[],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=1, max_screenshots=3).build_pending_batch(
-        excluded_ranges=[(11.0, 14.0)]
-    )
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=1,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(excluded_ranges=[(11.0, 14.0)], force_flush=True)
 
     assert batch is not None
     assert len(batch.text_segments) == 1
@@ -196,7 +207,12 @@ def test_batch_builder_filters_consecutive_identical_screenshots() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 1
@@ -214,7 +230,12 @@ def test_batch_builder_keeps_visually_distinct_screenshots() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 2
@@ -231,7 +252,12 @@ def test_batch_builder_keeps_screenshots_when_window_title_changes() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 2
@@ -249,7 +275,12 @@ def test_batch_builder_respects_max_screenshot_count_after_dedup() -> None:
         ],
     )
 
-    batch = BatchBuilder(storage=repo, max_text_segments=10, max_screenshots=3).build_pending_batch()
+    batch = BatchBuilder(
+        storage=repo,
+        max_text_segments=10,
+        max_screenshots=3,
+        activity_segment_min_duration_seconds=0.0,
+    ).build_pending_batch(force_flush=True)
 
     assert batch is not None
     assert len(batch.screenshots) == 3
