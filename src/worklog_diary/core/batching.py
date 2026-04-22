@@ -194,14 +194,13 @@ class BatchBuilder:
             if forced_segment.duration_seconds < self.activity_segment_min_duration_seconds:
                 _LOGGER.info(
                     (
-                        "event=activity_segment_pending reason=force_flush_requested detail=min_duration_not_met "
+                        "event=activity_segment_selected reason=force_flush_requested detail=min_duration_bypassed "
                         "segment_count=%s selected_duration_seconds=%.3f required_duration_seconds=%.3f"
                     ),
                     len(segments),
                     forced_segment.duration_seconds,
                     self.activity_segment_min_duration_seconds,
                 )
-                return None
             selected_segments = [forced_segment]
             accumulated_duration = forced_segment.duration_seconds
         ready_segment = selected_segments[-1]

@@ -327,3 +327,26 @@ def test_batch_builder_accumulates_short_closed_segments_until_min_duration() ->
     assert batch.end_ts == 150.0
     assert [item.id for item in batch.active_intervals] == [1, 2, 3]
     assert len(batch.activity_segments) == 3
+
+
+def test_batch_builder_force_flush_includes_short_pending_segment() -> None:
+    intervals = [
+        ActiveInterval(id=1, start_ts=0.0, end_ts=45.0, hwnd=1, pid=1, process_name="a.exe", window_title="A", blocked=False),
+    ]
+    repo = FakeActivityRepository(
+        intervals=intervals,
+        blocked_intervals=[],
+        text_segments=[],
+        screenshots=[],
+    )
+
+    batch = BatchBuilder(
+        storage=repo,
+        activity_segment_min_duration_seconds=180.0,
+        activity_segment_idle_gap_seconds=300.0,
+    ).build_pending_batch(force_flush=True)
+
+    assert batch is not None
+    assert batch.start_ts == 0.0
+    assert batch.end_ts == 45.0
+    assert [item.id for item in batch.active_intervals] == [1]
