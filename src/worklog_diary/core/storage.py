@@ -74,7 +74,6 @@ class SQLiteStorage(ActivityRepository):
                     self.db_key_path,
                 )
             self._conn = open_sqlcipher_connection(self.db_path, key_bytes)
-            self._conn.row_factory = sqlite3.Row
             self.schema_manager = StorageSchemaManager(self._conn, self._lock, self.logger)
             self.diagnostics_repository = StorageDiagnosticsRepository(self._conn, self._lock, self.logger)
             self.cleanup_service = StorageCleanupService(self._conn, self._lock, self.logger)
