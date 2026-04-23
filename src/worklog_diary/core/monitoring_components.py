@@ -473,6 +473,23 @@ class FlushCoordinator:
                     stop_reason = "error"
                     break
 
+                if (
+                    reason == "scheduled"
+                    and bool(runtime["summary_admission_paused"])
+                    and int(runtime["running_jobs"]) == 0
+                ):
+                    self.logger.info(
+                        (
+                            "event=summary_drain_stopped reason=scheduled_admission_paused queued=%s "
+                            "running=%s pending_summary_jobs=%s"
+                        ),
+                        runtime["queued_jobs"],
+                        runtime["running_jobs"],
+                        runtime["pending_summary_jobs"],
+                    )
+                    stop_reason = "paused"
+                    break
+
                 backlog_remaining = _has_pending_backlog(pending)
                 if not backlog_remaining and int(runtime["pending_summary_jobs"]) == 0:
                     stop_reason = "empty"
