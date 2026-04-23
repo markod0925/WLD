@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import date
 
 from .config import AppConfig, app_data_dir_source, is_frozen_executable, save_config
-from .crash_reporting import CrashReporter
+from .crash_monitor import CrashMonitor
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError
 from .logging_setup import configure_logging
 from .lmstudio_logging import get_failed_stage
@@ -19,6 +19,7 @@ from .monitoring_components import (
 )
 from .summary_dedup import SummaryDeduplicator
 from .semantic_coalescing import SemanticCoalescingConfig
+from .. import __version__
 
 
 class MonitoringServices:
@@ -42,8 +43,8 @@ class MonitoringServices:
         )
         self.logger.info("event=runtime_paths_source source=%s", app_data_dir_source())
 
-        self.crash_reporter = CrashReporter(self.config.app_data_dir, self.config.log_dir, self.logger)
-        self.crash_reporter.install()
+        self.crash_reporter = CrashMonitor(self.config.app_data_dir, self.config.log_dir, self.logger)
+        self.crash_reporter.install(app_version=__version__)
 
         self.registry = ServiceRegistry(self.config)
         self._services: MonitoringServiceBundle = self.registry.build_bundle()
@@ -267,9 +268,28 @@ class MonitoringServices:
         if self._shutdown_completed:
             return
         self._shutdown_completed = True
-        self._services.shutdown_event.set()
-        self.cancel_flush_drain()
-        self.stop_monitoring()
-        self.summarizer.stop()
-        self.storage.close()
-        self.crash_reporter.mark_clean_exit()
+        first_error: Exception | None = None
+        try:
+            self._services.shutdown_event.set()
+            self.cancel_flush_drain()
+            self.stop_monitoring()
+            self.summarizer.stop()
+            self.storage.close()
+        except Exception as exc:
+            first_error = exc
+            self.logger.exception(
+                "event=services_shutdown_step_failed error_type=%s error=%s",
+                exc.__class__.__name__,
+                exc,
+            )
+        finally:
+            try:
+                self.crash_reporter.mark_clean_exit()
+            except Exception as exc:
+                self.logger.warning(
+                    "event=services_shutdown_finalization_failed error_type=%s error=%s",
+                    exc.__class__.__name__,
+                    exc,
+                )
+        if first_error is not None:
+            raise first_error

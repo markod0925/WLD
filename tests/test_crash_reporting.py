@@ -5,46 +5,222 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
-from worklog_diary.core.crash_reporting import CrashReporter, run_protected
+from worklog_diary.core.crash_monitor import CrashMonitor, append_emergency_marker, run_protected
+from worklog_diary.core.services import MonitoringServices
 
 
-def _make_reporter(tmp_path: Path) -> CrashReporter:
-    logger = logging.getLogger("test.crash")
-    return CrashReporter(str(tmp_path / "app"), str(tmp_path / "logs"), logger)
+def _make_monitor(tmp_path: Path) -> CrashMonitor:
+    logger = logging.getLogger("test.crash_monitor")
+    return CrashMonitor(str(tmp_path / "app"), str(tmp_path / "logs"), logger)
 
 
 def test_previous_run_unclean_shutdown_is_logged(tmp_path: Path, caplog) -> None:
-    reporter = _make_reporter(tmp_path)
-    reporter.app_data_dir.mkdir(parents=True, exist_ok=True)
-    reporter.marker_path.write_text(
+    monitor = _make_monitor(tmp_path)
+    monitor.app_data_dir.mkdir(parents=True, exist_ok=True)
+    monitor.session_state_path.write_text(
         json.dumps(
             {
-                "status": "RUNNING",
-                "clean_exit": False,
+                "schema_version": 1,
+                "session_id": "old-session",
                 "pid": 123,
-                "start_ts": 1.0,
-                "heartbeat_ts": 2.0,
+                "started_at_utc": "2026-01-01T00:00:00Z",
+                "last_heartbeat_utc": "2026-01-01T00:00:15Z",
+                "clean_shutdown": False,
+                "app_version": "0.0.1",
             }
         ),
         encoding="utf-8",
     )
 
     caplog.set_level(logging.WARNING)
-    reporter._check_previous_run()
+    monitor._log_previous_unclean_shutdown_if_present()
 
-    assert any("[CRASH] stage=previous_run_check status=unclean_shutdown detected=true" in r.message for r in caplog.records)
+    assert any("event=previous_run_unexpected_exit detected=true" in r.message for r in caplog.records)
 
 
-def test_main_and_thread_hooks_log_crash_records(tmp_path: Path, caplog, monkeypatch) -> None:
-    reporter = _make_reporter(tmp_path)
+def test_clean_shutdown_marks_session_state(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.app_data_dir.mkdir(parents=True, exist_ok=True)
+    monitor._initialize_session_state(app_version="0.1.0")
+
+    monitor.finalize_clean_shutdown()
+
+    state = json.loads(monitor.session_state_path.read_text(encoding="utf-8"))
+    assert state["clean_shutdown"] is True
+    assert state["exit_reason"] == "clean_shutdown"
+    assert int(state["pid"]) == os.getpid()
+
+
+def test_corrupt_session_state_is_tolerated(tmp_path: Path, caplog) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.app_data_dir.mkdir(parents=True, exist_ok=True)
+    monitor.log_dir.mkdir(parents=True, exist_ok=True)
+    monitor.session_state_path.write_text("{not-json", encoding="utf-8")
+
+    caplog.set_level(logging.WARNING)
+
+    assert monitor._load_session_state() is None
+    assert any("event=session_state_load_failed" in r.message for r in caplog.records)
+
+
+def test_session_writes_are_safe_under_concurrency(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.app_data_dir.mkdir(parents=True, exist_ok=True)
+
+    failures: list[Exception] = []
+
+    def _writer(idx: int) -> None:
+        try:
+            for tick in range(50):
+                monitor._write_session_state({"session_id": idx, "tick": tick, "clean_shutdown": False})
+        except Exception as exc:  # pragma: no cover
+            failures.append(exc)
+
+    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert monitor.session_state_path.exists()
+
+
+def test_emergency_marker_never_raises_when_open_fails(tmp_path: Path, monkeypatch) -> None:
+    marker_path = tmp_path / "crash_last_gasp.log"
+
+    def _boom(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError("open failed")
+
+    monkeypatch.setattr(Path, "open", _boom)
+    append_emergency_marker(marker_path, "test-marker")
+
+
+def test_heartbeat_updates_session_state(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.app_data_dir.mkdir(parents=True, exist_ok=True)
+    monitor._heartbeat_interval_seconds = 0.01
+    monitor._initialize_session_state(app_version="0.1.0")
+
+    monitor._start_heartbeat()
+    try:
+        threading.Event().wait(0.03)
+    finally:
+        monitor._stop_heartbeat()
+
+    state = json.loads(monitor.session_state_path.read_text(encoding="utf-8"))
+    assert state["clean_shutdown"] is False
+    assert "last_heartbeat_utc" in state
+
+
+def test_finalize_prevents_late_heartbeat_overwrite(tmp_path: Path, monkeypatch) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.app_data_dir.mkdir(parents=True, exist_ok=True)
+    monitor._heartbeat_interval_seconds = 0.01
+    monitor._initialize_session_state(app_version="0.1.0")
+
+    original_write = monitor._write_session_state
+    heartbeat_started = threading.Event()
+    release_heartbeat_write = threading.Event()
+    writes: list[dict] = []
+
+    def _wrapped_write(state: dict) -> None:
+        writes.append(dict(state))
+        if state.get("exit_reason") == "running" and not release_heartbeat_write.is_set():
+            heartbeat_started.set()
+            release_heartbeat_write.wait(timeout=1.0)
+        original_write(state)
+
+    monkeypatch.setattr(monitor, "_write_session_state", _wrapped_write)
+
+    monitor._start_heartbeat()
+    assert heartbeat_started.wait(timeout=1.0)
+
+    finalize_thread = threading.Thread(target=monitor.finalize_clean_shutdown)
+    finalize_thread.start()
+    time.sleep(0.02)
+    release_heartbeat_write.set()
+    finalize_thread.join(timeout=1.0)
+
+    state = json.loads(monitor.session_state_path.read_text(encoding="utf-8"))
+    assert state["clean_shutdown"] is True
+
+    first_clean_idx = next(i for i, item in enumerate(writes) if item.get("clean_shutdown") is True)
+    assert not any(item.get("clean_shutdown") is False for item in writes[first_clean_idx + 1 :])
+
+
+def test_finalize_retries_after_failed_persist(tmp_path: Path, monkeypatch) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.app_data_dir.mkdir(parents=True, exist_ok=True)
+    monitor._initialize_session_state(app_version="0.1.0")
+
+    original_write = monitor._write_session_state
+    attempts = {"count": 0}
+
+    def _flaky_write(state: dict) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("transient write failure")
+        original_write(state)
+
+    monkeypatch.setattr(monitor, "_write_session_state", _flaky_write)
+
+    monitor.finalize_clean_shutdown()
+    monitor.finalize_clean_shutdown()
+
+    state = json.loads(monitor.session_state_path.read_text(encoding="utf-8"))
+    assert attempts["count"] >= 2
+    assert state["clean_shutdown"] is True
+
+
+def test_install_is_non_fatal_when_stages_fail(tmp_path: Path, monkeypatch) -> None:
+    monitor = _make_monitor(tmp_path)
+
+    monkeypatch.setattr(monitor, "_initialize_session_state", lambda app_version=None: (_ for _ in ()).throw(OSError("write fail")))
+    monkeypatch.setattr(monitor, "_enable_faulthandler", lambda: (_ for _ in ()).throw(RuntimeError("fault fail")))
+    monkeypatch.setattr(monitor, "_install_exception_hooks", lambda: (_ for _ in ()).throw(RuntimeError("hook fail")))
+
+    monitor.install(app_version="0.1.0")
+
+    assert monitor._installed is True
+
+
+def test_services_shutdown_attempts_clean_mark_even_if_teardown_raises() -> None:
+    services = MonitoringServices.__new__(MonitoringServices)
+    services._shutdown_completed = False
+    services.logger = logging.getLogger("test.services.shutdown")
+    services._services = SimpleNamespace(shutdown_event=threading.Event())
+    services.cancel_flush_drain = lambda: False
+    services.stop_monitoring = lambda: (_ for _ in ()).throw(RuntimeError("stop failed"))
+    services.summarizer = SimpleNamespace(stop=lambda: None)
+    services.storage = SimpleNamespace(close=lambda: None)
+    calls: list[str] = []
+    services.crash_reporter = SimpleNamespace(mark_clean_exit=lambda: calls.append("marked"))
+
+    try:
+        services.shutdown()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("shutdown should surface teardown failure")
+
+    assert calls == ["marked"]
+
+
+def test_hooks_capture_main_thread_thread_and_unraisable(tmp_path: Path, caplog, monkeypatch) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.log_dir.mkdir(parents=True, exist_ok=True)
     caplog.set_level(logging.CRITICAL)
 
     original_sys = sys.excepthook
     original_thread = threading.excepthook
+    original_unraisable = sys.unraisablehook
 
-    reporter._install_exception_hooks()
+    monitor._install_exception_hooks()
 
     try:
         try:
@@ -59,69 +235,20 @@ def test_main_and_thread_hooks_log_crash_records(tmp_path: Path, caplog, monkeyp
         thread.start()
         thread.join()
 
-        assert any("[CRASH] stage=unhandled_exception status=error" in r.message for r in caplog.records)
-        assert any("error_type=ValueError" in r.message for r in caplog.records)
-        assert any("[CRASH] stage=thread_unhandled_exception status=error" in r.message for r in caplog.records)
-        assert any("thread=Worker-1" in r.message for r in caplog.records)
+        class _Unraisable:
+            def __del__(self) -> None:
+                raise RuntimeError("del boom")
+
+        obj = _Unraisable()
+        del obj
+
+        assert any("stage=unhandled_exception" in r.message for r in caplog.records)
+        assert any("stage=thread_unhandled_exception" in r.message for r in caplog.records)
+        assert any("stage=unraisable_exception" in r.message for r in caplog.records)
     finally:
         monkeypatch.setattr(sys, "excepthook", original_sys)
         monkeypatch.setattr(threading, "excepthook", original_thread)
-
-
-def test_mark_clean_exit_updates_state(tmp_path: Path) -> None:
-    reporter = _make_reporter(tmp_path)
-    reporter.app_data_dir.mkdir(parents=True, exist_ok=True)
-    reporter._mark_running()
-
-    reporter.mark_clean_exit()
-
-    state = json.loads(reporter.marker_path.read_text(encoding="utf-8"))
-    assert state["status"] == "CLEAN_EXIT"
-    assert state["clean_exit"] is True
-    assert int(state["pid"]) == os.getpid()
-
-
-def test_mark_clean_exit_stops_heartbeat_before_marker_write(tmp_path: Path, monkeypatch) -> None:
-    reporter = _make_reporter(tmp_path)
-    reporter.app_data_dir.mkdir(parents=True, exist_ok=True)
-
-    steps: list[str] = []
-
-    def _stop() -> None:
-        steps.append("stop")
-
-    def _write(_state: dict) -> None:
-        steps.append("write")
-
-    monkeypatch.setattr(reporter, "_stop_heartbeat", _stop)
-    monkeypatch.setattr(reporter, "_write_marker_state", _write)
-
-    reporter.mark_clean_exit()
-
-    assert steps == ["stop", "write"]
-
-
-def test_marker_writes_are_safe_under_concurrency(tmp_path: Path) -> None:
-    reporter = _make_reporter(tmp_path)
-    reporter.app_data_dir.mkdir(parents=True, exist_ok=True)
-
-    failures: list[Exception] = []
-
-    def _writer(idx: int) -> None:
-        try:
-            for tick in range(50):
-                reporter._write_marker_state({"status": "RUNNING", "idx": idx, "tick": tick})
-        except Exception as exc:  # pragma: no cover - this path should remain unreachable
-            failures.append(exc)
-
-    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(6)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert failures == []
-    assert reporter.marker_path.exists()
+        monkeypatch.setattr(sys, "unraisablehook", original_unraisable)
 
 
 def test_run_protected_logs_and_reraises(caplog) -> None:
@@ -138,4 +265,4 @@ def test_run_protected_logs_and_reraises(caplog) -> None:
     else:
         raise AssertionError("run_protected should re-raise runtime errors")
 
-    assert any("[CRASH] stage=app_main_loop status=error" in r.message for r in caplog.records)
+    assert any("event=run_protected_exception stage=app_main_loop" in r.message for r in caplog.records)
