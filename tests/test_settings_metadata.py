@@ -53,6 +53,7 @@ def test_settings_are_grouped_by_exposure_level() -> None:
         "log_dir",
         "db_path",
         "max_parallel_summary_jobs",
+        "process_backlog_only_while_locked",
         "max_screenshots_per_summary",
         "max_text_segments_per_summary",
         "request_timeout_seconds",

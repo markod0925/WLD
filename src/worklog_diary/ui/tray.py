@@ -234,6 +234,8 @@ class TrayController:
         self.buffer_action.setText(
             f"Buffer: {status['buffer_state']} | approx batches: {status['approx_remaining_batches']}"
         )
+        if bool(status.get("summary_admission_paused")):
+            self.buffer_action.setText(f"{self.buffer_action.text()} | summary starts paused")
 
         jobs = status["summary_jobs"]
         self.jobs_action.setText(
@@ -263,6 +265,7 @@ class TrayController:
             f"Blocked: {blocked}\n"
             f"Context: {context}\n"
             f"Buffer state: {status['buffer_state']}\n"
+            f"Summary admission paused: {bool(status.get('summary_admission_paused'))}\n"
             f"Approx remaining batches: {status['approx_remaining_batches']}\n"
             f"Flush drain: {drain_state}\n"
             f"Last flush: {last_flush}\n"
