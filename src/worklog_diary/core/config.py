@@ -40,6 +40,7 @@ class AppConfig:
     max_screenshots_per_summary: int = 3
     max_text_segments_per_summary: int = 400
     max_parallel_summary_jobs: int = 2
+    process_backlog_only_while_locked: bool = True
     request_timeout_seconds: int = 600
     activity_segment_min_duration_seconds: float = 180.0
     activity_segment_max_duration_seconds: float = 900.0
@@ -98,6 +99,7 @@ class AppConfig:
         self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "active_window"
 
         self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
+        self.process_backlog_only_while_locked = bool(self.process_backlog_only_while_locked)
         self.lmstudio_max_prompt_chars = max(2000, int(self.lmstudio_max_prompt_chars))
         self.activity_segment_min_duration_seconds = max(0.0, float(self.activity_segment_min_duration_seconds))
         self.activity_segment_max_duration_seconds = max(
@@ -288,6 +290,7 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "max_screenshots_per_summary": _coerce_int,
         "max_text_segments_per_summary": _coerce_int,
         "max_parallel_summary_jobs": _coerce_int,
+        "process_backlog_only_while_locked": _coerce_bool,
         "request_timeout_seconds": _coerce_int,
         "activity_segment_min_duration_seconds": _coerce_float,
         "activity_segment_max_duration_seconds": _coerce_float,

@@ -203,6 +203,7 @@ class MonitoringServices:
             embedding_client.base_url = self.config.semantic_embedding_base_url.rstrip("/")
             embedding_client.model = self.config.semantic_embedding_model
         self.summarizer.update_max_parallel_jobs(self.config.max_parallel_summary_jobs)
+        self.summarizer.set_process_backlog_only_while_locked(self.config.process_backlog_only_while_locked)
         self.scheduler.interval_seconds = max(30, self.config.flush_interval_seconds)
         self.flush_coordinator.flush_interval_seconds = max(30, self.config.flush_interval_seconds)
 

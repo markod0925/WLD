@@ -49,6 +49,7 @@ EXPOSURE_BY_KEY: dict[str, ExposureLevel] = {
     "max_screenshots_per_summary": "advanced",
     "max_text_segments_per_summary": "advanced",
     "max_parallel_summary_jobs": "advanced",
+    "process_backlog_only_while_locked": "advanced",
     "request_timeout_seconds": "advanced",
     "activity_segment_min_duration_seconds": "debug",
     "activity_segment_max_duration_seconds": "debug",
@@ -558,6 +559,18 @@ EXPOSED_SETTINGS: tuple[SettingUiMetadata, ...] = (
         widget="int",
         min_value=1,
         max_value=8,
+    ),
+    _setting(
+        key="process_backlog_only_while_locked",
+        label="Start summary jobs only while locked:",
+        tooltip=(
+            "Description: Gate starting new LM Studio summary jobs until the Windows session is locked.\n"
+            "Impact: Reduces interactive CPU/GPU load while actively using the PC; capture/storage stay unaffected.\n"
+            "Behavior: Running jobs are never cancelled on unlock; only new job starts are paused.\n"
+            f"Default: {DEFAULTS['process_backlog_only_while_locked']}."
+        ),
+        exposure="advanced",
+        widget="bool",
     ),
     _setting(
         key="semantic_min_cosine_similarity",

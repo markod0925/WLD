@@ -173,6 +173,7 @@ class ServiceRegistry:
             batch_builder=batch_builder,
             lm_client=lmstudio_client,
             max_parallel_jobs=self.config.max_parallel_summary_jobs,
+            process_backlog_only_while_locked=self.config.process_backlog_only_while_locked,
             error_notifier=error_notifier,
             shutdown_event=shutdown_event,
             summary_deduplicator=summary_deduplicator,
@@ -299,6 +300,7 @@ class MonitoringLifecycleManager:
             self._paused_by_lock = True
             should_log_pause = self._monitoring_requested and not self._manual_pause and not was_paused_by_lock
         self._apply_effective_monitoring_state()
+        self.services.summarizer.handle_session_lock_state_change(True)
         if should_log_pause:
             self.logger.info("event=monitoring_paused_by_lock")
 
@@ -308,6 +310,7 @@ class MonitoringLifecycleManager:
             self._paused_by_lock = False
             should_log_resume = was_paused_by_lock and self._monitoring_requested and not self._manual_pause
         active = self._apply_effective_monitoring_state()
+        self.services.summarizer.handle_session_lock_state_change(False)
         if should_log_resume and active:
             self.logger.info("event=monitoring_resumed_after_unlock")
 
@@ -470,6 +473,23 @@ class FlushCoordinator:
                     stop_reason = "error"
                     break
 
+                if (
+                    reason == "scheduled"
+                    and bool(runtime["summary_admission_paused"])
+                    and int(runtime["running_jobs"]) == 0
+                ):
+                    self.logger.info(
+                        (
+                            "event=summary_drain_stopped reason=scheduled_admission_paused queued=%s "
+                            "running=%s pending_summary_jobs=%s"
+                        ),
+                        runtime["queued_jobs"],
+                        runtime["running_jobs"],
+                        runtime["pending_summary_jobs"],
+                    )
+                    stop_reason = "paused"
+                    break
+
                 backlog_remaining = _has_pending_backlog(pending)
                 if not backlog_remaining and int(runtime["pending_summary_jobs"]) == 0:
                     stop_reason = "empty"
@@ -574,6 +594,7 @@ class DiagnosticsService:
             "llm_queue_running": int(runtime["llm_queue_running_jobs"]) > 0,
             "flush_drain_active": bool(drain["drain_active"]),
             "unrecoverable_summary_error": runtime["unrecoverable_error"],
+            "summary_admission_paused": bool(runtime["summary_admission_paused"]),
         }
 
     def get_diagnostics_snapshot(self) -> dict:
@@ -610,6 +631,7 @@ class DiagnosticsService:
         buffer_state = _synthesize_buffer_state(
             pending_counts=pending,
             running_jobs=int(summary_runtime["running_jobs"]),
+            summary_admission_paused=bool(summary_runtime["summary_admission_paused"]),
         )
         approx_batches_remaining = _estimate_remaining_batches(
             pending_counts=pending,
@@ -654,6 +676,9 @@ class DiagnosticsService:
             "approx_remaining_batches": approx_batches_remaining,
             "max_parallel_summary_jobs": int(summary_runtime["max_parallel_summary_jobs"]),
             "unrecoverable_summary_error": summary_runtime["unrecoverable_error"],
+            "summary_admission_paused": bool(summary_runtime["summary_admission_paused"]),
+            "process_backlog_only_while_locked": bool(summary_runtime["process_backlog_only_while_locked"]),
+            "session_locked": summary_runtime["session_locked"],
         }
 
 
@@ -667,12 +692,19 @@ def _has_pending_backlog(pending_counts: dict[str, int]) -> bool:
     )
 
 
-def _synthesize_buffer_state(pending_counts: dict[str, int], running_jobs: int) -> str:
+def _synthesize_buffer_state(
+    pending_counts: dict[str, int],
+    running_jobs: int,
+    *,
+    summary_admission_paused: bool,
+) -> str:
     has_backlog = _has_pending_backlog(pending_counts)
     if running_jobs > 0:
         if has_backlog:
             return "Summarizing, backlog remaining"
         return "Summarizing"
+    if has_backlog and summary_admission_paused:
+        return "Backlog waiting for PC lock"
     if has_backlog:
         return "Buffer pending"
     return "Buffer empty"

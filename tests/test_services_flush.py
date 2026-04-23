@@ -152,3 +152,57 @@ def test_flush_now_runs_full_pipeline_on_real_sqlite(tmp_path: Path) -> None:
         assert not shot_path.exists()
     finally:
         services.shutdown()
+
+
+def test_manual_flush_bypasses_lock_gate_when_unlocked(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path, process_backlog_only_while_locked=True))
+    services.summarizer.lm_client = SuccessfulClient()
+    try:
+        services.handle_session_unlocked()
+        services.storage.insert_text_segments(
+            [
+                TextSegment(
+                    id=None,
+                    start_ts=1.0,
+                    end_ts=1.1,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="manual",
+                    hotkeys=[],
+                    raw_key_count=1,
+                )
+            ]
+        )
+        result = services.flush_now(reason="manual")
+        assert result is not None
+        assert result.summaries_created == 1
+    finally:
+        services.shutdown()
+
+
+def test_scheduled_flush_stops_when_admission_paused(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path, process_backlog_only_while_locked=True))
+    services.summarizer.lm_client = SuccessfulClient()
+    try:
+        services.handle_session_unlocked()
+        services.storage.insert_text_segments(
+            [
+                TextSegment(
+                    id=None,
+                    start_ts=1.0,
+                    end_ts=1.1,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="scheduled",
+                    hotkeys=[],
+                    raw_key_count=1,
+                )
+            ]
+        )
+
+        result = services.flush_now(reason="scheduled")
+        assert result is not None
+        assert result.stop_reason == "paused"
+        assert services.storage.get_pending_counts()["text_segments"] == 1
+    finally:
+        services.shutdown()

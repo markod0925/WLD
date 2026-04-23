@@ -42,6 +42,7 @@ class Summarizer:
         shutdown_event: threading.Event | None = None,
         summary_deduplicator: SummaryDeduplicator | None = None,
         semantic_coalescer: SemanticCoalescer | None = None,
+        process_backlog_only_while_locked: bool = True,
     ) -> None:
         self.storage = storage
         self.batch_builder = batch_builder
@@ -63,6 +64,9 @@ class Summarizer:
         self._stop_event = threading.Event()
         self._max_parallel_jobs = max(1, int(max_parallel_jobs))
         self._unrecoverable_error: str | None = None
+        self._process_backlog_only_while_locked = bool(process_backlog_only_while_locked)
+        self._session_locked: bool | None = None
+        self._admission_paused = False
 
         self._ensure_worker_count_locked()
 
@@ -93,6 +97,37 @@ class Summarizer:
                 self._retired_workers.extend(retired)
             self._ensure_worker_count_locked()
             self._condition.notify_all()
+
+    def set_process_backlog_only_while_locked(self, enabled: bool) -> None:
+        with self._condition:
+            self._process_backlog_only_while_locked = bool(enabled)
+            self._condition.notify_all()
+            paused_now = self._is_summary_admission_paused_locked()
+        if not paused_now and self._admission_paused:
+            self._admission_paused = False
+            self.logger.info("event=summary_admission_resumed reason=config_disabled")
+
+    def handle_session_lock_state_change(self, is_locked: bool) -> None:
+        with self._condition:
+            previous = self._session_locked
+            self._session_locked = bool(is_locked)
+            self._condition.notify_all()
+            paused_now = self._is_summary_admission_paused_locked()
+
+        if not self._process_backlog_only_while_locked:
+            return
+        if is_locked:
+            if self._admission_paused:
+                self._admission_paused = False
+                self.logger.info("event=summary_admission_resumed reason=pc_locked message=\"summary processing resumed because PC locked\"")
+            elif previous is False:
+                self.logger.info("event=summary_admission_state reason=pc_locked")
+        else:
+            if previous is True:
+                self.logger.info(
+                    "event=summary_admission_paused reason=pc_unlocked message=\"summary processing stopped admitting new jobs because PC unlocked\""
+                )
+                self._admission_paused = paused_now
 
     def clear_unrecoverable_error(self) -> None:
         with self._lock:
@@ -215,6 +250,8 @@ class Summarizer:
             running_jobs = len(self._running_jobs)
             max_parallel = self._max_parallel_jobs
             unrecoverable_error = self._unrecoverable_error
+            admission_paused = self._is_summary_admission_paused_locked()
+            session_locked = self._session_locked
 
         try:
             persisted_counts = self.storage.get_summary_job_status_counts()
@@ -240,6 +277,9 @@ class Summarizer:
             "llm_queue_accepting_jobs": bool(llm_queue["accepting_jobs"]),
             "llm_queue_closing": bool(llm_queue["closing"]),
             "llm_queue_closed": bool(llm_queue["closed"]),
+            "summary_admission_paused": admission_paused,
+            "process_backlog_only_while_locked": self._process_backlog_only_while_locked,
+            "session_locked": session_locked,
         }
 
     def flush_pending(self, reason: str = "manual", *, force_flush: bool = False) -> int | None:
@@ -585,13 +625,20 @@ class Summarizer:
                     not self._stop_event.is_set()
                     and not self._shutdown_event.is_set()
                     and not worker_stop_event.is_set()
-                    and not self._queue
+                    and (
+                        not self._queue
+                        or self._next_startable_index_locked() is None
+                    )
                 ):
+                    if self._queue and self._next_startable_index_locked() is None:
+                        self._log_admission_paused_once_locked()
                     self._condition.wait(timeout=0.5)
                 if self._stop_event.is_set() or self._shutdown_event.is_set() or worker_stop_event.is_set():
                     return
-                if self._queue:
-                    queued_job = self._queue.popleft()
+                startable_index = self._next_startable_index_locked()
+                if startable_index is not None:
+                    queued_job = self._queue[startable_index]
+                    del self._queue[startable_index]
                     self._running_jobs.add(queued_job.job_id)
                     input_chars = sum(len(segment.text) for segment in queued_job.batch.text_segments)
                     self.logger.info(
@@ -619,6 +666,36 @@ class Summarizer:
 
             if worker_stop_event.is_set():
                 return
+
+    def _next_startable_index_locked(self) -> int | None:
+        for index, queued_job in enumerate(self._queue):
+            if self._can_start_summary_job_now_locked(reason=queued_job.reason):
+                return index
+        return None
+
+    def _can_start_summary_job_now_locked(self, *, reason: str) -> bool:
+        if reason in {"manual", "summary-window"}:
+            return True
+        if not self._process_backlog_only_while_locked:
+            return True
+        if self._session_locked is None:
+            return True
+        return self._session_locked
+
+    def _is_summary_admission_paused_locked(self) -> bool:
+        if not self._process_backlog_only_while_locked:
+            return False
+        if self._session_locked is None:
+            return False
+        return not self._session_locked
+
+    def _log_admission_paused_once_locked(self) -> None:
+        if self._admission_paused:
+            return
+        self._admission_paused = True
+        self.logger.info(
+            "event=summary_admission_paused reason=pc_unlocked message=\"summary processing paused until PC lock\""
+        )
 
     def _run_summary_job(
         self,
