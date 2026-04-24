@@ -274,6 +274,35 @@ def test_shutdown_continues_after_teardown_error_and_keeps_worker_barrier() -> N
     assert "storage_close" in order
 
 
+def test_shutdown_does_not_emit_storage_closed_when_close_fails(caplog) -> None:
+    services = MonitoringServices.__new__(MonitoringServices)
+    services._shutdown_completed = False
+    services.logger = logging.getLogger("test.services.storage-fail")
+    services._services = SimpleNamespace(shutdown_event=threading.Event())
+    services.cancel_flush_drain = lambda: None
+    services.scheduler = SimpleNamespace(stop=lambda: None)
+    services.summarizer = SimpleNamespace(
+        stop=lambda: None,
+        stop_accepting_new_jobs=lambda: None,
+        get_runtime_status=lambda: {},
+    )
+    services.window_tracker = SimpleNamespace(stop=lambda: None)
+    services.keyboard_capture = SimpleNamespace(stop=lambda: None)
+    services.text_service = SimpleNamespace(stop=lambda: None)
+    services.screenshot_capture = SimpleNamespace(stop=lambda: None)
+    services.session_monitor = None
+    services.storage = SimpleNamespace(close=lambda: (_ for _ in ()).throw(RuntimeError("close boom")))
+    services.crash_reporter = SimpleNamespace(mark_clean_exit=lambda: None)
+    caplog.set_level(logging.INFO)
+
+    try:
+        services.shutdown()
+    except RuntimeError:
+        pass
+
+    assert not any("event=storage_closed" in rec.message for rec in caplog.records)
+
+
 def test_hooks_capture_main_thread_thread_and_unraisable(tmp_path: Path, caplog, monkeypatch) -> None:
     monitor = _make_monitor(tmp_path)
     monitor.log_dir.mkdir(parents=True, exist_ok=True)

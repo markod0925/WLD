@@ -122,3 +122,18 @@ def test_log_audit_flags_shutdown_and_crash_regressions(tmp_path: Path) -> None:
     assert "shutdown_storage_ordering_violation" in anomaly_types
     assert "missing_summary_workers_joined" in anomaly_types
     assert "missing_crash_finalization_marker" in anomaly_types
+
+
+def test_log_audit_skips_session_monitor_missing_marker_when_inactive(tmp_path: Path) -> None:
+    log_path = _write_log(
+        tmp_path,
+        "no-monitor.log",
+        [
+            "2026-04-24 09:00:00 [INFO] svc: event=runtime_paths mode=dev",
+            "2026-04-24 09:00:01 [INFO] svc: event=shutdown_complete",
+        ],
+    )
+    out_dir = tmp_path / "out-inactive"
+    outputs = LogAuditRunner([log_path], out_dir).run()
+    anomaly_types = {item["type"] for item in outputs["anomalies"]}
+    assert "session_monitor_no_start_evidence" not in anomaly_types

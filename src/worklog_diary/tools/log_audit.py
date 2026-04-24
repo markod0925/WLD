@@ -1268,7 +1268,11 @@ class LogAuditRunner:
 
         monitor_started = any(item.get("event") == "session_monitor_started" for item in self.stats.major_timeline)
         monitor_failed = any(item.get("event") == "session_monitor_start_failed" for item in self.stats.major_timeline)
-        if not monitor_started and not monitor_failed:
+        monitor_activity_seen = (
+            self.stats.lock_audit["session_locked"] > 0
+            or self.stats.lock_audit["session_unlocked"] > 0
+        )
+        if monitor_activity_seen and not monitor_started and not monitor_failed:
             anomalies.append(
                 {
                     "type": "session_monitor_no_start_evidence",

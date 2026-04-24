@@ -308,8 +308,7 @@ class MonitoringServices:
             ("session_monitor_stop", lambda: self.session_monitor.stop() if self.session_monitor is not None else None),
             ("monitors_stopped_log", lambda: self.logger.info("event=monitors_stopped")),
             ("crash_finalize", lambda: self.crash_reporter.mark_clean_exit()),
-            ("storage_close", lambda: self.storage.close()),
-            ("storage_closed_log", lambda: self.logger.info("event=storage_closed")),
+            ("storage_close", lambda: self._close_storage_with_log()),
         ]
         for step_name, step in shutdown_steps:
             try:
@@ -326,6 +325,10 @@ class MonitoringServices:
         self.logger.info("event=shutdown_complete")
         if first_error is not None:
             raise first_error
+
+    def _close_storage_with_log(self) -> None:
+        self.storage.close()
+        self.logger.info("event=storage_closed")
 
 
 def _format_kv(data: dict[str, object]) -> str:
