@@ -144,6 +144,6 @@ def test_storage_roundtrip_persists_counts_across_reopen(tmp_path: Path) -> None
         assert diagnostics["table_counts"]["active_intervals"] == 1
         assert diagnostics["table_counts"]["text_segments"] == 1
         assert diagnostics["summary_jobs"]["running"] == 0
-        assert diagnostics["summary_jobs"]["failed"] == 1
+        assert diagnostics["summary_jobs"]["abandoned"] == 1
     finally:
         reopened.close()

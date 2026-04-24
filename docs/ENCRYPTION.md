@@ -71,6 +71,8 @@ The application treats the following as hard errors:
 
 Each case is logged and surfaced as a user-facing startup failure. There is no plaintext fallback.
 
+If `db_key.bin` is missing, restore the original file to the same folder as the database before starting WorkLog Diary again. Without that matching key file, the existing encrypted database is unreadable. If the key cannot be restored, the only recovery option is to delete the existing database and let WorkLog Diary create a new empty encrypted database; this permanently removes the stored diary data.
+
 ## Packaging And Development Notes
 
 Windows builds should include a SQLCipher-compatible Python binding. The project uses `sqlcipher3-binary` in the Python dependency list.
@@ -78,4 +80,3 @@ Windows builds should include a SQLCipher-compatible Python binding. The project
 PyInstaller builds should collect the SQLCipher package and any bundled native libraries so the frozen app does not depend on a system-wide SQLCipher installation.
 
 The project does not migrate legacy plaintext databases. If a pre-encryption database exists, it is treated as incompatible with this development branch.
-

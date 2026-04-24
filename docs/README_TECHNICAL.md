@@ -169,8 +169,9 @@ Important fields:
 - `foreground_poll_interval_seconds`
 - `flush_interval_seconds`
 - `max_parallel_summary_jobs`: concurrent summary worker limit (default `2`)
-- `max_text_segments_per_summary`
+- `max_text_segments_per_summary`: also derives per-summary text truncation (`max_text_chars = max_text_segments_per_summary * 5`)
 - `max_screenshots_per_summary`
+- `lmstudio_max_prompt_chars`: prompt budget used for chunking
 - `screenshot_dedup_enabled`
 - `screenshot_dedup_threshold`
 - `screenshot_min_keep_interval_seconds`

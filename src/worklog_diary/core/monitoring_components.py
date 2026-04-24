@@ -128,7 +128,10 @@ class ServiceRegistry:
             model=self.config.lmstudio_model,
             timeout_seconds=self.config.request_timeout_seconds,
             daily_timeout_seconds=max(self.config.request_timeout_seconds * 2, self.config.request_timeout_seconds),
-            prompt_builder=LMStudioPromptBuilder(max_prompt_chars=self.config.lmstudio_max_prompt_chars),
+            prompt_builder=LMStudioPromptBuilder(
+                max_summary_text_segments=self.config.max_text_segments_per_summary,
+                max_prompt_chars=self.config.lmstudio_max_prompt_chars,
+            ),
         )
         embedding_client = LMStudioEmbeddingClient(
             base_url=self.config.semantic_embedding_base_url,

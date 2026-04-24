@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from datetime import date
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -38,12 +39,25 @@ class FakeStorage:
     def list_summaries_for_day(self, day: date, limit: int = 1000) -> list[SummaryRecord]:
         return list(self._summaries) if day == self.day else []
 
+    def list_effective_summaries_for_day(self, day: date, *, use_coalesced: bool = False) -> list[SummaryRecord]:
+        return self.list_summaries_for_day(day)
+
     def get_daily_summary_for_day(self, day: date) -> DailySummaryRecord | None:
         return self._daily_summary if day == self.day else None
+
+    def list_semantic_merge_diagnostics(
+        self,
+        day: date,
+        *,
+        decision: str | None = None,
+        limit: int = 1000,
+    ) -> list[object]:
+        return []
 
 
 class FakeServices:
     def __init__(self, storage: FakeStorage) -> None:
+        self.config = SimpleNamespace(semantic_coalescing_enabled=False)
         self.storage = storage
         self.started = threading.Event()
         self.release = threading.Event()

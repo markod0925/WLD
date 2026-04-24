@@ -8,6 +8,7 @@ import time
 
 from .app import create_services, run_desktop_app
 from .core.crash_reporting import run_protected
+from .core.startup_errors import ENCRYPTED_DATABASE_STARTUP_ERRORS
 
 
 
@@ -23,7 +24,15 @@ def main() -> int:
         if not args.headless:
             return run_desktop_app(config_path=args.config_path)
 
-        services = create_services(config_path=args.config_path)
+        try:
+            services = create_services(config_path=args.config_path)
+        except ENCRYPTED_DATABASE_STARTUP_ERRORS as exc:
+            logger.error(
+                "event=startup_failed status=user_recoverable error_type=%s error=%s",
+                exc.__class__.__name__,
+                exc,
+            )
+            return 1
         services.start_monitoring()
 
         stop_requested = False

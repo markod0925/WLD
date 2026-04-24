@@ -264,8 +264,8 @@ EXPOSED_SETTINGS: tuple[SettingUiMetadata, ...] = (
         label="Max text segments per summary:",
         tooltip=(
             "Description: Maximum reconstructed text segments included in a single summary batch.\n"
-            "Impact: Higher values improve context but increase latency and token pressure.\n"
-            "Range: Keep high enough to avoid truncating busy sessions.\n"
+            "Impact: Higher values improve context, increase token pressure, and raise the per-summary text character cap.\n"
+            "Range: The per-summary text character cap is five times this value.\n"
             f"Default: {DEFAULTS['max_text_segments_per_summary']}."
         ),
         exposure="advanced",
@@ -344,7 +344,7 @@ EXPOSED_SETTINGS: tuple[SettingUiMetadata, ...] = (
         label="LM max prompt chars:",
         tooltip=(
             "Description: Hard cap for prompt size before LM requests are sent.\n"
-            "Impact: Lower values trim context; higher values can increase latency or model failures.\n"
+            "Impact: Lower values split daily recap work into more chunks; higher values can increase latency or model failures.\n"
             "Experimental: Primarily for live tuning while refining prompt construction.\n"
             f"Default: {DEFAULTS['lmstudio_max_prompt_chars']}."
         ),

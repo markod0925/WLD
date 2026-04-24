@@ -26,6 +26,7 @@ from .monitoring_components import (
 )
 from .summary_dedup import SummaryDeduplicator
 from .semantic_coalescing import SemanticCoalescingConfig
+from .startup_errors import ENCRYPTED_DATABASE_STARTUP_ERRORS
 from .. import __version__
 
 
@@ -56,7 +57,11 @@ class MonitoringServices:
         self.crash_reporter.install(app_version=__version__)
 
         self.registry = ServiceRegistry(self.config)
-        self._services: MonitoringServiceBundle = self.registry.build_bundle()
+        try:
+            self._services: MonitoringServiceBundle = self.registry.build_bundle()
+        except ENCRYPTED_DATABASE_STARTUP_ERRORS:
+            self.crash_reporter.mark_clean_exit()
+            raise
 
         self.state = self._services.state
         self.storage = self._services.storage
@@ -183,6 +188,9 @@ class MonitoringServices:
                 self.config.request_timeout_seconds,
             )
             self.lmstudio_client.prompt_builder.max_prompt_chars = self.config.lmstudio_max_prompt_chars
+            max_summary_text_segments = max(1, int(self.config.max_text_segments_per_summary))
+            self.lmstudio_client.prompt_builder.max_summary_text_segments = max_summary_text_segments
+            self.lmstudio_client.prompt_builder.max_text_chars = max_summary_text_segments * 5
             self.summarizer.summary_deduplicator = SummaryDeduplicator(
                 suppress_threshold=self.config.summary_similarity_suppress_threshold,
                 merge_threshold=self.config.summary_similarity_merge_threshold,

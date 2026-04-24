@@ -210,6 +210,14 @@ def test_prompt_builder_limits_daily_recap_prompt_budget() -> None:
     assert result.metadata["max_prompt_chars"] == 2000
 
 
+def test_prompt_builder_derives_text_char_limit_from_text_segment_budget() -> None:
+    default_builder = LMStudioPromptBuilder(max_summary_text_segments=400)
+    smaller_builder = LMStudioPromptBuilder(max_summary_text_segments=100)
+
+    assert default_builder.max_text_chars == 2000
+    assert smaller_builder.max_text_chars == 500
+
+
 def test_lmstudio_client_daily_recap_splits_large_input_into_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     builder = LMStudioPromptBuilder(max_text_chars=500, max_prompt_chars=1800, max_daily_summaries=50)
     client = LMStudioClient(
