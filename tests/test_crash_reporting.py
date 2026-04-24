@@ -195,8 +195,13 @@ def test_services_shutdown_attempts_clean_mark_even_if_teardown_raises() -> None
     services.logger = logging.getLogger("test.services.shutdown")
     services._services = SimpleNamespace(shutdown_event=threading.Event())
     services.cancel_flush_drain = lambda: False
-    services.stop_monitoring = lambda: (_ for _ in ()).throw(RuntimeError("stop failed"))
-    services.summarizer = SimpleNamespace(stop=lambda: None)
+    services.scheduler = SimpleNamespace(stop=lambda: (_ for _ in ()).throw(RuntimeError("stop failed")))
+    services.summarizer = SimpleNamespace(stop=lambda: None, stop_accepting_new_jobs=lambda: None, get_runtime_status=lambda: {})
+    services.window_tracker = SimpleNamespace(stop=lambda: None)
+    services.keyboard_capture = SimpleNamespace(stop=lambda: None)
+    services.text_service = SimpleNamespace(stop=lambda: None)
+    services.screenshot_capture = SimpleNamespace(stop=lambda: None)
+    services.session_monitor = None
     services.storage = SimpleNamespace(close=lambda: None)
     calls: list[str] = []
     services.crash_reporter = SimpleNamespace(mark_clean_exit=lambda: calls.append("marked"))
@@ -209,6 +214,93 @@ def test_services_shutdown_attempts_clean_mark_even_if_teardown_raises() -> None
         raise AssertionError("shutdown should surface teardown failure")
 
     assert calls == ["marked"]
+
+
+def test_services_shutdown_closes_storage_after_summary_stop() -> None:
+    services = MonitoringServices.__new__(MonitoringServices)
+    services._shutdown_completed = False
+    services.logger = logging.getLogger("test.services.order")
+    services._services = SimpleNamespace(shutdown_event=threading.Event())
+    order: list[str] = []
+    services.cancel_flush_drain = lambda: order.append("cancel_drain")
+    services.scheduler = SimpleNamespace(stop=lambda: order.append("scheduler_stop"))
+    services.summarizer = SimpleNamespace(
+        stop=lambda: order.append("summarizer_stop"),
+        stop_accepting_new_jobs=lambda: order.append("stop_accepting"),
+        get_runtime_status=lambda: {},
+    )
+    services.window_tracker = SimpleNamespace(stop=lambda: order.append("window_stop"))
+    services.keyboard_capture = SimpleNamespace(stop=lambda: order.append("keyboard_stop"))
+    services.text_service = SimpleNamespace(stop=lambda: order.append("text_stop"))
+    services.screenshot_capture = SimpleNamespace(stop=lambda: order.append("screenshot_stop"))
+    services.session_monitor = None
+    services.storage = SimpleNamespace(close=lambda: order.append("storage_close"))
+    services.crash_reporter = SimpleNamespace(mark_clean_exit=lambda: order.append("mark_clean_exit"))
+
+    services.shutdown()
+
+    assert order.index("summarizer_stop") < order.index("storage_close")
+    assert order.index("mark_clean_exit") < order.index("storage_close")
+
+
+def test_shutdown_continues_after_teardown_error_and_keeps_worker_barrier() -> None:
+    services = MonitoringServices.__new__(MonitoringServices)
+    services._shutdown_completed = False
+    services.logger = logging.getLogger("test.services.shutdown-barrier")
+    services._services = SimpleNamespace(shutdown_event=threading.Event())
+    order: list[str] = []
+    services.cancel_flush_drain = lambda: order.append("cancel_drain")
+    services.scheduler = SimpleNamespace(stop=lambda: order.append("scheduler_stop"))
+    services.summarizer = SimpleNamespace(
+        stop=lambda: order.append("summarizer_stop"),
+        stop_accepting_new_jobs=lambda: order.append("stop_accepting"),
+        get_runtime_status=lambda: {"running_jobs": 0, "queued_jobs": 0, "completed_jobs": 0, "failed_jobs": 0, "cancelled_jobs": 0},
+    )
+    services.window_tracker = SimpleNamespace(stop=lambda: (_ for _ in ()).throw(RuntimeError("window stop failed")))
+    services.keyboard_capture = SimpleNamespace(stop=lambda: order.append("keyboard_stop"))
+    services.text_service = SimpleNamespace(stop=lambda: order.append("text_stop"))
+    services.screenshot_capture = SimpleNamespace(stop=lambda: order.append("screenshot_stop"))
+    services.session_monitor = None
+    services.storage = SimpleNamespace(close=lambda: order.append("storage_close"))
+    services.crash_reporter = SimpleNamespace(mark_clean_exit=lambda: order.append("mark_clean_exit"))
+
+    try:
+        services.shutdown()
+    except RuntimeError:
+        pass
+
+    assert "summarizer_stop" in order
+    assert "mark_clean_exit" in order
+    assert "storage_close" in order
+
+
+def test_shutdown_does_not_emit_storage_closed_when_close_fails(caplog) -> None:
+    services = MonitoringServices.__new__(MonitoringServices)
+    services._shutdown_completed = False
+    services.logger = logging.getLogger("test.services.storage-fail")
+    services._services = SimpleNamespace(shutdown_event=threading.Event())
+    services.cancel_flush_drain = lambda: None
+    services.scheduler = SimpleNamespace(stop=lambda: None)
+    services.summarizer = SimpleNamespace(
+        stop=lambda: None,
+        stop_accepting_new_jobs=lambda: None,
+        get_runtime_status=lambda: {},
+    )
+    services.window_tracker = SimpleNamespace(stop=lambda: None)
+    services.keyboard_capture = SimpleNamespace(stop=lambda: None)
+    services.text_service = SimpleNamespace(stop=lambda: None)
+    services.screenshot_capture = SimpleNamespace(stop=lambda: None)
+    services.session_monitor = None
+    services.storage = SimpleNamespace(close=lambda: (_ for _ in ()).throw(RuntimeError("close boom")))
+    services.crash_reporter = SimpleNamespace(mark_clean_exit=lambda: None)
+    caplog.set_level(logging.INFO)
+
+    try:
+        services.shutdown()
+    except RuntimeError:
+        pass
+
+    assert not any("event=storage_closed" in rec.message for rec in caplog.records)
 
 
 def test_hooks_capture_main_thread_thread_and_unraisable(tmp_path: Path, caplog, monkeypatch) -> None:

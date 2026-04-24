@@ -15,6 +15,21 @@ CONFIG_VERSION = 5
 
 _LOGGER = logging.getLogger(__name__)
 
+SAFE_CONFIG_KEYS: tuple[str, ...] = (
+    "app_data_dir",
+    "screenshot_dir",
+    "db_path",
+    "lmstudio_base_url",
+    "lmstudio_model",
+    "screenshot_interval_seconds",
+    "flush_interval_seconds",
+    "blocked_processes",
+    "process_backlog_only_while_locked",
+    "max_parallel_summary_jobs",
+    "request_timeout_seconds",
+    "capture_mode",
+)
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -162,6 +177,21 @@ class AppConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def safe_config_snapshot(config: AppConfig) -> dict[str, Any]:
+    data = config.to_dict()
+    return {key: data.get(key) for key in SAFE_CONFIG_KEYS}
+
+
+def safe_config_diff(previous: AppConfig, current: AppConfig) -> dict[str, tuple[Any, Any]]:
+    before = safe_config_snapshot(previous)
+    after = safe_config_snapshot(current)
+    changes: dict[str, tuple[Any, Any]] = {}
+    for key in SAFE_CONFIG_KEYS:
+        if before.get(key) != after.get(key):
+            changes[key] = (before.get(key), after.get(key))
+    return changes
 
 
 def _config_field_names() -> set[str]:

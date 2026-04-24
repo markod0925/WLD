@@ -103,3 +103,37 @@ def test_normalize_signature_masks_volatile_values() -> None:
     assert "<path>" in signature
     assert "42" not in signature
     assert "3.25" not in signature
+
+
+def test_log_audit_flags_shutdown_and_crash_regressions(tmp_path: Path) -> None:
+    log_path = _write_log(
+        tmp_path,
+        "regression.log",
+        [
+            "2026-04-24 12:00:00 [INFO] svc: event=shutdown_start",
+            "2026-04-24 12:00:01 [INFO] svc: event=storage_closed",
+            "2026-04-24 12:00:02 [INFO] svc: event=summary_flush_triggered reason=scheduled",
+            "2026-04-24 12:00:03 [INFO] svc: event=shutdown_complete",
+        ],
+    )
+    out_dir = tmp_path / "out"
+    outputs = LogAuditRunner([log_path], out_dir).run()
+    anomaly_types = {item["type"] for item in outputs["anomalies"]}
+    assert "shutdown_storage_ordering_violation" in anomaly_types
+    assert "missing_summary_workers_joined" in anomaly_types
+    assert "missing_crash_finalization_marker" in anomaly_types
+
+
+def test_log_audit_skips_session_monitor_missing_marker_when_inactive(tmp_path: Path) -> None:
+    log_path = _write_log(
+        tmp_path,
+        "no-monitor.log",
+        [
+            "2026-04-24 09:00:00 [INFO] svc: event=runtime_paths mode=dev",
+            "2026-04-24 09:00:01 [INFO] svc: event=shutdown_complete",
+        ],
+    )
+    out_dir = tmp_path / "out-inactive"
+    outputs = LogAuditRunner([log_path], out_dir).run()
+    anomaly_types = {item["type"] for item in outputs["anomalies"]}
+    assert "session_monitor_no_start_evidence" not in anomaly_types

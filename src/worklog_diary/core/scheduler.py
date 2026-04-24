@@ -47,6 +47,9 @@ class FlushScheduler:
             self.state.set_flush_times(last_flush_ts=self.state.snapshot().last_flush_ts, next_flush_ts=next_run)
 
             if now >= next_run:
+                if self._stop_event.is_set() or self._shutdown_event.is_set():
+                    self.logger.info("event=summary_flush_skipped reason=late_scheduler_callback request_reason=scheduled")
+                    break
                 try:
                     self.logger.info("event=summary_flush_triggered reason=scheduled")
                     self.flush_callback("scheduled")

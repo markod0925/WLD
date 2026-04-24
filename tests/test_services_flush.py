@@ -206,3 +206,14 @@ def test_scheduled_flush_stops_when_admission_paused(tmp_path: Path) -> None:
         assert services.storage.get_pending_counts()["text_segments"] == 1
     finally:
         services.shutdown()
+
+
+def test_late_scheduler_callback_after_shutdown_is_ignored(tmp_path: Path, caplog) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    try:
+        caplog.set_level("INFO")
+        services.shutdown()
+        assert services.flush_now(reason="scheduled") is None
+        assert any("event=summary_flush_skipped reason=shutdown_in_progress" in rec.message for rec in caplog.records)
+    finally:
+        pass
