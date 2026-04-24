@@ -48,8 +48,9 @@ class MonitoringServices:
             self.config.db_path,
             self.config.config_path,
         )
+        self.logger.info("event=config_loaded path=%s", self.config.config_path)
+        self.logger.info("event=config_snapshot %s", _format_kv(safe_config_snapshot(self.config)))
         self.logger.info("event=runtime_paths_source source=%s", app_data_dir_source())
-        self.logger.info("event=config_snapshot_startup %s", _format_kv(safe_config_snapshot(self.config)))
 
         self.crash_reporter = CrashMonitor(self.config.app_data_dir, self.config.log_dir, self.logger)
         self.crash_reporter.install(app_version=__version__)
@@ -223,6 +224,7 @@ class MonitoringServices:
             if was_monitoring_requested:
                 self.start_monitoring()
             self.logger.info("event=config_apply_complete changed_count=%s", len(changes))
+            self.logger.info("event=config_snapshot %s", _format_kv(safe_config_snapshot(self.config)))
         except Exception as exc:
             self.logger.exception(
                 "event=config_apply_failed error_type=%s error=%s",
@@ -291,7 +293,14 @@ class MonitoringServices:
             return
         self._shutdown_completed = True
         first_error: Exception | None = None
-        self.logger.info("event=shutdown_start")
+        session_id = getattr(self.crash_reporter, "session_id", None)
+        if session_id is not None:
+            self.logger.info("event=shutdown_start session_id=%s", session_id)
+        else:
+            self.logger.info("event=shutdown_start")
+        mark_shutdown_start = getattr(self.crash_reporter, "mark_shutdown_start", None)
+        if callable(mark_shutdown_start):
+            mark_shutdown_start()
         self._services.shutdown_event.set()
         shutdown_steps: list[tuple[str, Callable[[], None]]] = [
             ("summary_admission_stop", lambda: self.summarizer.stop_accepting_new_jobs()),

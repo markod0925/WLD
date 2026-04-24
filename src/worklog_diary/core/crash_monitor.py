@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -20,6 +21,10 @@ SESSION_STATE_SCHEMA_VERSION = 1
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _local_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _flush_logging_handlers() -> None:
@@ -75,6 +80,8 @@ class CrashMonitor:
 
         self._session_id = str(uuid4())
         self._started_at_utc = _utc_now()
+        self._started_at_local = _local_now()
+        self._app_version = "unknown"
 
         self._original_sys_excepthook = sys.excepthook
         self._original_threading_excepthook = threading.excepthook
@@ -83,6 +90,7 @@ class CrashMonitor:
     def install(self, *, app_version: str | None = None) -> None:
         if self._installed:
             return
+        self._app_version = app_version or "unknown"
 
         try:
             self.app_data_dir.mkdir(parents=True, exist_ok=True)
@@ -106,6 +114,11 @@ class CrashMonitor:
             "session_state_initialize",
             lambda: self._initialize_session_state(app_version=app_version),
         )
+        self.logger.info(
+            "event=crash_monitor_session_start session_id=%s faulthandler_path=%s",
+            self._session_id,
+            self.faulthandler_path,
+        )
         self._run_install_stage("faulthandler_enable", self._enable_faulthandler)
         self._run_install_stage("exception_hooks_install", self._install_exception_hooks)
         self._run_install_stage("heartbeat_start", self._start_heartbeat)
@@ -119,7 +132,8 @@ class CrashMonitor:
             if self._session_finalized:
                 return
             self._session_finalizing = True
-        self.logger.info("event=crash_monitor_finalize_start")
+        self.logger.info("event=crash_monitor_finalize_start session_id=%s", self._session_id)
+        self._append_faulthandler_marker("crash_monitor_finalize_start")
 
         self._stop_heartbeat()
         try:
@@ -135,6 +149,7 @@ class CrashMonitor:
                 }
             )
             self._write_session_state(state)
+            self._append_faulthandler_finalization_marker()
             self.logger.info("event=crash_monitor_session_finalized session_id=%s", state.get("session_id"))
             with self._session_lock:
                 self._session_finalized = True
@@ -147,6 +162,13 @@ class CrashMonitor:
 
     def mark_clean_exit(self) -> None:
         self.finalize_clean_shutdown()
+
+    def mark_shutdown_start(self) -> None:
+        self._append_faulthandler_marker("shutdown_start")
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
 
     def _install_exception_hooks(self) -> None:
         def _main_thread_hook(
@@ -280,16 +302,15 @@ class CrashMonitor:
             return
 
     def _enable_faulthandler(self) -> None:
-        try:
-            self._fault_stream = self.faulthandler_path.open("a", encoding="utf-8", buffering=1)
-            faulthandler.enable(file=self._fault_stream, all_threads=True)
-            self.logger.info("event=faulthandler_enabled path=%s", self.faulthandler_path)
-        except Exception as exc:
-            self.logger.warning(
-                "event=faulthandler_enable_failed error_type=%s error=%s",
-                exc.__class__.__name__,
-                exc,
-            )
+        self._fault_stream = self.faulthandler_path.open("a", encoding="utf-8", buffering=1)
+        self._write_faulthandler_header()
+        faulthandler.enable(file=self._fault_stream, all_threads=True)
+        self._append_faulthandler_marker("faulthandler_enabled")
+        self.logger.info(
+            "event=crash_monitor_faulthandler_enabled session_id=%s path=%s",
+            self._session_id,
+            self.faulthandler_path,
+        )
 
     def _log_previous_unclean_shutdown_if_present(self) -> None:
         state = self._load_session_state()
@@ -319,6 +340,7 @@ class CrashMonitor:
             "app_version": app_version,
             "pid": os.getpid(),
             "started_at_utc": self._started_at_utc,
+            "started_at_local": self._started_at_local,
             "last_heartbeat_utc": self._started_at_utc,
             "clean_shutdown": False,
             "exit_reason": "unknown",
@@ -411,6 +433,45 @@ class CrashMonitor:
                 os.close(dir_fd)
             except Exception:
                 return
+
+    def _fault_stream_handle(self) -> Any | None:
+        if self._fault_stream is not None:
+            return self._fault_stream
+        try:
+            self._fault_stream = self.faulthandler_path.open("a", encoding="utf-8", buffering=1)
+            return self._fault_stream
+        except Exception:
+            return None
+
+    def _write_fault_line(self, line: str) -> None:
+        handle = self._fault_stream_handle()
+        if handle is None:
+            return
+        try:
+            handle.write(f"{line}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except Exception:
+            return
+
+    def _write_faulthandler_header(self) -> None:
+        header_lines = [
+            "# WorkLog Diary faulthandler log",
+            f"# session_id={self._session_id}",
+            f"# process_start_utc={self._started_at_utc}",
+            f"# process_start_local={self._started_at_local}",
+            f"# pid={os.getpid()}",
+            f"# app_version={self._app_version}",
+        ]
+        for line in header_lines:
+            self._write_fault_line(line)
+
+    def _append_faulthandler_marker(self, event: str) -> None:
+        self._write_fault_line(f"# marker_utc={_utc_now()} event={event} session_id={self._session_id}")
+
+    def _append_faulthandler_finalization_marker(self) -> None:
+        self._write_fault_line(f"# clean_finalization_utc={_utc_now()} session_id={self._session_id}")
+        self._write_fault_line(f"# clean_finalization_local={_local_now()} session_id={self._session_id}")
 
 
 

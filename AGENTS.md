@@ -14,3 +14,14 @@ Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bas
 - The index auto-builds on first use — no manual indexing step needed. Queries auto-refresh incrementally.
 - All commands support `--json` for structured output.
 - Always add `--db .\.cymbal\index.db` for compatibility with Codex
+
+## Test Execution (WSL)
+
+When running tests under WSL, do not call `pytest` directly.
+
+WSL + Windows-mounted temp directories (e.g. `/mnt/c/.../Temp`) can break pytest fd capture teardown, causing FileNotFoundError during shutdown.
+
+Use:
+
+```bash
+tools/run_tests.sh

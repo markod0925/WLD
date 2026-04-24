@@ -76,6 +76,12 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+## Test runner note
+
+When running the test suite from WSL against a checkout that lives on a Windows-mounted path such as `/mnt/c/...`, Python and pytest can place fd-capture temp files under the Windows temp directory. Those files can disappear before pytest teardown finishes, which breaks normal capture with `FileNotFoundError`.
+
+Use [`tools/run_tests.sh`](../tools/run_tests.sh) for local test runs. It exports `TMPDIR=/tmp`, `TEMP=/tmp`, and `TMP=/tmp` before invoking pytest so capture uses a local Linux temp directory.
+
 ## Run
 
 Tray app:

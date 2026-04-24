@@ -9,3 +9,5 @@ __pycache__/
 ..cymbalindex.db
 /analysis
 /logs
+.cymbal/index.db-shm
+.cymbal/index.db-wal

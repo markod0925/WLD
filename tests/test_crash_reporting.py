@@ -55,6 +55,51 @@ def test_clean_shutdown_marks_session_state(tmp_path: Path) -> None:
     assert int(state["pid"]) == os.getpid()
 
 
+def test_install_writes_faulthandler_header_and_session_logs(tmp_path: Path, caplog) -> None:
+    monitor = _make_monitor(tmp_path)
+    caplog.set_level(logging.INFO)
+
+    monitor.install(app_version="0.1.0")
+
+    lines = monitor.faulthandler_path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "# WorkLog Diary faulthandler log"
+    assert any(line == f"# session_id={monitor.session_id}" for line in lines)
+    assert any(line.startswith("# process_start_utc=") for line in lines)
+    assert any(line.startswith("# process_start_local=") for line in lines)
+    assert any(line == f"# pid={os.getpid()}" for line in lines)
+    assert any(line == "# app_version=0.1.0" for line in lines)
+    assert any("event=crash_monitor_session_start session_id=" in r.message for r in caplog.records)
+    assert any("event=crash_monitor_faulthandler_enabled session_id=" in r.message for r in caplog.records)
+
+
+def test_finalize_appends_clean_finalization_marker(tmp_path: Path, caplog) -> None:
+    monitor = _make_monitor(tmp_path)
+    caplog.set_level(logging.INFO)
+    monitor.install(app_version="0.1.0")
+
+    monitor.finalize_clean_shutdown()
+
+    lines = monitor.faulthandler_path.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith("# marker_utc=") and "event=crash_monitor_finalize_start" in line for line in lines)
+    assert any(line.startswith("# clean_finalization_utc=") and f"session_id={monitor.session_id}" in line for line in lines)
+    assert any(line.startswith("# clean_finalization_local=") and f"session_id={monitor.session_id}" in line for line in lines)
+    assert any("event=crash_monitor_session_finalized session_id=" in rec.message for rec in caplog.records)
+
+
+def test_previous_crash_evidence_is_preserved(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    monitor.log_dir.mkdir(parents=True, exist_ok=True)
+    monitor.faulthandler_path.write_text("legacy crash evidence\nlegacy frame\n", encoding="utf-8")
+
+    monitor.install(app_version="0.1.0")
+
+    lines = monitor.faulthandler_path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "legacy crash evidence"
+    assert "legacy frame" in lines
+    assert any(line == "# WorkLog Diary faulthandler log" for line in lines)
+    assert any(line == f"# session_id={monitor.session_id}" for line in lines)
+
+
 def test_corrupt_session_state_is_tolerated(tmp_path: Path, caplog) -> None:
     monitor = _make_monitor(tmp_path)
     monitor.app_data_dir.mkdir(parents=True, exist_ok=True)

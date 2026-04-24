@@ -773,7 +773,7 @@ class Summarizer:
 
     def _log_admission_config_locked(self) -> None:
         self.logger.info(
-            "event=summary_admission_config process_backlog_only_while_locked=%s current_lock_state=%s fail_open_when_unknown=true",
+            "event=summary_admission_config process_backlog_only_while_locked=%s lock_state=%s fail_open_when_unknown=true",
             self._process_backlog_only_while_locked,
             self._lock_state_label(),
         )

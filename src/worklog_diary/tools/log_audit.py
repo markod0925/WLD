@@ -6,7 +6,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable
@@ -15,6 +15,14 @@ from typing import Any, Iterable
 ENTRY_RE = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
     r"\[(?P<level>[A-Z]+)\] (?P<logger>[^:]+): (?P<message>.*)$"
+)
+CRASH_DUMP_HEADER_RE = re.compile(r"^(?P<header>(?:Windows fatal exception|Fatal Python error):.*)$")
+CRASH_DUMP_THREAD_RE = re.compile(
+    r"^(?P<label>Current thread|Thread) 0x(?P<thread_id>[0-9a-fA-F]+) "
+    r"\(most recent call first\):$"
+)
+CRASH_DUMP_FRAME_RE = re.compile(
+    r'^\s+File "(?P<file>[^"]+)", line (?P<line>\d+) in (?P<func>.*)$'
 )
 PREFIX_RE = re.compile(r"^\[(?P<tag>[A-Z]+)\]\s*(?P<body>.*)$")
 KV_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)=(?P<value>.*?)(?=\s+[A-Za-z_][A-Za-z0-9_.-]*=|$)")
@@ -216,6 +224,8 @@ STORAGE_EVENT_NAMES = {
 CRASH_EVENT_NAMES = {
     "crash_monitor_stage_failed",
     "crash_monitor_initialized",
+    "crash_monitor_session_start",
+    "crash_monitor_faulthandler_enabled",
     "crash_exception",
     "crash_hooks_installed",
     "faulthandler_enable",
@@ -252,6 +262,8 @@ LOCK_EVENT_NAMES = {
 }
 
 CONFIG_EVENT_NAMES = {
+    "config_loaded",
+    "config_snapshot",
     "config_unknown_fields",
     "config_legacy_field_conflict",
     "config_snapshot_startup",
@@ -562,6 +574,8 @@ class ParseStats:
     storage_ops: Counter[str] = field(default_factory=Counter)
     storage_errors: list[dict[str, Any]] = field(default_factory=list)
     crash_events: list[dict[str, Any]] = field(default_factory=list)
+    crash_dumps: list[dict[str, Any]] = field(default_factory=list)
+    faulthandler_records: list[dict[str, Any]] = field(default_factory=list)
     lmstudio_requests: list[RequestRecord] = field(default_factory=list)
     request_buckets: dict[str, list[RequestRecord]] = field(default_factory=lambda: defaultdict(list))
     anomalies: list[dict[str, Any]] = field(default_factory=list)
@@ -587,6 +601,9 @@ class LogAuditRunner:
         return outputs
 
     def _process_file(self, path: Path) -> None:
+        if path.name.lower() == "crash_faulthandler.log":
+            self._process_crash_dump(path)
+            return
         current: dict[str, Any] | None = None
         source_file = str(path.resolve())
         with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -619,6 +636,199 @@ class LogAuditRunner:
 
         if current is not None:
             self._finalize_current(current)
+
+    def _process_crash_dump(self, path: Path) -> None:
+        source_file = str(path.resolve())
+        file_mtime = path.stat().st_mtime if path.exists() else None
+        file_record: dict[str, Any] = {
+            "source_file": source_file,
+            "line_start": 1,
+            "line_end": 0,
+            "file_header": None,
+            "metadata": {},
+            "markers": [],
+            "notes": [],
+            "source_mtime_utc": _timestamp_to_utc_iso(file_mtime),
+            "source_mtime_local": _timestamp_to_local_iso(file_mtime),
+        }
+        dump_header: str | None = None
+        threads: list[dict[str, Any]] = []
+        current_thread: dict[str, Any] | None = None
+        frame_count = 0
+
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                self.stats.total_lines += 1
+                line = raw_line.rstrip("\n")
+                file_record["line_end"] = line_number
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("#"):
+                    comment = stripped[1:].strip()
+                    if file_record["file_header"] is None and comment == "WorkLog Diary faulthandler log":
+                        file_record["file_header"] = comment
+                        continue
+                    fields = parse_fields(comment)
+                    if not fields:
+                        file_record["notes"].append(comment)
+                        continue
+                    _update_faulthandler_metadata(file_record, fields)
+                    marker_utc = _string_field(fields, "marker_utc")
+                    if marker_utc:
+                        file_record["markers"].append(
+                            {
+                                "marker_utc": marker_utc,
+                                "event": _string_field(fields, "event"),
+                                "session_id": _string_field(fields, "session_id"),
+                            }
+                        )
+                    if "clean_finalization_utc" in fields or "clean_finalization_local" in fields:
+                        file_record["metadata"]["clean_finalization_utc"] = _string_field(fields, "clean_finalization_utc")
+                        file_record["metadata"]["clean_finalization_local"] = _string_field(fields, "clean_finalization_local")
+                    continue
+                if dump_header is None and CRASH_DUMP_HEADER_RE.match(stripped):
+                    dump_header = stripped
+                    continue
+                thread_match = CRASH_DUMP_THREAD_RE.match(stripped)
+                if thread_match:
+                    if dump_header is None:
+                        dump_header = file_record["file_header"]
+                    if current_thread is not None:
+                        threads.append(current_thread)
+                    current_thread = {
+                        "label": stripped,
+                        "thread_id": thread_match.group("thread_id"),
+                        "current": thread_match.group("label").startswith("Current"),
+                        "frames": [],
+                    }
+                    continue
+                frame_match = CRASH_DUMP_FRAME_RE.match(line)
+                if frame_match and current_thread is not None:
+                    current_thread["frames"].append(
+                        {
+                            "file": frame_match.group("file"),
+                            "line": int(frame_match.group("line")),
+                            "function": frame_match.group("func").strip(),
+                        }
+                    )
+                    frame_count += 1
+                    continue
+                file_record["notes"].append(stripped)
+
+        if current_thread is not None:
+            threads.append(current_thread)
+
+        file_record["threads"] = threads
+        file_record["thread_count"] = len(threads)
+        file_record["frame_count"] = frame_count
+        file_record["header"] = dump_header
+        file_record["current_thread"] = None
+        if threads:
+            current = next((thread for thread in threads if thread.get("current")), threads[0])
+            file_record["current_thread"] = current.get("thread_id")
+
+        file_record["top_frame"] = None
+        for thread in threads:
+            if thread.get("current") and thread.get("frames"):
+                frame = thread["frames"][0]
+                file_record["top_frame"] = {
+                    "file": frame["file"],
+                    "line": frame["line"],
+                    "function": frame["function"],
+                }
+                break
+        if file_record["top_frame"] is None:
+            for thread in threads:
+                if thread.get("frames"):
+                    frame = thread["frames"][0]
+                    file_record["top_frame"] = {
+                        "file": frame["file"],
+                        "line": frame["line"],
+                        "function": frame["function"],
+                    }
+                    break
+
+        self.stats.faulthandler_records.append(file_record)
+
+        has_dump = dump_header is not None or bool(threads)
+        if not has_dump:
+            if file_record["metadata"] or file_record["markers"] or file_record["notes"] or file_record["file_header"]:
+                self.stats.parsed_entries += 1
+            return
+
+        crash_dump = dict(file_record)
+        crash_dump["metadata"] = dict(file_record["metadata"])
+        crash_dump["markers"] = list(file_record["markers"])
+        self.stats.crash_dumps.append(crash_dump)
+        self.stats.crash_events.append(
+            {
+                "timestamp": None,
+                "event": "faulthandler_dump",
+                "stage": "fatal_access_violation",
+                "error_type": "Windows fatal exception",
+                "message": crash_dump["header"] or "Windows fatal exception",
+                "source_file": source_file,
+                "line_start": 1,
+                "line_end": crash_dump["line_end"],
+                "thread_count": crash_dump["thread_count"],
+                "frame_count": crash_dump["frame_count"],
+            }
+        )
+        self.stats.parsed_entries += 1
+        self.stats.level_counts["CRITICAL"] += 1
+        self.stats.subsystem_counts["crash_monitor"] += 1
+        self.stats.category_counts["crash"] += 1
+        self.stats.message_counts[crash_dump["header"] or "Windows fatal exception"] += 1
+        self.stats.error_counts["crash | crash_monitor | faulthandler_dump | windows fatal exception"] += 1
+        self._write_parsed_event(
+            ParsedEvent(
+                source_file=source_file,
+                line_start=1,
+                line_end=crash_dump["line_end"],
+                timestamp="",
+                level="CRITICAL",
+                logger="worklog_diary.core.crash_monitor",
+                message=crash_dump["header"] or "Windows fatal exception",
+                traceback="\n".join(
+                    line
+                    for thread in crash_dump["threads"]
+                    for line in [
+                        thread["label"],
+                        *[
+                            f'  File "{frame["file"]}", line {frame["line"]} in {frame["function"]}'
+                            for frame in thread["frames"]
+                        ],
+                    ]
+                ),
+                tags=["CRASH", "FAULTHANDLER"],
+                event_name="faulthandler_dump",
+                category="crash",
+                subsystem="crash_monitor",
+                fields={
+                    "dump_type": "faulthandler",
+                    "header": crash_dump["header"],
+                    "thread_count": crash_dump["thread_count"],
+                    "frame_count": crash_dump["frame_count"],
+                    "current_thread": crash_dump["current_thread"],
+                    "top_frame": crash_dump["top_frame"],
+                    "session_id": _string_field(crash_dump["metadata"], "session_id"),
+                    "process_start_utc": _string_field(crash_dump["metadata"], "process_start_utc"),
+                    "process_start_local": _string_field(crash_dump["metadata"], "process_start_local"),
+                    "clean_finalization_utc": _string_field(crash_dump["metadata"], "clean_finalization_utc"),
+                    "clean_finalization_local": _string_field(crash_dump["metadata"], "clean_finalization_local"),
+                    "pid": _int_value(crash_dump["metadata"].get("pid"), default=None),
+                    "app_version": _string_field(crash_dump["metadata"], "app_version"),
+                },
+                error_class="WindowsFatalException",
+                correlation_id=None,
+                summary_job_id=None,
+                screenshot_path=None,
+                screenshot_hash=None,
+                db_path=None,
+                config_changes=[],
+            )
+        )
 
     def _finalize_current(self, current: dict[str, Any]) -> None:
         continuation = current.pop("continuation", [])
@@ -713,12 +923,22 @@ class LogAuditRunner:
         if event.level in {"WARNING", "ERROR", "CRITICAL"} or event.event_name in {
             "runtime_paths",
             "runtime_paths_source",
+            "config_loaded",
+            "config_snapshot",
             "db_open",
             "crash_monitor_initialized",
+            "crash_monitor_session_start",
+            "crash_monitor_faulthandler_enabled",
             "faulthandler_enable",
             "previous_run_check",
             "session_heartbeat_started",
+            "session_monitor_start",
+            "session_monitor_started",
+            "session_monitor_start_failed",
             "monitoring_state_change",
+            "summary_admission_config",
+            "summary_admission_state",
+            "summary_admission_decision",
             "summary_drain_started",
             "summary_drain_finished",
             "summary_drain_failed",
@@ -1051,17 +1271,79 @@ class LogAuditRunner:
             for item in crash_events
             if item.get("stage") in {"session_monitor_stop_post_message", "session_monitor_unregister_notification", "session_monitor_unregister_class"}
         ]
+        main_session_ids = {
+            session_id
+            for item in self.stats.major_timeline
+            if item.get("event") in {"crash_monitor_session_start", "crash_monitor_initialized", "crash_monitor_session_finalized"}
+            for session_id in [
+                _string_field(parse_fields(str(item.get("message", ""))), "session_id"),
+            ]
+            if session_id
+        }
+        best_confidence = "Unknown"
+        best_method = "unknown"
+        confidence_rank = {"Unknown": 0, "Low": 1, "Medium": 2, "High": 3}
+        for dump in self.stats.crash_dumps:
+            metadata = dump.get("metadata") or {}
+            session_id = _string_field(metadata, "session_id")
+            process_start_utc = _string_field(metadata, "process_start_utc")
+            process_start_local = _string_field(metadata, "process_start_local")
+            clean_finalization_utc = _string_field(metadata, "clean_finalization_utc")
+            clean_finalization_local = _string_field(metadata, "clean_finalization_local")
+            markers = dump.get("markers") or []
+            if session_id and session_id in main_session_ids:
+                confidence = "High"
+                method = "session_id"
+            elif session_id is None and main_session_ids:
+                confidence = "Medium"
+                method = "missing_session_id"
+            elif process_start_utc or process_start_local:
+                confidence = "Medium"
+                method = "process_start"
+            elif markers:
+                confidence = "Medium"
+                method = "marker"
+            elif dump.get("source_mtime_utc") or dump.get("source_mtime_local"):
+                confidence = "Low"
+                method = "mtime"
+            else:
+                confidence = "Unknown"
+                method = "unknown"
+            dump["correlation"] = {
+                "confidence": confidence,
+                "method": method,
+                "session_id": session_id,
+                "main_session_match": session_id in main_session_ids if session_id else False,
+                "process_start_utc": process_start_utc,
+                "process_start_local": process_start_local,
+                "clean_finalization_utc": clean_finalization_utc,
+                "clean_finalization_local": clean_finalization_local,
+            }
+            if confidence_rank[confidence] > confidence_rank[best_confidence]:
+                best_confidence = confidence
+                best_method = method
         return {
             "crash_events": crash_events,
+            "faulthandler_dumps": self.stats.crash_dumps,
+            "faulthandler_records": self.stats.faulthandler_records,
             "counts_by_stage": dict(crash_by_stage),
             "unhandled_exceptions": unhandled,
             "session_monitor_failures": session_monitor_failures,
             "clean_finalization_seen": any(item["event"] in {"session_finalized", "crash_monitor_session_finalized"} for item in self.stats.major_timeline),
-            "faulthandler_seen": any(item["event"] in {"faulthandler_enable", "faulthandler_enabled"} for item in crash_events),
+            "faulthandler_seen": any(
+                item["event"] in {"faulthandler_enable", "faulthandler_enabled", "crash_monitor_faulthandler_enabled"}
+                for item in crash_events
+            ),
+            "clean_finalization_marked_in_faulthandler": any(
+                (record.get("metadata") or {}).get("clean_finalization_utc") or (record.get("metadata") or {}).get("clean_finalization_local")
+                for record in self.stats.faulthandler_records
+            ),
+            "correlation_confidence": best_confidence,
+            "correlation_method": best_method,
             "previous_unclean_shutdown_seen": any(
                 item["event"] in {"previous_run_check", "previous_run_unexpected_exit"} for item in crash_events
             ),
-            "evidence_available": bool(crash_events),
+            "evidence_available": bool(crash_events or self.stats.faulthandler_records),
             "instrumentation_gap": not any(item["event"] in {"session_finalized", "crash_monitor_session_finalized"} for item in crash_events),
         }
 
@@ -1230,6 +1512,15 @@ class LogAuditRunner:
                     "detail": "No configuration load/apply events were logged, so runtime settings can only be partially inferred.",
                 }
             )
+        for crash_dump in self.stats.crash_dumps:
+            anomalies.append(
+                {
+                    "type": "fatal_crash_dump",
+                    "detail": crash_dump.get("header") or "Windows fatal exception",
+                    "top_frame": crash_dump.get("top_frame"),
+                    "thread_count": crash_dump.get("thread_count"),
+                }
+            )
         lm_events = [
             event
             for event in self.stats.major_timeline
@@ -1369,7 +1660,22 @@ class LogAuditRunner:
         lines.append("")
         lines.append("## Crash Monitor Audit")
         lines.append(f"- Crash events observed: {len(crash['crash_events'])}")
+        lines.append(f"- Faulthandler dumps observed: {len(crash['faulthandler_dumps'])}")
+        lines.append(f"- Faulthandler records observed: {len(crash['faulthandler_records'])}")
         lines.append(f"- Clean finalization seen: {crash['clean_finalization_seen']}")
+        lines.append(f"- Clean finalization marked in faulthandler: {crash['clean_finalization_marked_in_faulthandler']}")
+        lines.append(
+            f"- Crash dump correlation: {crash['correlation_confidence']} via {crash['correlation_method']}"
+        )
+        if crash["faulthandler_dumps"]:
+            top_dump = crash["faulthandler_dumps"][0]
+            lines.append(f"- Crash dump header: {top_dump.get('header')}")
+            lines.append(f"- Crash dump session id: {(top_dump.get('metadata') or {}).get('session_id')}")
+            top_frame = top_dump.get("top_frame") or {}
+            if top_frame:
+                lines.append(
+                    f"- Crash dump top frame: {top_frame.get('file')}:{top_frame.get('line')} in {top_frame.get('function')}"
+                )
         lines.append("")
         lines.append("## Storage/DB Audit")
         lines.append(f"- Operations: {json.dumps(storage['operations'], ensure_ascii=False)}")
@@ -1384,10 +1690,22 @@ class LogAuditRunner:
             lines.append(f"- {json.dumps(anomaly, ensure_ascii=False)}")
         lines.append("")
         lines.append("## Instrumentation Gaps")
-        lines.append("- No configuration load/apply events were logged.")
-        lines.append("- No session lock or unlock events were logged.")
-        lines.append("- No `process_backlog_only_while_locked` evidence was logged in this build.")
-        lines.append("- Crash-monitor lifecycle markers such as clean finalization were absent from the log.")
+        if config["config_instrumentation_gap"]:
+            lines.append("- No configuration load/apply events were logged.")
+        else:
+            lines.append("- Configuration load/apply events were logged.")
+        if lock_unlock["gate_observable"]:
+            lines.append("- Session lock or unlock events were logged.")
+        else:
+            lines.append("- No session lock or unlock events were logged.")
+        if any("process_backlog_only_while_locked" in item.get("message", "") for item in self.stats.major_timeline):
+            lines.append("- `process_backlog_only_while_locked` evidence was logged in this build.")
+        else:
+            lines.append("- No `process_backlog_only_while_locked` evidence was logged in this build.")
+        if crash["clean_finalization_seen"] or crash["clean_finalization_marked_in_faulthandler"]:
+            lines.append("- Crash-monitor lifecycle markers such as clean finalization were present.")
+        else:
+            lines.append("- Crash-monitor lifecycle markers such as clean finalization were absent from the log.")
         lines.append("")
         lines.append("## Recommended Code Changes")
         lines.append("- `src/worklog_diary/core/services.py`: emit a startup config snapshot and a shutdown summary with explicit finalization state.")
@@ -1417,6 +1735,105 @@ class LogAuditRunner:
             (item for item in error_taxonomy if "AttributeError" in item["signature"] and "HCURSOR" in " ".join(item["examples"])),
             None,
         )
+        if crash.get("faulthandler_dumps"):
+            dump = crash["faulthandler_dumps"][0]
+            metadata = dump.get("metadata") or {}
+            correlation = dump.get("correlation") or {}
+            top_frame = dump.get("top_frame") or {}
+            frame_text = (
+                f'{top_frame.get("file")}:{top_frame.get("line")} in {top_frame.get("function")}'
+                if top_frame
+                else "unknown top frame"
+            )
+            findings.append(
+                {
+                    "title": "Faulthandler dump captures a fatal access violation",
+                    "severity": "Critical",
+                    "confidence": "High",
+                    "subsystem": "crash_monitor/session_monitor",
+                    "first_occurrence": None,
+                    "last_occurrence": None,
+                    "evidence": f'{dump.get("header") or "Windows fatal exception"}; top frame {frame_text}',
+                    "interpretation": "The separate faulthandler dump is a real fatal crash, not a normal shutdown. The main application log closes cleanly, so the dump must be correlated manually to the run that generated it.",
+                    "recommended_fix": "Write a timestamped structured crash marker before emitting the faulthandler dump so the crash can be joined back to the main run log.",
+                    "suggested_logging": "Log a crash session id, the dump path, and the fatal exception type at the moment the dump is written.",
+                }
+            )
+            root_causes.append("fatal access violation in session monitor")
+
+            if not metadata.get("session_id") or not dump.get("file_header"):
+                findings.append(
+                    {
+                        "title": "Faulthandler dump is missing session metadata",
+                        "severity": "Critical",
+                        "confidence": "High",
+                        "subsystem": "crash_monitor",
+                        "first_occurrence": None,
+                        "last_occurrence": None,
+                        "evidence": json.dumps(
+                            {
+                                "session_id": metadata.get("session_id"),
+                                "file_header": dump.get("file_header"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "interpretation": "The crash dump lacks the structured header needed to correlate it back to the application run.",
+                        "recommended_fix": "Write the faulthandler session header before enabling faulthandler and keep the same session id in the main log.",
+                        "suggested_logging": "Log `session_id`, `process_start_utc`, `process_start_local`, `pid`, and `app_version` at faulthandler initialization.",
+                    }
+                )
+            elif correlation.get("method") == "missing_session_id":
+                findings.append(
+                    {
+                        "title": "Crash dump cannot be joined to the main log by session id",
+                        "severity": "Medium",
+                        "confidence": "High",
+                        "subsystem": "crash_monitor",
+                        "first_occurrence": None,
+                        "last_occurrence": None,
+                        "evidence": json.dumps(correlation, ensure_ascii=False),
+                        "interpretation": "The main log contains crash-monitor session markers, but the faulthandler file does not carry the same session id.",
+                        "recommended_fix": "Mirror the crash-monitor session id into the faulthandler header before any fatal dump is written.",
+                        "suggested_logging": "Emit `event=crash_monitor_session_start session_id=<id>` and include the same session id in the faulthandler header.",
+                    }
+                )
+            elif crash["clean_finalization_seen"] and correlation.get("main_session_match"):
+                findings.append(
+                    {
+                        "title": "Clean shutdown and fatal faulthandler dump overlap in one session",
+                        "severity": "Medium",
+                        "confidence": "High",
+                        "subsystem": "crash_monitor",
+                        "first_occurrence": None,
+                        "last_occurrence": None,
+                        "evidence": json.dumps(
+                            {
+                                "session_id": metadata.get("session_id"),
+                                "clean_finalization_utc": metadata.get("clean_finalization_utc"),
+                                "correlation": correlation,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "interpretation": "The same session appears to have both a clean finalization marker and a fatal faulthandler dump, which indicates stale crash evidence or an uncorrelated crash file.",
+                        "recommended_fix": "Preserve the faulthandler file across runs, write explicit session headers, and treat same-session crash dumps as unresolved until joined by metadata.",
+                        "suggested_logging": "Keep the faulthandler header, session id, and clean-finalization marker together so the audit can separate stale evidence from the active run.",
+                    }
+                )
+            elif correlation.get("method") == "mtime":
+                findings.append(
+                    {
+                        "title": "Faulthandler dump is only correlated by file mtime",
+                        "severity": "Low",
+                        "confidence": "High",
+                        "subsystem": "crash_monitor",
+                        "first_occurrence": None,
+                        "last_occurrence": None,
+                        "evidence": json.dumps(correlation, ensure_ascii=False),
+                        "interpretation": "The crash file has no reliable structured metadata, so the audit can only align it using the filesystem timestamp.",
+                        "recommended_fix": "Write the session header and lifecycle markers before any crash can occur.",
+                        "suggested_logging": "Include `session_id` and `process_start_utc` in the faulthandler header.",
+                    }
+                )
         if session_monitor_error:
             findings.append(
                 {
@@ -1580,6 +1997,23 @@ def parse_fields(text: str) -> dict[str, Any]:
         value = match.group("value").strip()
         fields[key] = coerce_value(value)
     return fields
+
+
+def _update_faulthandler_metadata(file_record: dict[str, Any], fields: dict[str, Any]) -> None:
+    metadata = file_record.setdefault("metadata", {})
+    for key in ("session_id", "process_start_utc", "process_start_local", "clean_finalization_utc", "clean_finalization_local", "app_version"):
+        value = _string_field(fields, key)
+        if value is not None:
+            metadata[key] = value
+    pid = _int_value(fields.get("pid"), default=None)
+    if pid is not None:
+        metadata["pid"] = pid
+    marker_utc = _string_field(fields, "marker_utc")
+    if marker_utc is not None:
+        metadata.setdefault("marker_utc", []).append(marker_utc)
+    event = _string_field(fields, "event")
+    if event is not None:
+        metadata.setdefault("marker_event", []).append(event)
 
 
 def coerce_value(value: str) -> Any:
@@ -1825,6 +2259,24 @@ def _bool_value(value: Any) -> bool | None:
 def _parse_timestamp(value: str) -> datetime | None:
     try:
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _timestamp_to_utc_iso(value: float | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def _timestamp_to_local_iso(value: float | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(value).astimezone().isoformat(timespec="seconds")
     except Exception:
         return None
 
