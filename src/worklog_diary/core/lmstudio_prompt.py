@@ -53,7 +53,12 @@ class LMStudioPromptBuilder:
             title=f"Create a short daily recap for {day.isoformat()} from the following batch summaries.",
             instructions=(
                 "Return only valid JSON with keys summary_text, key_points, blocked_activity, metadata. "
-                "Keep the recap concise and practical."
+                "Keep summary_text short, ideally 2 to 4 sentences. "
+                "Make key_points a compact highlights list with 3 to 6 entries, each using the format "
+                "\"Category: short description\". "
+                "Prefer categories such as \"Programma/Attività\", \"Decisioni\", \"Blocchi\", and \"Follow-up\". "
+                "Use key_points to capture the most useful actions and outcomes from the day, not generic prose. "
+                "Keep blocked_activity brief and only mention meaningful privacy or blocked-work notes."
             ),
             payload=payload,
             metadata=metadata,

@@ -185,6 +185,28 @@ def test_lmstudio_client_daily_recap_uses_structured_schema(monkeypatch: pytest.
     assert parsed["metadata"]["response_kind"] == "daily_recap"
 
 
+def test_daily_recap_prompt_requests_short_highlight_list() -> None:
+    builder = LMStudioPromptBuilder(max_daily_summaries=5, max_summary_text_segments=20)
+    summaries = [
+        SummaryRecord(
+            id=1,
+            job_id=1,
+            start_ts=1.0,
+            end_ts=2.0,
+            summary_text="worked on recap formatting and review flow",
+            summary_json={"summary_text": "worked on recap formatting and review flow"},
+            created_ts=3.0,
+        )
+    ]
+
+    result = builder.build_daily_recap_prompt(day=date(2026, 4, 14), summaries=summaries)
+
+    assert "key_points" in result.prompt_text
+    assert "3 to 6 entries" in result.prompt_text
+    assert "Category: short description" in result.prompt_text
+    assert "Programma/Attività" in result.prompt_text
+
+
 def test_prompt_builder_limits_daily_recap_prompt_budget() -> None:
     builder = LMStudioPromptBuilder(
         max_daily_summaries=20,
