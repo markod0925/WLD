@@ -119,6 +119,7 @@ class CrashMonitor:
             if self._session_finalized:
                 return
             self._session_finalizing = True
+        self.logger.info("event=crash_monitor_finalize_start")
 
         self._stop_heartbeat()
         try:
@@ -134,12 +135,12 @@ class CrashMonitor:
                 }
             )
             self._write_session_state(state)
-            self.logger.info("event=session_finalized status=clean session_id=%s", state.get("session_id"))
+            self.logger.info("event=crash_monitor_session_finalized session_id=%s", state.get("session_id"))
             with self._session_lock:
                 self._session_finalized = True
         except Exception as exc:
             self.logger.warning(
-                "event=session_finalize_failed error_type=%s error=%s",
+                "event=crash_monitor_finalize_failed error_type=%s error=%s",
                 exc.__class__.__name__,
                 exc,
             )

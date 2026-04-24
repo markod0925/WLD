@@ -147,6 +147,8 @@ SUMMARY_EVENT_NAMES = {
     "summary_drain_failed",
     "summary_drain_cancel_requested",
     "summary_drain_stopped",
+    "summary_workers_join_start",
+    "summary_workers_joined",
     "summary_flush_triggered",
     "summary_flush_skipped",
     "submission_decision",
@@ -166,6 +168,10 @@ SUMMARY_EVENT_NAMES = {
     "payload_build",
     "request_submit",
     "request_success",
+    "lmstudio_request_start",
+    "lmstudio_request_success",
+    "lmstudio_request_failure",
+    "lmstudio_request_timeout",
     "http_response",
     "response_parse",
     "retry_scheduled",
@@ -220,9 +226,15 @@ CRASH_EVENT_NAMES = {
     "session_heartbeat_started",
     "session_heartbeat_update_failed",
     "session_finalize_failed",
+    "crash_monitor_finalize_start",
+    "crash_monitor_session_finalized",
+    "crash_monitor_finalize_failed",
     "session_state_load_failed",
     "session_monitor_start_failed",
     "session_monitor_registration_failed",
+    "session_monitor_start",
+    "session_monitor_started",
+    "session_monitor_thread_exit",
     "session_monitor_callback_failed",
     "session_finalized",
     "run_protected_exception",
@@ -231,6 +243,10 @@ CRASH_EVENT_NAMES = {
 LOCK_EVENT_NAMES = {
     "session_locked",
     "session_unlocked",
+    "summary_admission_config",
+    "summary_admission_decision",
+    "summary_admission_state",
+    "backlog_waiting_for_pc_lock",
     "monitoring_paused_by_lock",
     "monitoring_resumed_after_unlock",
 }
@@ -238,6 +254,11 @@ LOCK_EVENT_NAMES = {
 CONFIG_EVENT_NAMES = {
     "config_unknown_fields",
     "config_legacy_field_conflict",
+    "config_snapshot_startup",
+    "config_apply_start",
+    "config_apply_diff",
+    "config_apply_complete",
+    "config_apply_failed",
 }
 
 
@@ -702,7 +723,12 @@ class LogAuditRunner:
             "summary_drain_finished",
             "summary_drain_failed",
             "summary_drain_stopped",
+            "summary_workers_joined",
             "summary_flush_triggered",
+            "lmstudio_request_start",
+            "lmstudio_request_success",
+            "lmstudio_request_failure",
+            "lmstudio_request_timeout",
             "daily_recap_generation_started",
             "daily_recap_generation_succeeded",
             "daily_recap_generation_failed",
@@ -710,6 +736,11 @@ class LogAuditRunner:
             "session_locked",
             "session_unlocked",
             "session_finalized",
+            "crash_monitor_session_finalized",
+            "crash_monitor_finalize_start",
+            "crash_monitor_finalize_failed",
+            "storage_closed",
+            "shutdown_complete",
         }:
             self.stats.major_timeline.append(
                 {
@@ -904,14 +935,14 @@ class LogAuditRunner:
         shutdown_steps = [
             item
             for item in self.stats.major_timeline
-            if item["event"] in {"summary_drain_finished", "summary_drain_failed", "summary_drain_stopped", "session_finalized"}
+            if item["event"] in {"summary_drain_finished", "summary_drain_failed", "summary_drain_stopped", "session_finalized", "crash_monitor_session_finalized"}
         ]
         return {
             "major_events": self.stats.major_timeline,
             "startup_steps": startup_steps,
             "shutdown_steps": shutdown_steps,
             "sessions_observed": len([item for item in self.stats.major_timeline if item["event"] == "runtime_paths"]),
-            "observed_clean_shutdown": any(item["event"] == "session_finalized" for item in self.stats.major_timeline),
+            "observed_clean_shutdown": any(item["event"] in {"session_finalized", "crash_monitor_session_finalized"} for item in self.stats.major_timeline),
             "observed_startup_recovery": any(item["event"] == "startup_recovery" for item in self.stats.major_timeline),
             "observed_monitoring_start": any(item["event"] == "monitoring_state_change" and item["message"].startswith("event=monitoring_state_change active=True") for item in self.stats.major_timeline),
         }
@@ -1025,13 +1056,13 @@ class LogAuditRunner:
             "counts_by_stage": dict(crash_by_stage),
             "unhandled_exceptions": unhandled,
             "session_monitor_failures": session_monitor_failures,
-            "clean_finalization_seen": any(item["event"] == "session_finalized" for item in self.stats.major_timeline),
+            "clean_finalization_seen": any(item["event"] in {"session_finalized", "crash_monitor_session_finalized"} for item in self.stats.major_timeline),
             "faulthandler_seen": any(item["event"] in {"faulthandler_enable", "faulthandler_enabled"} for item in crash_events),
             "previous_unclean_shutdown_seen": any(
                 item["event"] in {"previous_run_check", "previous_run_unexpected_exit"} for item in crash_events
             ),
             "evidence_available": bool(crash_events),
-            "instrumentation_gap": not any(item["event"] == "session_finalized" for item in crash_events),
+            "instrumentation_gap": not any(item["event"] in {"session_finalized", "crash_monitor_session_finalized"} for item in crash_events),
         }
 
     def _build_lock_unlock_audit(self) -> dict[str, Any]:
@@ -1110,6 +1141,61 @@ class LogAuditRunner:
 
     def _build_anomalies(self) -> list[dict[str, Any]]:
         anomalies = list(self.stats.anomalies)
+        storage_closed_index = next(
+            (idx for idx, item in enumerate(self.stats.major_timeline) if item.get("event") == "storage_closed"),
+            None,
+        )
+        if storage_closed_index is not None:
+            for item in self.stats.major_timeline[storage_closed_index + 1 :]:
+                if item.get("event") in {"summary_flush_triggered", "summary_job_started", "summary_store", "lmstudio_request_success"}:
+                    anomalies.append(
+                        {
+                            "type": "shutdown_storage_ordering_violation",
+                            "severity": "Critical",
+                            "detail": f"Event {item.get('event')} appeared after storage_closed.",
+                        }
+                    )
+                    break
+
+        shutdown_complete_index = next(
+            (idx for idx, item in enumerate(self.stats.major_timeline) if item.get("event") == "shutdown_complete"),
+            None,
+        )
+        if shutdown_complete_index is not None:
+            prior_events = {item.get("event") for item in self.stats.major_timeline[: shutdown_complete_index + 1]}
+            if "summary_workers_joined" not in prior_events:
+                anomalies.append(
+                    {
+                        "type": "missing_summary_workers_joined",
+                        "severity": "High",
+                        "detail": "shutdown_complete observed without summary_workers_joined marker.",
+                    }
+                )
+            if not {"crash_monitor_session_finalized", "crash_monitor_finalize_failed"}.intersection(prior_events):
+                anomalies.append(
+                    {
+                        "type": "missing_crash_finalization_marker",
+                        "severity": "High",
+                        "detail": "shutdown_complete observed without crash finalization marker.",
+                    }
+                )
+
+        finalize_index = next(
+            (idx for idx, item in enumerate(self.stats.major_timeline) if item.get("event") == "crash_monitor_finalize_start"),
+            None,
+        )
+        if finalize_index is not None:
+            for item in self.stats.major_timeline[finalize_index + 1 :]:
+                if item.get("event") == "session_heartbeat_started":
+                    anomalies.append(
+                        {
+                            "type": "heartbeat_after_finalize_start",
+                            "severity": "High",
+                            "detail": "Heartbeat marker observed after crash_monitor_finalize_start.",
+                        }
+                    )
+                    break
+
         repeated_errors = [
             {"signature": signature, "count": group.count, "first_seen": group.first_seen, "last_seen": group.last_seen, "severity": group.severity}
             for signature, group in self.stats.error_groups.items()
@@ -1142,6 +1228,65 @@ class LogAuditRunner:
                 {
                     "type": "missing_config_events",
                     "detail": "No configuration load/apply events were logged, so runtime settings can only be partially inferred.",
+                }
+            )
+        lm_events = [
+            event
+            for event in self.stats.major_timeline
+            if event.get("event") in {"lmstudio_request_success", "lmstudio_request_failure", "lmstudio_request_timeout"}
+        ]
+        for event in lm_events:
+            fields = parse_fields(str(event.get("message", "")))
+            if "lm_request_id" not in fields:
+                anomalies.append(
+                    {
+                        "type": "lmstudio_missing_request_id",
+                        "severity": "Medium",
+                        "detail": f"{event.get('event')} missing lm_request_id.",
+                    }
+                )
+                break
+
+        request_to_job: dict[str, str] = {}
+        for event in lm_events:
+            fields = parse_fields(str(event.get("message", "")))
+            request_id = _string_field(fields, "lm_request_id")
+            summary_job_id = _string_field(fields, "summary_job_id")
+            if not request_id or not summary_job_id:
+                continue
+            existing = request_to_job.get(request_id)
+            if existing is not None and existing != summary_job_id:
+                anomalies.append(
+                    {
+                        "type": "lmstudio_request_id_reused_across_jobs",
+                        "severity": "Medium",
+                        "detail": f"lm_request_id={request_id} mapped to multiple summary_job_id values.",
+                    }
+                )
+                break
+            request_to_job[request_id] = summary_job_id
+
+        monitor_started = any(item.get("event") == "session_monitor_started" for item in self.stats.major_timeline)
+        monitor_failed = any(item.get("event") == "session_monitor_start_failed" for item in self.stats.major_timeline)
+        if not monitor_started and not monitor_failed:
+            anomalies.append(
+                {
+                    "type": "session_monitor_no_start_evidence",
+                    "severity": "Medium",
+                    "detail": "No session_monitor_started or session_monitor_start_failed marker found.",
+                }
+            )
+        has_gate_enabled_evidence = any(
+            "process_backlog_only_while_locked=true" in str(item.get("message", ""))
+            for item in self.stats.major_timeline
+        )
+        has_admission_state_marker = any(item.get("event") == "summary_admission_state" for item in self.stats.major_timeline)
+        if has_gate_enabled_evidence and not has_admission_state_marker:
+            anomalies.append(
+                {
+                    "type": "missing_summary_admission_state",
+                    "severity": "Medium",
+                    "detail": "Lock gate appears enabled but summary_admission_state markers were not observed.",
                 }
             )
         return anomalies

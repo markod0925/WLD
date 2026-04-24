@@ -8,6 +8,7 @@ import time
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+from uuid import uuid4
 
 if TYPE_CHECKING:
     import requests
@@ -18,6 +19,7 @@ from .llm_job_queue import LLMJobQueue
 from .lmstudio_prompt import LMStudioPromptBuilder, PromptBuildResult
 from .models import SummaryRecord
 from .lmstudio_logging import (
+    get_llm_job_id,
     log_llm_stage,
     safe_error,
     safe_response_preview,
@@ -479,8 +481,23 @@ class LMStudioClient:
         *,
         endpoint: str,
         timeout_s: int,
+        lm_request_id: str,
+        summary_job_id: object | None,
+        attempt: int,
+        max_attempts: int,
     ) -> "requests.Response":
         start = time.perf_counter()
+        self.logger.info(
+            "event=lmstudio_request_start lm_request_id=%s summary_job_id=%s model=%s base_url=%s endpoint=%s timeout_s=%s attempt=%s max_attempts=%s",
+            lm_request_id,
+            summary_job_id if summary_job_id is not None else "none",
+            self.model,
+            self.base_url,
+            endpoint,
+            timeout_s,
+            attempt,
+            max_attempts,
+        )
         log_llm_stage(
             self.logger,
             "request_submit",
@@ -500,6 +517,17 @@ class LMStudioClient:
             )
         except requests.Timeout as exc:
             elapsed_s = time.perf_counter() - start
+            self.logger.error(
+                "event=lmstudio_request_timeout lm_request_id=%s summary_job_id=%s category=timeout duration_ms=%.3f model=%s base_url=%s endpoint=%s attempt=%s max_attempts=%s",
+                lm_request_id,
+                summary_job_id if summary_job_id is not None else "none",
+                elapsed_s * 1000.0,
+                self.model,
+                self.base_url,
+                endpoint,
+                attempt,
+                max_attempts,
+            )
             log_llm_stage(
                 self.logger,
                 "http_response",
@@ -518,6 +546,17 @@ class LMStudioClient:
             ) from exc
         except requests.ConnectionError as exc:
             elapsed_s = time.perf_counter() - start
+            self.logger.error(
+                "event=lmstudio_request_failure lm_request_id=%s summary_job_id=%s category=connection_error duration_ms=%.3f model=%s base_url=%s endpoint=%s attempt=%s max_attempts=%s",
+                lm_request_id,
+                summary_job_id if summary_job_id is not None else "none",
+                elapsed_s * 1000.0,
+                self.model,
+                self.base_url,
+                endpoint,
+                attempt,
+                max_attempts,
+            )
             log_llm_stage(
                 self.logger,
                 "http_response",
@@ -535,6 +574,17 @@ class LMStudioClient:
             ) from exc
         except requests.RequestException as exc:
             elapsed_s = time.perf_counter() - start
+            self.logger.error(
+                "event=lmstudio_request_failure lm_request_id=%s summary_job_id=%s category=http_error duration_ms=%.3f model=%s base_url=%s endpoint=%s attempt=%s max_attempts=%s",
+                lm_request_id,
+                summary_job_id if summary_job_id is not None else "none",
+                elapsed_s * 1000.0,
+                self.model,
+                self.base_url,
+                endpoint,
+                attempt,
+                max_attempts,
+            )
             log_llm_stage(
                 self.logger,
                 "http_response",
@@ -555,6 +605,18 @@ class LMStudioClient:
         http_status = getattr(response, "status_code", None)
         if http_status is None or not 200 <= int(http_status) < 300:
             body_preview = safe_response_preview(getattr(response, "text", ""))
+            self.logger.error(
+                "event=lmstudio_request_failure lm_request_id=%s summary_job_id=%s category=http_error duration_ms=%.3f model=%s base_url=%s endpoint=%s http_status=%s attempt=%s max_attempts=%s",
+                lm_request_id,
+                summary_job_id if summary_job_id is not None else "none",
+                elapsed_s * 1000.0,
+                self.model,
+                self.base_url,
+                endpoint,
+                http_status,
+                attempt,
+                max_attempts,
+            )
             log_llm_stage(
                 self.logger,
                 "http_response",
@@ -582,6 +644,18 @@ class LMStudioClient:
             elapsed_s=elapsed_s,
             http_status=http_status,
             timeout_s=timeout_s,
+        )
+        self.logger.info(
+            "event=lmstudio_request_success lm_request_id=%s summary_job_id=%s duration_ms=%.3f model=%s base_url=%s endpoint=%s http_status=%s attempt=%s max_attempts=%s",
+            lm_request_id,
+            summary_job_id if summary_job_id is not None else "none",
+            elapsed_s * 1000.0,
+            self.model,
+            self.base_url,
+            endpoint,
+            http_status,
+            attempt,
+            max_attempts,
         )
         return response
 
@@ -618,7 +692,17 @@ class LMStudioClient:
         current_payload = payload
 
         for attempt in range(1, self.max_response_attempts + 1):
-            response = self._post_chat_completion(current_payload, endpoint=endpoint, timeout_s=timeout_s)
+            summary_job_id = get_llm_job_id(default=None)
+            lm_request_id = uuid4().hex
+            response = self._post_chat_completion(
+                current_payload,
+                endpoint=endpoint,
+                timeout_s=timeout_s,
+                lm_request_id=lm_request_id,
+                summary_job_id=summary_job_id,
+                attempt=attempt,
+                max_attempts=self.max_response_attempts,
+            )
             raw_response_text = getattr(response, "text", "")
             log_llm_stage(
                 self.logger,
@@ -655,6 +739,16 @@ class LMStudioClient:
                 return parsed
             except ValueError as exc:
                 last_error = str(exc)
+                self.logger.error(
+                    "event=lmstudio_request_failure lm_request_id=%s summary_job_id=%s category=invalid_response model=%s base_url=%s endpoint=%s attempt=%s max_attempts=%s",
+                    lm_request_id,
+                    summary_job_id if summary_job_id is not None else "none",
+                    self.model,
+                    self.base_url,
+                    endpoint,
+                    attempt,
+                    self.max_response_attempts,
+                )
                 log_llm_stage(
                     self.logger,
                     "response_parse",

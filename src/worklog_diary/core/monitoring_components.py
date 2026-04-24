@@ -407,7 +407,7 @@ class FlushCoordinator:
 
     def flush_now(self, reason: str = "manual") -> FlushDrainResult | None:
         if self.services.shutdown_event.is_set():
-            self.logger.info("event=summary_flush_skipped reason=shutdown request_reason=%s", reason)
+            self.logger.info("event=summary_flush_skipped reason=shutdown_in_progress request_reason=%s", reason)
             return None
         if not self._flush_lock.acquire(blocking=False):
             self.logger.info("event=summary_flush_skipped reason=already_running request_reason=%s", reason)

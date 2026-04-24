@@ -67,11 +67,23 @@ class Summarizer:
         self._process_backlog_only_while_locked = bool(process_backlog_only_while_locked)
         self._session_locked: bool | None = None
         self._admission_paused = False
+        self._accepting_new_jobs = True
+        self._last_admission_state: str | None = None
 
         self._ensure_worker_count_locked()
+        self._emit_admission_state_if_changed(reason="startup")
 
-    def stop(self) -> None:
+    def stop(self) -> dict[str, int]:
+        self.logger.info("event=summary_workers_join_start")
         self._stop_event.set()
+        cancelled = 0
+        with self._condition:
+            self._accepting_new_jobs = False
+            while self._queue:
+                item = self._queue.popleft()
+                cancelled += 1
+                self._reserved_ranges.pop(item.job_id, None)
+                self.storage.update_summary_job(item.job_id, status="cancelled", error="shutdown")
         with self._condition:
             for handle in self._workers:
                 handle.stop_event.set()
@@ -83,8 +95,25 @@ class Summarizer:
             job_queue.stop()
         for handle in self._workers + self._retired_workers:
             handle.thread.join(timeout=2)
+        runtime = self.get_runtime_status()
+        self.logger.info(
+            "event=summary_workers_joined running=%s queued=%s cancelled=%s failed=%s",
+            runtime["running_jobs"],
+            runtime["queued_jobs"],
+            cancelled,
+            runtime["failed_jobs"],
+        )
         self._workers.clear()
         self._retired_workers.clear()
+        return {"cancelled": int(cancelled)}
+
+    def stop_accepting_new_jobs(self) -> None:
+        with self._condition:
+            self._accepting_new_jobs = False
+            self._condition.notify_all()
+        self.logger.info("event=summary_admission_stopped")
+        self.logger.info("event=summary_admission_decision allowed=false reason=shutdown lock_state=%s trigger=shutdown", self._lock_state_label())
+        self._emit_admission_state_if_changed(reason="shutdown")
 
     def update_max_parallel_jobs(self, max_parallel_jobs: int) -> None:
         with self._condition:
@@ -103,6 +132,8 @@ class Summarizer:
             self._process_backlog_only_while_locked = bool(enabled)
             self._condition.notify_all()
             paused_now = self._is_summary_admission_paused_locked()
+            self._log_admission_config_locked()
+        self._emit_admission_state_if_changed(reason="config")
         if not paused_now and self._admission_paused:
             self._admission_paused = False
             self.logger.info("event=summary_admission_resumed reason=config_disabled")
@@ -113,6 +144,8 @@ class Summarizer:
             self._session_locked = bool(is_locked)
             self._condition.notify_all()
             paused_now = self._is_summary_admission_paused_locked()
+            self._log_admission_config_locked()
+        self._emit_admission_state_if_changed(reason="lock_change")
 
         if not self._process_backlog_only_while_locked:
             return
@@ -147,7 +180,7 @@ class Summarizer:
         *,
         force_flush: bool = False,
     ) -> int:
-        if self._stop_event.is_set() or self._shutdown_event.is_set():
+        if self._stop_event.is_set() or self._shutdown_event.is_set() or not self._accepting_new_jobs:
             return 0
         with self._condition:
             available_slots = self._max_parallel_jobs - (len(self._queue) + len(self._running_jobs))
@@ -674,13 +707,25 @@ class Summarizer:
         return None
 
     def _can_start_summary_job_now_locked(self, *, reason: str) -> bool:
+        if not self._accepting_new_jobs:
+            self._log_admission_decision_locked(allowed=False, reason="shutdown", trigger=reason)
+            return False
         if reason in {"manual", "summary-window"}:
+            self._log_admission_decision_locked(allowed=True, reason="bypass", trigger=reason)
             return True
         if not self._process_backlog_only_while_locked:
+            self._log_admission_decision_locked(allowed=True, reason="gate_disabled", trigger=reason)
             return True
         if self._session_locked is None:
+            self._log_admission_decision_locked(allowed=True, reason="unknown_fail_open", trigger=reason)
             return True
-        return self._session_locked
+        allowed = self._session_locked
+        self._log_admission_decision_locked(
+            allowed=allowed,
+            reason="pc_locked" if allowed else "pc_unlocked",
+            trigger=reason,
+        )
+        return allowed
 
     def _is_summary_admission_paused_locked(self) -> bool:
         if not self._process_backlog_only_while_locked:
@@ -689,6 +734,34 @@ class Summarizer:
             return False
         return not self._session_locked
 
+    def _effective_admission_state_locked(self) -> tuple[str, str]:
+        if not self._accepting_new_jobs:
+            return "blocked", "shutdown"
+        if not self._process_backlog_only_while_locked:
+            return "allowed", "gate_disabled"
+        if self._session_locked is None:
+            return "allowed", "unknown_fail_open"
+        if self._session_locked:
+            return "allowed", "pc_locked"
+        return "blocked", "pc_unlocked"
+
+    def _emit_admission_state_if_changed(self, *, reason: str) -> None:
+        with self._condition:
+            state, state_reason = self._effective_admission_state_locked()
+            if state == self._last_admission_state:
+                return
+            self._last_admission_state = state
+            lock_state = self._lock_state_label()
+            gate = self._process_backlog_only_while_locked
+        self.logger.info(
+            "event=summary_admission_state state=%s reason=%s lock_state=%s process_backlog_only_while_locked=%s trigger=%s",
+            state,
+            state_reason,
+            lock_state,
+            gate,
+            reason,
+        )
+
     def _log_admission_paused_once_locked(self) -> None:
         if self._admission_paused:
             return
@@ -696,6 +769,28 @@ class Summarizer:
         self.logger.info(
             "event=summary_admission_paused reason=pc_unlocked message=\"summary processing paused until PC lock\""
         )
+        self.logger.info("event=backlog_waiting_for_pc_lock")
+
+    def _log_admission_config_locked(self) -> None:
+        self.logger.info(
+            "event=summary_admission_config process_backlog_only_while_locked=%s current_lock_state=%s fail_open_when_unknown=true",
+            self._process_backlog_only_while_locked,
+            self._lock_state_label(),
+        )
+
+    def _log_admission_decision_locked(self, *, allowed: bool, reason: str, trigger: str) -> None:
+        self.logger.info(
+            "event=summary_admission_decision allowed=%s reason=%s lock_state=%s trigger=%s",
+            allowed,
+            reason,
+            self._lock_state_label(),
+            trigger,
+        )
+
+    def _lock_state_label(self) -> str:
+        if self._session_locked is None:
+            return "unknown"
+        return "locked" if self._session_locked else "unlocked"
 
     def _run_summary_job(
         self,

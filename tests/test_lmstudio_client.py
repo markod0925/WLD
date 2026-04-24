@@ -320,3 +320,36 @@ def test_lmstudio_client_wraps_chunk_planning_prompt_errors() -> None:
         client.summarize_daily_recap(day=date(2026, 4, 20), summaries=summaries)
 
     assert getattr(exc_info.value, "failed_stage", None) == "payload_build"
+
+
+def test_lmstudio_client_logs_timeout_category(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=1)
+    caplog.set_level("INFO")
+
+    def fake_post(*_args: object, **_kwargs: object) -> FakeResponse:
+        raise requests.Timeout("slow")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(Exception):
+        client.summarize_batch(_summary_batch())
+
+    assert any("event=lmstudio_request_timeout" in rec.message and "category=timeout" in rec.message for rec in caplog.records)
+
+
+def test_lmstudio_request_id_correlates_start_and_success(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    caplog.set_level("INFO")
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda *_args, **_kwargs: FakeResponse('{"summary_text":"ok","key_points":[],"blocked_activity":[],"metadata":{}}'),
+    )
+
+    client.summarize_batch(_summary_batch(), job_id="job-42")
+    start_line = next(rec.message for rec in caplog.records if "event=lmstudio_request_start" in rec.message)
+    success_line = next(rec.message for rec in caplog.records if "event=lmstudio_request_success" in rec.message)
+    start_id = start_line.split("lm_request_id=")[1].split()[0]
+    success_id = success_line.split("lm_request_id=")[1].split()[0]
+    assert start_id == success_id
+    assert "summary_job_id=job-42" in start_line
+    assert "summary_job_id=job-42" in success_line
