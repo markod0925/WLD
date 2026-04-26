@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import date, datetime, time
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from worklog_diary.core.audit_export import AuditExportError, AuditExportOptions, export_audit_bundle
 from worklog_diary.core.config import AppConfig
@@ -132,6 +133,91 @@ def test_export_date_range_filtering(tmp_path: Path) -> None:
         summaries = _read_jsonl(result.output_dir / "summaries.jsonl")
         assert len(summaries) == 1
         assert summaries[0]["summary_text"] == "new"
+    finally:
+        storage.close()
+
+
+def test_export_uses_unique_directory_name_even_for_same_timestamp(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "wld.db"))
+    try:
+        fixed_now = datetime(2026, 4, 20, 12, 0, 0)
+        mocked_datetime = Mock()
+        mocked_datetime.utcnow.return_value = fixed_now
+
+        with patch("worklog_diary.core.audit_export.datetime", mocked_datetime):
+            first = export_audit_bundle(storage, tmp_path / "exports", AuditExportOptions(), config=AppConfig())
+            second = export_audit_bundle(storage, tmp_path / "exports", AuditExportOptions(), config=AppConfig())
+
+        assert first.output_dir != second.output_dir
+        assert first.output_dir.exists()
+        assert second.output_dir.exists()
+    finally:
+        storage.close()
+
+
+def test_coalesced_members_query_scales_with_filtered_date_range(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "wld.db"))
+    try:
+        old_day = date(2026, 4, 10)
+        in_range_day = date(2026, 4, 20)
+        old_sid = _insert_summary(
+            storage,
+            start_ts=_ts(old_day, 9, 0),
+            end_ts=_ts(old_day, 9, 15),
+            text="old",
+        )
+        in_range_sid = _insert_summary(
+            storage,
+            start_ts=_ts(in_range_day, 9, 0),
+            end_ts=_ts(in_range_day, 9, 15),
+            text="in-range",
+        )
+        storage.replace_coalesced_summaries_for_day(
+            old_day,
+            [
+                type(
+                    "Plan",
+                    (),
+                    {
+                        "start_ts": _ts(old_day, 9, 0),
+                        "end_ts": _ts(old_day, 9, 15),
+                        "summary_text": "old",
+                        "summary_json": {"confidence_bucket": "High"},
+                        "source_summary_ids": [old_sid],
+                    },
+                )
+            ],
+        )
+        storage.replace_coalesced_summaries_for_day(
+            in_range_day,
+            [
+                type(
+                    "Plan",
+                    (),
+                    {
+                        "start_ts": _ts(in_range_day, 9, 0),
+                        "end_ts": _ts(in_range_day, 9, 15),
+                        "summary_text": "in-range",
+                        "summary_json": {"confidence_bucket": "High"},
+                        "source_summary_ids": [in_range_sid],
+                    },
+                )
+            ],
+        )
+
+        statements: list[str] = []
+        storage._conn.set_trace_callback(statements.append)
+        rows = storage.list_audit_coalesced_summaries(
+            start_day=date(2026, 4, 15),
+            end_day_exclusive=date(2026, 4, 21),
+        )
+        storage._conn.set_trace_callback(None)
+
+        assert len(rows) == 1
+        assert rows[0]["member_summary_ids"] == [in_range_sid]
+
+        members_query = next(sql for sql in statements if "FROM coalesced_summary_members" in sql)
+        assert "WHERE coalesced_summary_id IN" in members_query
     finally:
         storage.close()
 

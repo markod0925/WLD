@@ -1518,13 +1518,20 @@ class SQLiteStorage(ActivityRepository):
                 ,
                 values,
             ).fetchall()
-            members = self._conn.execute(
-                """
-                SELECT coalesced_summary_id, summary_id, member_index
-                FROM coalesced_summary_members
-                ORDER BY coalesced_summary_id ASC, member_index ASC
-                """
-            ).fetchall()
+            selected_coalesced_ids = [int(row["id"]) for row in rows]
+            if selected_coalesced_ids:
+                placeholders = ",".join("?" for _ in selected_coalesced_ids)
+                members = self._conn.execute(
+                    f"""
+                    SELECT coalesced_summary_id, summary_id, member_index
+                    FROM coalesced_summary_members
+                    WHERE coalesced_summary_id IN ({placeholders})
+                    ORDER BY coalesced_summary_id ASC, member_index ASC
+                    """,
+                    selected_coalesced_ids,
+                ).fetchall()
+            else:
+                members = []
         members_by_id: dict[int, list[int]] = {}
         for item in members:
             coalesced_id = int(item["coalesced_summary_id"])
