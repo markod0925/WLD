@@ -1390,6 +1390,210 @@ class SQLiteStorage(ActivityRepository):
             for row in rows
         ]
 
+    def list_audit_summaries(
+        self,
+        *,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if start_ts is not None:
+            clauses.append("s.start_ts >= ?")
+            values.append(float(start_ts))
+        if end_ts is not None:
+            clauses.append("s.start_ts < ?")
+            values.append(float(end_ts))
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    s.id,
+                    s.job_id,
+                    s.start_ts,
+                    s.end_ts,
+                    s.summary_text,
+                    s.summary_json,
+                    s.created_ts,
+                    sj.job_type,
+                    sj.target_day
+                FROM summaries AS s
+                LEFT JOIN summary_jobs AS sj ON sj.id = s.job_id
+                """
+                + where_clause
+                + """
+                ORDER BY s.start_ts ASC, s.id ASC
+                """
+                ,
+                values,
+            ).fetchall()
+        return [
+            {
+                "summary_id": int(row["id"]),
+                "job_id": int(row["job_id"]),
+                "start_ts": float(row["start_ts"]),
+                "end_ts": float(row["end_ts"]),
+                "summary_text": str(row["summary_text"]),
+                "summary_json": json.loads(str(row["summary_json"])),
+                "created_ts": float(row["created_ts"]),
+                "job_type": None if row["job_type"] is None else str(row["job_type"]),
+                "target_day": None if row["target_day"] is None else str(row["target_day"]),
+            }
+            for row in rows
+        ]
+
+    def list_audit_daily_summaries(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if start_day is not None:
+            clauses.append("day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("day < ?")
+            values.append(end_day_exclusive.isoformat())
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, day, created_ts, recap_text, recap_json, source_batch_count
+                FROM daily_summaries
+                """
+                + where_clause
+                + """
+                ORDER BY day ASC, id ASC
+                """
+                ,
+                values,
+            ).fetchall()
+        return [
+            {
+                "daily_summary_id": int(row["id"]),
+                "day": str(row["day"]),
+                "created_ts": float(row["created_ts"]),
+                "recap_text": str(row["recap_text"]),
+                "recap_json": json.loads(str(row["recap_json"])) if row["recap_json"] else None,
+                "source_batch_count": int(row["source_batch_count"]),
+            }
+            for row in rows
+        ]
+
+    def list_audit_coalesced_summaries(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if start_day is not None:
+            clauses.append("cs.day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("cs.day < ?")
+            values.append(end_day_exclusive.isoformat())
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    cs.id,
+                    cs.day,
+                    cs.start_ts,
+                    cs.end_ts,
+                    cs.summary_text,
+                    cs.summary_json,
+                    cs.created_ts
+                FROM coalesced_summaries AS cs
+                """
+                + where_clause
+                + """
+                ORDER BY cs.day ASC, cs.start_ts ASC, cs.id ASC
+                """
+                ,
+                values,
+            ).fetchall()
+            members = self._conn.execute(
+                """
+                SELECT coalesced_summary_id, summary_id, member_index
+                FROM coalesced_summary_members
+                ORDER BY coalesced_summary_id ASC, member_index ASC
+                """
+            ).fetchall()
+        members_by_id: dict[int, list[int]] = {}
+        for item in members:
+            coalesced_id = int(item["coalesced_summary_id"])
+            members_by_id.setdefault(coalesced_id, []).append(int(item["summary_id"]))
+        return [
+            {
+                "coalesced_id": int(row["id"]),
+                "day": str(row["day"]),
+                "start_ts": float(row["start_ts"]),
+                "end_ts": float(row["end_ts"]),
+                "summary_text": str(row["summary_text"]),
+                "summary_json": json.loads(str(row["summary_json"])),
+                "created_ts": float(row["created_ts"]),
+                "member_summary_ids": members_by_id.get(int(row["id"]), []),
+            }
+            for row in rows
+        ]
+
+    def list_audit_merge_diagnostics(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if start_day is not None:
+            clauses.append("day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("day < ?")
+            values.append(end_day_exclusive.isoformat())
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, day, left_summary_id, right_summary_id, embedding_cosine_similarity,
+                    app_similarity_score, window_similarity_score, keyword_overlap_score,
+                    temporal_gap_seconds, blockers_json, final_merge_score, decision, reasons_json, created_ts
+                FROM semantic_merge_diagnostics
+                """
+                + where_clause
+                + """
+                ORDER BY day ASC, id ASC
+                """
+                ,
+                values,
+            ).fetchall()
+        return [
+            {
+                "diagnostic_id": int(row["id"]),
+                "day": str(row["day"]),
+                "left_summary_id": int(row["left_summary_id"]),
+                "right_summary_id": int(row["right_summary_id"]),
+                "embedding_cosine_similarity": float(row["embedding_cosine_similarity"]),
+                "app_similarity_score": float(row["app_similarity_score"]),
+                "window_similarity_score": float(row["window_similarity_score"]),
+                "keyword_overlap_score": float(row["keyword_overlap_score"]),
+                "temporal_gap_seconds": float(row["temporal_gap_seconds"]),
+                "blockers_json": json.loads(str(row["blockers_json"])),
+                "final_merge_score": float(row["final_merge_score"]),
+                "decision": str(row["decision"]),
+                "reasons_json": json.loads(str(row["reasons_json"])),
+                "created_ts": float(row["created_ts"]),
+            }
+            for row in rows
+        ]
+
     def get_coalesced_member_count(self, coalesced_summary_id: int) -> int:
         with self._lock:
             row = self._conn.execute(
