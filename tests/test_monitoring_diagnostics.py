@@ -24,5 +24,6 @@ def test_diagnostics_service_delegates_status_and_snapshot(tmp_path: Path) -> No
     try:
         assert services.diagnostics_service.get_status() == services.get_status()
         assert services.diagnostics_service.get_diagnostics_snapshot() == services.storage.get_diagnostics_snapshot()
+        assert services.get_status()["shutdown_in_progress"] is False
     finally:
         services.shutdown()

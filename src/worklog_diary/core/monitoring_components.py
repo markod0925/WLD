@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 from dataclasses import dataclass
@@ -626,22 +625,9 @@ class DiagnosticsService:
         summary_runtime = self.services.summarizer.get_runtime_status()
         lifecycle = self.lifecycle_manager.snapshot()
         drain = self.flush_coordinator.snapshot()
-
         monitoring_state = "Monitoring"
         if not snapshot.monitoring_active:
             monitoring_state = "Paused (PC locked)" if lifecycle["paused_by_lock"] else "Paused"
-
-        buffer_state = _synthesize_buffer_state(
-            pending_counts=pending,
-            running_jobs=int(summary_runtime["running_jobs"]),
-            summary_admission_paused=bool(summary_runtime["summary_admission_paused"]),
-        )
-        approx_batches_remaining = _estimate_remaining_batches(
-            pending_counts=pending,
-            pending_summary_jobs=int(summary_runtime["pending_summary_jobs"]),
-            max_text_segments=max(1, self.services.batch_builder.max_text_segments),
-            max_screenshots=max(1, self.services.batch_builder.max_screenshots),
-        )
 
         return {
             "monitoring_active": snapshot.monitoring_active,
@@ -675,13 +661,12 @@ class DiagnosticsService:
             "flush_drain_active": bool(drain["drain_active"]),
             "flush_drain_reason": drain["drain_reason"],
             "flush_drain_cancel_requested": bool(drain["cancel_requested"]),
-            "buffer_state": buffer_state,
-            "approx_remaining_batches": approx_batches_remaining,
             "max_parallel_summary_jobs": int(summary_runtime["max_parallel_summary_jobs"]),
             "unrecoverable_summary_error": summary_runtime["unrecoverable_error"],
             "summary_admission_paused": bool(summary_runtime["summary_admission_paused"]),
             "process_backlog_only_while_locked": bool(summary_runtime["process_backlog_only_while_locked"]),
             "session_locked": summary_runtime["session_locked"],
+            "shutdown_in_progress": bool(self.services.shutdown_event.is_set()),
         }
 
 
@@ -695,34 +680,3 @@ def _has_pending_backlog(pending_counts: dict[str, int]) -> bool:
     )
 
 
-def _synthesize_buffer_state(
-    pending_counts: dict[str, int],
-    running_jobs: int,
-    *,
-    summary_admission_paused: bool,
-) -> str:
-    has_backlog = _has_pending_backlog(pending_counts)
-    if running_jobs > 0:
-        if has_backlog:
-            return "Summarizing, backlog remaining"
-        return "Summarizing"
-    if has_backlog and summary_admission_paused:
-        return "Backlog waiting for PC lock"
-    if has_backlog:
-        return "Buffer pending"
-    return "Buffer empty"
-
-
-def _estimate_remaining_batches(
-    pending_counts: dict[str, int],
-    pending_summary_jobs: int,
-    max_text_segments: int,
-    max_screenshots: int,
-) -> int:
-    text_batches = math.ceil(pending_counts["text_segments"] / max_text_segments) if pending_counts["text_segments"] > 0 else 0
-    screenshot_batches = (
-        math.ceil(pending_counts["screenshots"] / max_screenshots) if pending_counts["screenshots"] > 0 else 0
-    )
-    interval_batches = 1 if pending_counts["intervals"] > 0 else 0
-    key_batches = 1 if pending_counts["key_events"] > 0 or pending_counts["processed_key_events"] > 0 else 0
-    return max(pending_summary_jobs, text_batches + screenshot_batches + interval_batches + key_batches)

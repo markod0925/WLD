@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import sys
 import threading
-from datetime import datetime
+from collections.abc import Callable
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from ..core.services import MonitoringServices
 from ..core.monitoring_components import DiagnosticsService
 from ..resources import app_logo_path
 from .settings_window import SettingsWindow
 from .summaries_window import SummariesWindow
+from .tray_status_view_model import build_tray_menu_actions, build_tray_status_snapshot, format_tray_tooltip
 
 
 class NotificationBridge(QObject):
@@ -50,47 +51,6 @@ class TrayController:
         self.summaries_window.setWindowIcon(window_icon)
 
         self.menu = QMenu()
-        self.status_action = self.menu.addAction("Status: idle")
-        self.status_action.setEnabled(False)
-        self.buffer_action = self.menu.addAction("Buffer: unknown")
-        self.buffer_action.setEnabled(False)
-        self.jobs_action = self.menu.addAction("Summary jobs: queued=0 running=0")
-        self.jobs_action.setEnabled(False)
-        self.pending_action = self.menu.addAction("Pending: text=0 screenshots=0 summary_jobs=0")
-        self.pending_action.setEnabled(False)
-        self.menu.addSeparator()
-
-        action_start = self.menu.addAction("Start Monitoring")
-        action_start.triggered.connect(self._start)
-
-        action_pause = self.menu.addAction("Pause Monitoring")
-        action_pause.triggered.connect(self._pause)
-
-        action_stop = self.menu.addAction("Stop Monitoring")
-        action_stop.triggered.connect(self._stop)
-
-        self.menu.addSeparator()
-
-        action_flush = self.menu.addAction("Flush Now (Drain)")
-        action_flush.triggered.connect(self._flush)
-
-        action_stop_flush = self.menu.addAction("Stop Flush Drain")
-        action_stop_flush.triggered.connect(self._stop_flush_drain)
-
-        action_diagnostics = self.menu.addAction("Diagnostics Snapshot")
-        action_diagnostics.triggered.connect(self._show_diagnostics)
-
-        action_settings = self.menu.addAction("Settings")
-        action_settings.triggered.connect(self._open_settings)
-
-        action_summaries = self.menu.addAction("Summaries")
-        action_summaries.triggered.connect(self._open_summaries)
-
-        self.menu.addSeparator()
-
-        action_exit = self.menu.addAction("Exit")
-        action_exit.triggered.connect(self._exit)
-
         self.tray.setContextMenu(self.menu)
 
         self.status_timer = QTimer()
@@ -154,42 +114,6 @@ class TrayController:
         title = titles.get(category, "WorkLog Diary")
         self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 5000)
 
-    def _show_diagnostics(self) -> None:
-        if self.diagnostics_service is not None:
-            diagnostics = self.diagnostics_service.get_diagnostics_snapshot()
-        else:
-            diagnostics = self.services.storage.get_diagnostics_snapshot()
-        pending = diagnostics["pending_counts"]
-        jobs = diagnostics["summary_jobs"]
-        ranges = diagnostics["pending_ranges"]
-
-        def _format_range(value: object) -> str:
-            if not isinstance(value, dict):
-                return "-"
-            return f"count={value['count']} start={value['start_ts']:.3f} end={value['end_ts']:.3f}"
-
-        body = (
-            "Pending counts\n"
-            f"- Intervals: {pending['intervals']}\n"
-            f"- Key events (unprocessed): {pending['key_events']}\n"
-            f"- Key events (processed): {pending['processed_key_events']}\n"
-            f"- Text segments: {pending['text_segments']}\n"
-            f"- Screenshots: {pending['screenshots']}\n\n"
-            "Pending ranges\n"
-            f"- Intervals: {_format_range(ranges['active_intervals_unsummarized'])}\n"
-            f"- Blocked intervals: {_format_range(ranges['blocked_intervals_unsummarized'])}\n"
-            f"- Unprocessed key events: {_format_range(ranges['key_events_unprocessed'])}\n"
-            f"- Text segments: {_format_range(ranges['text_segments_pending'])}\n"
-            f"- Screenshots: {_format_range(ranges['screenshots_pending'])}\n\n"
-            "Summary jobs\n"
-            f"- Queued: {jobs['queued']}\n"
-            f"- Running: {jobs['running']}\n"
-            f"- Failed: {jobs['failed']}\n"
-            f"- Succeeded: {jobs['succeeded']}\n"
-            f"- Cancelled: {jobs['cancelled']}"
-        )
-        QMessageBox.information(None, "WorkLog Diagnostics", body)
-
     def _open_settings(self) -> None:
         self.settings_window.load_from_config()
         self.settings_window.show()
@@ -201,6 +125,11 @@ class TrayController:
         self.summaries_window.show()
         self.summaries_window.raise_()
         self.summaries_window.activateWindow()
+
+    def _open_search_summaries(self) -> None:
+        self._open_summaries()
+        self.summaries_window.search_input.setFocus()
+        self.summaries_window.search_input.selectAll()
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
@@ -220,64 +149,36 @@ class TrayController:
             status = self.diagnostics_service.get_status()
         else:
             status = self.services.get_status()
-        monitoring = str(status["monitoring_state"])
-        blocked = "yes" if status["blocked"] else "no"
+        snapshot = build_tray_status_snapshot(status)
         self.tray.setIcon(self._select_tray_icon(status))
+        self.tray.setToolTip(format_tray_tooltip(snapshot))
+        self._rebuild_menu(snapshot)
 
-        foreground = status["foreground"]
-        if foreground is not None:
-            context = f"{foreground.process_name} | {foreground.window_title[:60]}"
-        else:
-            context = "No active window"
+    def _rebuild_menu(self, snapshot) -> None:
+        self.menu.clear()
+        for spec in build_tray_menu_actions(snapshot):
+            if spec.separator_before and self.menu.actions():
+                self.menu.addSeparator()
+            action = self.menu.addAction(spec.label)
+            action.setEnabled(spec.enabled)
+            action.triggered.connect(self._menu_callback_for(spec.command))
 
-        self.status_action.setText(f"Status: {monitoring} | blocked: {blocked}")
-        self.buffer_action.setText(
-            f"Buffer: {status['buffer_state']} | approx batches: {status['approx_remaining_batches']}"
-        )
-        if bool(status.get("summary_admission_paused")):
-            self.buffer_action.setText(f"{self.buffer_action.text()} | summary starts paused")
-
-        jobs = status["summary_jobs"]
-        self.jobs_action.setText(
-            "Summary jobs: "
-            f"queued={jobs['queued']} running={jobs['running']} completed={jobs['completed']} failed={jobs['failed']}"
-        )
-        self.pending_action.setText(
-            "Pending: "
-            f"text={status['pending_text_segment_count']} "
-            f"screenshots={status['pending_screenshot_count']} "
-            f"summary_jobs={status['pending_summary_job_count']}"
-        )
-
-        last_flush = "-"
-        if status["last_flush_ts"] is not None:
-            last_flush = datetime.fromtimestamp(status["last_flush_ts"]).strftime("%H:%M:%S")
-
-        next_flush = "-"
-        if status["next_flush_ts"] is not None:
-            next_flush = datetime.fromtimestamp(status["next_flush_ts"]).strftime("%H:%M:%S")
-
-        pending = status["pending"]
-        drain_state = "active" if status["flush_drain_active"] else "idle"
-        tooltip = (
-            "WorkLog Diary\n"
-            f"Monitoring: {monitoring}\n"
-            f"Blocked: {blocked}\n"
-            f"Context: {context}\n"
-            f"Buffer state: {status['buffer_state']}\n"
-            f"Summary admission paused: {bool(status.get('summary_admission_paused'))}\n"
-            f"Approx remaining batches: {status['approx_remaining_batches']}\n"
-            f"Flush drain: {drain_state}\n"
-            f"Last flush: {last_flush}\n"
-            f"Next flush: {next_flush}\n"
-            f"Pending intervals: {pending['intervals']}\n"
-            f"Pending keys: {pending['key_events']}\n"
-            f"Pending text: {pending['text_segments']}\n"
-            f"Pending screenshots: {pending['screenshots']}\n"
-            f"Summary jobs queued/running/completed/failed: "
-            f"{jobs['queued']}/{jobs['running']}/{jobs['completed']}/{jobs['failed']}"
-        )
-        self.tray.setToolTip(tooltip)
+    def _menu_callback_for(self, command: str) -> Callable[[], None]:
+        callbacks = {
+            "show_summaries": self._open_summaries,
+            "search_summaries": self._open_search_summaries,
+            "start_capture": self._start,
+            "resume_capture": self._start,
+            "pause_capture": self._pause,
+            "flush_now": self._flush,
+            "stop_flush_drain": self._stop_flush_drain,
+            "settings": self._open_settings,
+            "quit": self._exit,
+        }
+        callback = callbacks.get(command)
+        if callback is None:
+            return lambda: None
+        return callback
 
     def _select_tray_icon(self, status: dict) -> QIcon:
         if not bool(status["monitoring_active"]):

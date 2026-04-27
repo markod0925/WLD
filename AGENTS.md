@@ -25,3 +25,9 @@ Use:
 
 ```bash
 tools/run_tests.sh
+```
+
+## Tray UX Rule
+The Windows tray context menu must remain action-only.
+Live status information belongs only in the hover tooltip and must be generated through the shared tray status view-model.
+Do not add independent status formatting in `tray.py`; use `tray_status_view_model.py` instead.

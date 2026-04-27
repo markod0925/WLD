@@ -171,6 +171,7 @@ class SessionMonitor:
             thread = self._thread
             hwnd = self._hwnd
             thread_id = self._thread_id
+            destroyed_logged = self._window_destroyed_logged
 
         if thread is None:
             return
@@ -212,6 +213,9 @@ class SessionMonitor:
             )
 
         thread.join(timeout=5.0)
+
+        if hwnd and not destroyed_logged and not self._window_destroyed_logged and not thread.is_alive():
+            self._log_window_destroyed(hwnd)
 
     def _run_windows_loop(self) -> None:
         startup_complete = False
