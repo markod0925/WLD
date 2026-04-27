@@ -26,8 +26,10 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QDialogButtonBox,
     QCheckBox,
+    QFileDialog,
 )
 
+from worklog_diary.core.audit_export import AuditExportError, AuditExportOptions, export_audit_bundle
 from worklog_diary.core.lmstudio_logging import get_failed_stage
 from worklog_diary.core.summary_search import (
     SummarySearchParams,
@@ -98,6 +100,13 @@ class SummariesWindow(QWidget):
         self.coalescing_diag_button = QPushButton("Semantic Diagnostics")
         self.coalescing_diag_button.clicked.connect(self._open_semantic_diagnostics)
         tools.addWidget(self.coalescing_diag_button)
+
+        self.audit_export_button = QPushButton("Export audit bundle")
+        self.audit_export_button.setToolTip(
+            "Export generated summaries, daily recaps, coalesced summaries, and merge diagnostics."
+        )
+        self.audit_export_button.clicked.connect(self._export_audit_bundle)
+        tools.addWidget(self.audit_export_button)
         tools.addStretch(1)
 
         search_tools = QHBoxLayout()
@@ -547,6 +556,41 @@ class SummariesWindow(QWidget):
         table.setSortingEnabled(True)
         reload_rows()
         dialog.exec()
+
+    def _export_audit_bundle(self) -> None:
+        selected_dir = QFileDialog.getExistingDirectory(self, "Select export destination")
+        if not selected_dir:
+            return
+        try:
+            result = export_audit_bundle(
+                self.services.storage,
+                selected_dir,
+                AuditExportOptions(),
+                config=self.services.config,
+            )
+        except AuditExportError as exc:
+            self.logger.error("event=audit_export_ui_failed error=%s", exc)
+            QMessageBox.warning(
+                self,
+                "Audit export failed",
+                f"Could not export summary and merge diagnostics audit bundle.\n\n{exc}",
+            )
+            return
+
+        counts = result.counts
+        QMessageBox.information(
+            self,
+            "Audit export complete",
+            (
+                "Audit bundle exported successfully.\n\n"
+                "Scope: summaries and semantic merge diagnostics (no raw activity data).\n"
+                f"Folder: {result.output_dir}\n"
+                f"Summaries: {counts.get('summaries.jsonl', 0)}\n"
+                f"Daily summaries: {counts.get('daily_summaries.jsonl', 0)}\n"
+                f"Coalesced summaries: {counts.get('coalesced_summaries.jsonl', 0)}\n"
+                f"Merge diagnostics: {counts.get('merge_diagnostics.jsonl', 0)}"
+            ),
+        )
 
 
 def _build_summary_card_widget(
