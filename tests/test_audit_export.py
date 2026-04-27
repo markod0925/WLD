@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import date, datetime, time
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from worklog_diary.core.audit_export import AuditExportError, AuditExportOptions, export_audit_bundle
 from worklog_diary.core.config import AppConfig
@@ -198,7 +199,50 @@ def test_coalesced_members_query_scales_with_filtered_date_range(tmp_path: Path)
         assert rows[0]["member_summary_ids"] == [in_range_sid]
 
         members_query = next(sql for sql in statements if "FROM coalesced_summary_members" in sql)
-        assert "WHERE coalesced_summary_id IN" in members_query
+        assert "INNER JOIN coalesced_summaries AS cs" in members_query
+        assert "cs.day >= '2026-04-15'" in members_query
+        assert "cs.day < '2026-04-21'" in members_query
+    finally:
+        storage.close()
+
+
+def test_coalesced_members_query_does_not_depend_on_sql_variable_limit(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "wld.db"))
+    try:
+        for day_offset in range(12):
+            day = date(2026, 4, 1 + day_offset)
+            sid = _insert_summary(
+                storage,
+                start_ts=_ts(day, 9, 0),
+                end_ts=_ts(day, 9, 15),
+                text=f"summary-{day_offset}",
+            )
+            storage.replace_coalesced_summaries_for_day(
+                day,
+                [
+                    type(
+                        "Plan",
+                        (),
+                        {
+                            "start_ts": _ts(day, 9, 0),
+                            "end_ts": _ts(day, 9, 15),
+                            "summary_text": f"coalesced-{day_offset}",
+                            "summary_json": {"confidence_bucket": "High"},
+                            "source_summary_ids": [sid],
+                        },
+                    )
+                ],
+            )
+
+        statements: list[str] = []
+        storage._conn.set_trace_callback(statements.append)
+        rows = storage.list_audit_coalesced_summaries()
+        storage._conn.set_trace_callback(None)
+
+        assert len(rows) == 12
+        members_query = next(sql for sql in statements if "FROM coalesced_summary_members" in sql)
+        assert "INNER JOIN coalesced_summaries AS cs" in members_query
+        assert "WHERE coalesced_summary_id IN" not in members_query
     finally:
         storage.close()
 

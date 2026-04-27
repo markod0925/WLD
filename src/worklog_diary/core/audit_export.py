@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -49,7 +50,7 @@ def export_audit_bundle(
     end_ts = _day_start_ts(end_day_exclusive) if end_day_exclusive is not None else None
 
     base_dir = Path(output_dir)
-    bundle_dir = base_dir / f"wld_audit_export_{started_at.strftime('%Y%m%d_%H%M%S')}"
+    bundle_dir = base_dir / _build_bundle_dir_name(started_at)
     _LOGGER.info(
         "event=audit_export_start output_dir=%s start_day=%s end_day=%s export_scope=%s",
         str(bundle_dir),
@@ -158,6 +159,10 @@ def _build_summary_row(*, row: dict[str, Any], options: AuditExportOptions) -> d
         "model_name": summary_json.get("model_name"),
         "created_at": float(row["created_ts"]),
     }
+
+
+def _build_bundle_dir_name(started_at: datetime) -> str:
+    return f"wld_audit_export_{started_at.strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
 
 
 def _build_daily_summary_row(row: dict[str, Any]) -> dict[str, Any]:
