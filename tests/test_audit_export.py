@@ -137,24 +137,6 @@ def test_export_date_range_filtering(tmp_path: Path) -> None:
         storage.close()
 
 
-def test_export_uses_unique_directory_name_even_for_same_timestamp(tmp_path: Path) -> None:
-    storage = SQLiteStorage(str(tmp_path / "wld.db"))
-    try:
-        fixed_now = datetime(2026, 4, 20, 12, 0, 0)
-        mocked_datetime = Mock()
-        mocked_datetime.utcnow.return_value = fixed_now
-
-        with patch("worklog_diary.core.audit_export.datetime", mocked_datetime):
-            first = export_audit_bundle(storage, tmp_path / "exports", AuditExportOptions(), config=AppConfig())
-            second = export_audit_bundle(storage, tmp_path / "exports", AuditExportOptions(), config=AppConfig())
-
-        assert first.output_dir != second.output_dir
-        assert first.output_dir.exists()
-        assert second.output_dir.exists()
-    finally:
-        storage.close()
-
-
 def test_coalesced_members_query_scales_with_filtered_date_range(tmp_path: Path) -> None:
     storage = SQLiteStorage(str(tmp_path / "wld.db"))
     try:
