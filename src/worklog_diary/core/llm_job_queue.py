@@ -41,6 +41,12 @@ class _QueuedLLMJob(Generic[T]):
     on_cancelled: Callable[[LLMJobMetadata, str], None] | None = None
 
 
+@dataclass(slots=True)
+class _LLMWorkerHandle:
+    thread: threading.Thread
+    stop_event: threading.Event
+
+
 class LLMJobQueue:
     def __init__(self, *, max_concurrent_jobs: int = 1, logger: logging.Logger | None = None) -> None:
         self.logger = logger or logging.getLogger(__name__)
@@ -55,8 +61,10 @@ class LLMJobQueue:
         self._closing = False
         self._closed = False
         self._stop_event = threading.Event()
-        self._workers: list[threading.Thread] = []
+        self._workers: list[_LLMWorkerHandle] = []
+        self._retired_workers: list[_LLMWorkerHandle] = []
         self._start_workers()
+        self.logger.info("event=llm_queue_started max_concurrent_jobs=%s", self._max_concurrent_jobs)
 
     def allocate_job_id(self, job_type: str) -> str:
         with self._condition:
@@ -173,6 +181,23 @@ class LLMJobQueue:
             "stopped": closed or closing or not accepting_jobs,
         }
 
+    def set_max_concurrent_jobs(self, max_concurrent_jobs: int) -> None:
+        retired_workers: list[_LLMWorkerHandle] = []
+        with self._condition:
+            self._max_concurrent_jobs = max(1, int(max_concurrent_jobs))
+            if len(self._workers) > self._max_concurrent_jobs:
+                retired_workers = self._workers[self._max_concurrent_jobs :]
+                self._workers = self._workers[: self._max_concurrent_jobs]
+                for handle in retired_workers:
+                    handle.stop_event.set()
+                self._retired_workers.extend(retired_workers)
+            self._start_workers_locked()
+            self._condition.notify_all()
+            effective = self._max_concurrent_jobs
+        for handle in retired_workers:
+            handle.thread.join(timeout=2)
+        self.logger.info("event=llm_queue_concurrency_updated max_concurrent_jobs=%s", effective)
+
     def stop(self, *, reason: str = "shutdown") -> int:
         with self._condition:
             if self._closed:
@@ -216,27 +241,48 @@ class LLMJobQueue:
             )
             job.done.set()
 
-        for worker in self._workers:
-            worker.join(timeout=2)
+        with self._condition:
+            worker_handles = [*self._workers, *self._retired_workers]
+            for handle in worker_handles:
+                handle.stop_event.set()
+        for handle in worker_handles:
+            handle.thread.join(timeout=2)
         with self._condition:
             self._closing = False
             self._closed = True
             self._condition.notify_all()
+            self._workers.clear()
+            self._retired_workers.clear()
         return cancelled
 
     def _start_workers(self) -> None:
         with self._condition:
-            while len(self._workers) < self._max_concurrent_jobs:
-                index = len(self._workers) + 1
-                worker = threading.Thread(target=self._worker_loop, name=f"LLMJobWorker-{index}", daemon=True)
-                self._workers.append(worker)
-                worker.start()
+            self._start_workers_locked()
 
-    def _worker_loop(self) -> None:
+    def _start_workers_locked(self) -> None:
+        while len(self._workers) < self._max_concurrent_jobs:
+            index = len(self._workers) + 1
+            worker_stop_event = threading.Event()
+            worker = threading.Thread(
+                target=self._worker_loop,
+                args=(worker_stop_event,),
+                name=f"LLMJobWorker-{index}",
+                daemon=True,
+            )
+            self._workers.append(_LLMWorkerHandle(thread=worker, stop_event=worker_stop_event))
+            worker.start()
+
+    def _worker_loop(self, worker_stop_event: threading.Event) -> None:
         while True:
             with self._condition:
-                while not self._stop_event.is_set() and (not self._queue or self._active_jobs >= self._max_concurrent_jobs):
+                while (
+                    not self._stop_event.is_set()
+                    and not worker_stop_event.is_set()
+                    and (not self._queue or self._active_jobs >= self._max_concurrent_jobs)
+                ):
                     self._condition.wait(timeout=0.5)
+                if worker_stop_event.is_set():
+                    return
                 if self._stop_event.is_set() and not self._queue:
                     return
                 if not self._queue:

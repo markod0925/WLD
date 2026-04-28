@@ -59,6 +59,9 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
         llm_accepting_jobs = bool(llm_queue.get("accepting_jobs", True))
         llm_closing = bool(llm_queue.get("closing"))
         llm_closed = bool(llm_queue.get("closed"))
+        llm_max_concurrent = _coerce_int(llm_queue.get("max_concurrent"))
+    else:
+        llm_max_concurrent = 0
 
     unrecoverable_error = status.get("unrecoverable_summary_error")
     has_pending_activity = (
@@ -112,7 +115,10 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
         llm_line = "LLM: idle"
     detail_lines.append(llm_line)
 
-    detail_lines.append(f"Queue: {queued_jobs} queued, {running_jobs} running")
+    if llm_max_concurrent > 0:
+        detail_lines.append(f"Queue: {queued_jobs} queued, {running_jobs} in flight, max {llm_max_concurrent}")
+    else:
+        detail_lines.append(f"Queue: {queued_jobs} queued, {running_jobs} running")
 
     if (
         process_backlog_only_while_locked

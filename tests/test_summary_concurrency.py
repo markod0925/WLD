@@ -121,7 +121,7 @@ def test_summary_worker_pool_shrinks_and_stops_cleanly(tmp_path: Path) -> None:
         _wait_for_running_jobs(summarizer, expected=2)
 
         summarizer.update_max_parallel_jobs(1)
-        assert summarizer.get_runtime_status()["max_parallel_summary_jobs"] == 1
+        assert summarizer.get_runtime_status()["max_concurrent_summary_llm_requests"] == 1
         assert len(summarizer._workers) == 1
 
         client.release.set()

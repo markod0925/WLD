@@ -25,7 +25,7 @@ SAFE_CONFIG_KEYS: tuple[str, ...] = (
     "flush_interval_seconds",
     "blocked_processes",
     "process_backlog_only_while_locked",
-    "max_parallel_summary_jobs",
+    "max_concurrent_summary_llm_requests",
     "request_timeout_seconds",
     "daily_request_timeout_seconds",
     "capture_mode",
@@ -72,7 +72,7 @@ class AppConfig:
     start_monitoring_on_launch: bool = False
     max_screenshots_per_summary: int = 3
     max_text_segments_per_summary: int = 400
-    max_parallel_summary_jobs: int = 2
+    max_concurrent_summary_llm_requests: int = 2
     process_backlog_only_while_locked: bool = True
     request_timeout_seconds: int = 600
     daily_request_timeout_seconds: int | None = None
@@ -131,7 +131,7 @@ class AppConfig:
         mode = self.capture_mode.strip().lower()
         self.capture_mode = mode if mode in SUPPORTED_CAPTURE_MODES else "active_window"
 
-        self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
+        self.max_concurrent_summary_llm_requests = max(1, int(self.max_concurrent_summary_llm_requests))
         self.process_backlog_only_while_locked = bool(self.process_backlog_only_while_locked)
         self.lmstudio_max_prompt_chars = max(2000, int(self.lmstudio_max_prompt_chars))
         if self.daily_request_timeout_seconds is not None:
@@ -306,7 +306,8 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
     values = defaults.copy()
     needs_save = False
 
-    unknown_fields = sorted(name for name in data.keys() if name not in field_names and name != "screenshot_dedup_threshold")
+    deprecated_aliases = {"max_parallel_summary_jobs"}
+    unknown_fields = sorted(name for name in data.keys() if name not in field_names and name not in deprecated_aliases)
     if unknown_fields:
         needs_save = True
         _LOGGER.warning(
@@ -344,7 +345,7 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "start_monitoring_on_launch": _coerce_bool,
         "max_screenshots_per_summary": _coerce_int,
         "max_text_segments_per_summary": _coerce_int,
-        "max_parallel_summary_jobs": _coerce_int,
+        "max_concurrent_summary_llm_requests": _coerce_int,
         "process_backlog_only_while_locked": _coerce_bool,
         "request_timeout_seconds": _coerce_int,
         "daily_request_timeout_seconds": _coerce_optional_int,
@@ -389,6 +390,31 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
             needs_save = True
             continue
         values[field_name] = converter(data[field_name], field_name, source=source)
+
+    has_new_summary_concurrency = "max_concurrent_summary_llm_requests" in data
+    has_legacy_summary_concurrency = "max_parallel_summary_jobs" in data
+    if has_new_summary_concurrency and has_legacy_summary_concurrency:
+        legacy_value = _coerce_int(data["max_parallel_summary_jobs"], "max_parallel_summary_jobs", source=source)
+        canonical_value = values["max_concurrent_summary_llm_requests"]
+        if legacy_value != canonical_value:
+            _LOGGER.warning(
+                "event=config_legacy_field_conflict source=%s canonical_field=%s legacy_field=%s behavior=%s",
+                source or "config",
+                "max_concurrent_summary_llm_requests",
+                "max_parallel_summary_jobs",
+                "prefer_canonical",
+            )
+            needs_save = True
+    elif has_legacy_summary_concurrency:
+        migrated_value = _coerce_int(data["max_parallel_summary_jobs"], "max_parallel_summary_jobs", source=source)
+        values["max_concurrent_summary_llm_requests"] = migrated_value
+        needs_save = True
+        _LOGGER.warning(
+            "event=config_deprecated_field_migrated source=%s old_field=%s new_field=%s",
+            source or "config",
+            "max_parallel_summary_jobs",
+            "max_concurrent_summary_llm_requests",
+        )
 
     has_phash_threshold = "screenshot_dedup_phash_threshold" in data
     has_legacy_threshold = "screenshot_dedup_threshold" in data

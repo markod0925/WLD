@@ -23,7 +23,7 @@ def _config_for_tmp(tmp_path: Path, **overrides: object) -> AppConfig:
             "config_path": str(tmp_path / "app" / "config.json"),
             "max_text_segments_per_summary": 1,
             "max_screenshots_per_summary": 1,
-            "max_parallel_summary_jobs": 2,
+            "max_concurrent_summary_llm_requests": 2,
         }
     )
     data.update(overrides)

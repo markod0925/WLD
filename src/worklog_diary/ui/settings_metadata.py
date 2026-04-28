@@ -48,7 +48,7 @@ EXPOSURE_BY_KEY: dict[str, ExposureLevel] = {
     "start_monitoring_on_launch": "user",
     "max_screenshots_per_summary": "advanced",
     "max_text_segments_per_summary": "advanced",
-    "max_parallel_summary_jobs": "advanced",
+    "max_concurrent_summary_llm_requests": "advanced",
     "process_backlog_only_while_locked": "advanced",
     "request_timeout_seconds": "advanced",
     "daily_request_timeout_seconds": "internal",
@@ -232,13 +232,13 @@ EXPOSED_SETTINGS: tuple[SettingUiMetadata, ...] = (
         step=0.5,
     ),
     _setting(
-        key="max_parallel_summary_jobs",
-        label="Max parallel summary jobs:",
+        key="max_concurrent_summary_llm_requests",
+        label="Max concurrent summary LLM requests:",
         tooltip=(
-            "Description: Maximum concurrent summary requests per flush cycle.\n"
-            "Impact: Higher values increase throughput but can overload local model serving.\n"
-            "Range: Minimum is 1.\n"
-            f"Default: {DEFAULTS['max_parallel_summary_jobs']}."
+            "Description: Maximum number of queued summary-generation requests sent to LM Studio at the same time.\n"
+            "Impact: Controls in-flight summary LLM requests (queue dispatch concurrency), not summaries-per-batch.\n"
+            "Caution: Higher values can increase VRAM/CPU load or still serialize if the backend cannot run requests concurrently.\n"
+            f"Default: {DEFAULTS['max_concurrent_summary_llm_requests']}."
         ),
         exposure="advanced",
         widget="int",

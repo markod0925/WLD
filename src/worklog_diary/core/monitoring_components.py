@@ -131,6 +131,7 @@ class ServiceRegistry:
                 if self.config.daily_request_timeout_seconds is not None
                 else max(self.config.request_timeout_seconds * 2, 600)
             ),
+            max_concurrent_jobs=self.config.max_concurrent_summary_llm_requests,
             prompt_builder=LMStudioPromptBuilder(
                 max_summary_text_segments=self.config.max_text_segments_per_summary,
                 max_prompt_chars=self.config.lmstudio_max_prompt_chars,
@@ -178,7 +179,7 @@ class ServiceRegistry:
             storage=storage,
             batch_builder=batch_builder,
             lm_client=lmstudio_client,
-            max_parallel_jobs=self.config.max_parallel_summary_jobs,
+            max_parallel_jobs=self.config.max_concurrent_summary_llm_requests,
             process_backlog_only_while_locked=self.config.process_backlog_only_while_locked,
             error_notifier=error_notifier,
             shutdown_event=shutdown_event,
@@ -459,9 +460,9 @@ class FlushCoordinator:
                 self._drain_reason = reason
 
             self.logger.info(
-                "event=summary_drain_started reason=%s max_parallel_jobs=%s",
+                "event=summary_drain_started reason=%s max_concurrent_summary_llm_requests=%s",
                 reason,
-                self.services.summarizer.get_runtime_status()["max_parallel_summary_jobs"],
+                self.services.summarizer.get_runtime_status()["max_concurrent_summary_llm_requests"],
             )
 
             stop_reason = "empty"
@@ -687,11 +688,14 @@ class DiagnosticsService:
                 "running": int(summary_runtime["llm_queue_running_jobs"]),
                 "pending": int(summary_runtime["llm_queue_pending_jobs"]),
                 "max_concurrent": int(summary_runtime["llm_queue_max_concurrent_jobs"]),
+                "accepting_jobs": bool(summary_runtime["llm_queue_accepting_jobs"]),
+                "closing": bool(summary_runtime["llm_queue_closing"]),
+                "closed": bool(summary_runtime["llm_queue_closed"]),
             },
             "flush_drain_active": bool(drain["drain_active"]),
             "flush_drain_reason": drain["drain_reason"],
             "flush_drain_cancel_requested": bool(drain["cancel_requested"]),
-            "max_parallel_summary_jobs": int(summary_runtime["max_parallel_summary_jobs"]),
+            "max_concurrent_summary_llm_requests": int(summary_runtime["max_concurrent_summary_llm_requests"]),
             "unrecoverable_summary_error": summary_runtime["unrecoverable_error"],
             "summary_admission_paused": bool(summary_runtime["summary_admission_paused"]),
             "process_backlog_only_while_locked": bool(summary_runtime["process_backlog_only_while_locked"]),
@@ -708,5 +712,3 @@ def _has_pending_backlog(pending_counts: dict[str, int]) -> bool:
         or pending_counts["text_segments"] > 0
         or pending_counts["screenshots"] > 0
     )
-
-
