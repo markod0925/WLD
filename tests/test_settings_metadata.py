@@ -52,7 +52,7 @@ def test_settings_are_grouped_by_exposure_level() -> None:
         "screenshot_dir",
         "log_dir",
         "db_path",
-        "max_parallel_summary_jobs",
+        "max_concurrent_summary_llm_requests",
         "process_backlog_only_while_locked",
         "max_screenshots_per_summary",
         "max_text_segments_per_summary",
@@ -148,3 +148,10 @@ def test_semantic_preset_descriptions_present() -> None:
     assert "recommended default" in SEMANTIC_PRESET_DESCRIPTIONS["conservative"].lower()
     assert "broader" in SEMANTIC_PRESET_DESCRIPTIONS["aggressive"].lower()
     assert "disables" in SEMANTIC_PRESET_DESCRIPTIONS["off"].lower()
+
+
+def test_summary_concurrency_setting_uses_new_name_and_text() -> None:
+    setting = UI_SETTINGS_BY_KEY["max_concurrent_summary_llm_requests"]
+    assert setting.label == "Max concurrent summary LLM requests:"
+    assert "in-flight summary llm requests" in setting.tooltip.lower()
+    assert "parallel summary jobs" not in setting.tooltip.lower()

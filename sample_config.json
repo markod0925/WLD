@@ -20,7 +20,7 @@
   "start_monitoring_on_launch": false,
   "max_screenshots_per_summary": 3,
   "max_text_segments_per_summary": 400,
-  "max_parallel_summary_jobs": 2,
+  "max_concurrent_summary_llm_requests": 2,
   "request_timeout_seconds": 600,
   "activity_segment_min_duration_seconds": 180.0,
   "activity_segment_max_duration_seconds": 900.0,

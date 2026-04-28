@@ -119,3 +119,40 @@ def test_matching_legacy_dedup_threshold_does_not_log_conflict_or_force_save(cap
 
     assert needs_save is False
     assert not any("event=config_legacy_field_conflict" in record.message for record in caplog.records)
+
+
+def test_legacy_summary_concurrency_key_migrates_to_canonical(tmp_path: Path, caplog) -> None:
+    payload = config_module.AppConfig().to_dict()
+    payload.pop("max_concurrent_summary_llm_requests", None)
+    payload["max_parallel_summary_jobs"] = 2
+
+    caplog.clear()
+    cfg = config_module.AppConfig.from_dict(payload, source=str(tmp_path / "config.json"))
+    assert cfg.max_concurrent_summary_llm_requests == 2
+    assert any("event=config_deprecated_field_migrated" in record.message for record in caplog.records)
+
+
+def test_canonical_summary_concurrency_key_takes_precedence_over_legacy(tmp_path: Path, caplog) -> None:
+    payload = config_module.AppConfig().to_dict()
+    payload["max_concurrent_summary_llm_requests"] = 3
+    payload["max_parallel_summary_jobs"] = 2
+
+    caplog.clear()
+    cfg = config_module.AppConfig.from_dict(payload, source=str(tmp_path / "config.json"))
+    assert cfg.max_concurrent_summary_llm_requests == 3
+    assert any("event=config_legacy_field_conflict" in record.message for record in caplog.records)
+
+
+def test_save_config_writes_only_canonical_summary_concurrency_key(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    payload = config_module.AppConfig().to_dict()
+    payload.pop("max_concurrent_summary_llm_requests", None)
+    payload["max_parallel_summary_jobs"] = 4
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.max_concurrent_summary_llm_requests == 4
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["max_concurrent_summary_llm_requests"] == 4
+    assert "max_parallel_summary_jobs" not in saved

@@ -69,6 +69,7 @@ NUMERIC_FIELD_KEYS = {
     "last_pid",
     "line_end",
     "line_start",
+    "max_concurrent_summary_llm_requests",
     "max_parallel_jobs",
     "max_prompt_chars",
     "missing_files",
@@ -1407,7 +1408,12 @@ class LogAuditRunner:
             "lmstudio_base_urls": sorted({str(item.get("endpoint")) for item in self._flatten_request_records() if item.get("endpoint")}),
             "lmstudio_models": sorted({str(item.get("model")) for item in self._flatten_request_records() if item.get("model")}),
             "capture_modes_observed": dict(self.stats.capture["capture_modes"]),
-            "max_parallel_summary_jobs_observed": _max_from_timeline(self.stats.major_timeline, "summary_drain_started", "max_parallel_jobs"),
+            "max_concurrent_summary_llm_requests_observed": _max_from_timeline(
+                self.stats.major_timeline,
+                "summary_drain_started",
+                "max_concurrent_summary_llm_requests",
+            )
+            or _max_from_timeline(self.stats.major_timeline, "summary_drain_started", "max_parallel_jobs"),
             "request_timeout_seconds_observed": _max_from_timeline(self.stats.major_timeline, "request_submit", "timeout_s"),
             "config_instrumentation_gap": len(self.stats.config_events) == 0,
             "missing_fields": [
