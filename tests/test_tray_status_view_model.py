@@ -28,6 +28,7 @@ def _base_status(**overrides: object) -> dict[str, object]:
             "accepting_jobs": True,
             "closing": False,
             "closed": False,
+            "max_concurrent": 2,
         },
         "summary_admission_paused": False,
         "process_backlog_only_while_locked": False,
@@ -50,7 +51,7 @@ def test_tray_snapshot_and_menu_share_the_same_state_model() -> None:
         "WorkLog Diary: Active",
         "Capture: 1 screenshot buffered, 0 text segments buffered",
         "LLM: idle",
-        "Queue: 0 queued, 0 running",
+        "Queue: 0 queued, 0 in flight, max 2",
     ]
 
     menu_actions = build_tray_menu_actions(snapshot)

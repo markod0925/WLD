@@ -71,6 +71,10 @@ class Summarizer:
         self._last_admission_state: str | None = None
 
         self._ensure_worker_count_locked()
+        self.logger.info(
+            "event=summary_dispatcher_started max_concurrent_summary_llm_requests=%s",
+            self._max_parallel_jobs,
+        )
         self._emit_admission_state_if_changed(reason="startup")
 
     def stop(self) -> dict[str, int]:
@@ -126,6 +130,8 @@ class Summarizer:
                 self._retired_workers.extend(retired)
             self._ensure_worker_count_locked()
             self._condition.notify_all()
+            effective = self._max_parallel_jobs
+        self.logger.info("event=summary_dispatcher_concurrency_updated max_concurrent_summary_llm_requests=%s", effective)
 
     def set_process_backlog_only_while_locked(self, enabled: bool) -> None:
         with self._condition:
@@ -300,7 +306,7 @@ class Summarizer:
             "timed_out_jobs": int(persisted_counts.get("timed_out", 0)),
             "cancelled_jobs": int(persisted_counts.get("cancelled", 0)),
             "abandoned_jobs": int(persisted_counts.get("abandoned", 0)),
-            "max_parallel_summary_jobs": max_parallel,
+            "max_concurrent_summary_llm_requests": max_parallel,
             "has_unrecoverable_error": unrecoverable_error is not None,
             "unrecoverable_error": unrecoverable_error,
             "llm_queue_queued_jobs": int(llm_queue["queued_jobs"]),

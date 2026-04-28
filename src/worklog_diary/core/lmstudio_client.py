@@ -66,6 +66,7 @@ class LMStudioClient:
         daily_timeout_seconds: int | None = None,
         prompt_builder: LMStudioPromptBuilder | None = None,
         max_response_attempts: int = 2,
+        max_concurrent_jobs: int = 1,
         job_queue: LLMJobQueue | None = None,
     ) -> None:
         self.logger = logging.getLogger(__name__)
@@ -78,7 +79,10 @@ class LMStudioClient:
         )
         self.prompt_builder = prompt_builder or LMStudioPromptBuilder()
         self.max_response_attempts = max(1, int(max_response_attempts))
-        self.job_queue = job_queue or LLMJobQueue(logger=self.logger)
+        self.job_queue = job_queue or LLMJobQueue(max_concurrent_jobs=max_concurrent_jobs, logger=self.logger)
+
+    def set_summary_queue_concurrency(self, max_concurrent_jobs: int) -> None:
+        self.job_queue.set_max_concurrent_jobs(max_concurrent_jobs)
 
     def summarize_batch(
         self,

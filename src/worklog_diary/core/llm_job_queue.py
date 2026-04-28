@@ -57,6 +57,7 @@ class LLMJobQueue:
         self._stop_event = threading.Event()
         self._workers: list[threading.Thread] = []
         self._start_workers()
+        self.logger.info("event=llm_queue_started max_concurrent_jobs=%s", self._max_concurrent_jobs)
 
     def allocate_job_id(self, job_type: str) -> str:
         with self._condition:
@@ -173,6 +174,14 @@ class LLMJobQueue:
             "stopped": closed or closing or not accepting_jobs,
         }
 
+    def set_max_concurrent_jobs(self, max_concurrent_jobs: int) -> None:
+        with self._condition:
+            self._max_concurrent_jobs = max(1, int(max_concurrent_jobs))
+            self._start_workers_locked()
+            self._condition.notify_all()
+            effective = self._max_concurrent_jobs
+        self.logger.info("event=llm_queue_concurrency_updated max_concurrent_jobs=%s", effective)
+
     def stop(self, *, reason: str = "shutdown") -> int:
         with self._condition:
             if self._closed:
@@ -226,11 +235,14 @@ class LLMJobQueue:
 
     def _start_workers(self) -> None:
         with self._condition:
-            while len(self._workers) < self._max_concurrent_jobs:
-                index = len(self._workers) + 1
-                worker = threading.Thread(target=self._worker_loop, name=f"LLMJobWorker-{index}", daemon=True)
-                self._workers.append(worker)
-                worker.start()
+            self._start_workers_locked()
+
+    def _start_workers_locked(self) -> None:
+        while len(self._workers) < self._max_concurrent_jobs:
+            index = len(self._workers) + 1
+            worker = threading.Thread(target=self._worker_loop, name=f"LLMJobWorker-{index}", daemon=True)
+            self._workers.append(worker)
+            worker.start()
 
     def _worker_loop(self) -> None:
         while True:

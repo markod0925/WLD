@@ -168,7 +168,7 @@ Important fields:
 - `capture_mode`: `full_screen` or `active_window`
 - `foreground_poll_interval_seconds`
 - `flush_interval_seconds`
-- `max_parallel_summary_jobs`: concurrent summary worker limit (default `2`)
+- `max_concurrent_summary_llm_requests`: maximum in-flight summary LLM requests dispatched from the summary queue (default `2`)
 - `max_text_segments_per_summary`: also derives per-summary text truncation (`max_text_chars = max_text_segments_per_summary * 5`)
 - `max_screenshots_per_summary`
 - `lmstudio_max_prompt_chars`: prompt budget used for chunking
@@ -229,7 +229,8 @@ This is a selection-time filter only. Screenshots are still captured normally an
 
 Summary processing uses a bounded queue/worker dispatcher:
 
-- maximum concurrency is controlled by `max_parallel_summary_jobs`,
+- maximum concurrency is controlled by `max_concurrent_summary_llm_requests`,
+- this is dispatch concurrency for summary LLM calls (not summaries-per-batch),
 - batches are reserved before execution to avoid duplicate processing,
 - purge runs only for each batch that succeeds,
 - failed batches keep raw data retryable.
