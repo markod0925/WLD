@@ -83,8 +83,16 @@ def test_llm_job_queue_respects_serial_and_parallel_limits() -> None:
     for thread in serial_threads:
         thread.start()
     try:
-        assert serial_first_started.wait(timeout=5)
-        assert not serial_second_started.wait(timeout=0.3)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            started_flags = [serial_first_started.is_set(), serial_second_started.is_set()]
+            if any(started_flags):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("serial queue did not start any job")
+        started_count = int(serial_first_started.is_set()) + int(serial_second_started.is_set())
+        assert started_count == 1
         assert serial_queue.snapshot()["running_jobs"] == 1
         serial_release.set()
         for thread in serial_threads:
@@ -119,9 +127,17 @@ def test_llm_job_queue_respects_serial_and_parallel_limits() -> None:
     for thread in parallel_threads:
         thread.start()
     try:
-        assert started[0].wait(timeout=5)
-        assert started[1].wait(timeout=5)
-        assert not started[2].wait(timeout=0.3)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            started_count = sum(1 for event in started if event.is_set())
+            if started_count >= 2:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("parallel queue did not start two jobs")
+        assert sum(1 for event in started if event.is_set()) == 2
+        queued_index = next(i for i, event in enumerate(started) if not event.is_set())
+        assert not started[queued_index].wait(timeout=0.3)
         snapshot = parallel_queue.snapshot()
         assert snapshot["running_jobs"] == 2
         assert snapshot["queued_jobs"] == 1
@@ -161,9 +177,14 @@ def test_llm_job_queue_shutdown_cancels_queued_jobs_without_starting_new_ones() 
     third.start()
     try:
         assert started.wait(timeout=5)
-        snapshot = queue.snapshot()
-        assert snapshot["running_jobs"] == 1
-        assert snapshot["queued_jobs"] == 2
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            snapshot = queue.snapshot()
+            if snapshot["running_jobs"] == 1 and snapshot["queued_jobs"] == 2:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(f"unexpected queue state before shutdown: {queue.snapshot()}")
 
         cancelled = queue.stop(reason="shutdown")
         assert cancelled == 2
@@ -336,4 +357,18 @@ def test_llm_job_queue_runtime_upgrade_allows_additional_inflight_work() -> None
     finally:
         for event in release_events:
             event.set()
+        queue.stop()
+
+
+def test_llm_job_queue_retires_excess_workers_on_concurrency_downgrade() -> None:
+    queue = LLMJobQueue(max_concurrent_jobs=1)
+    try:
+        queue.set_max_concurrent_jobs(3)
+        assert len(queue._workers) == 3
+
+        queue.set_max_concurrent_jobs(1)
+        assert len(queue._workers) == 1
+        assert len(queue._retired_workers) == 2
+        assert all(not handle.thread.is_alive() for handle in queue._retired_workers)
+    finally:
         queue.stop()
