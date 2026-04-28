@@ -30,6 +30,36 @@ def _config_for_tmp(tmp_path: Path, **overrides: object) -> AppConfig:
     return AppConfig.from_dict(data)
 
 
+def test_daily_request_timeout_explicit_value_is_honored(tmp_path: Path) -> None:
+    services = MonitoringServices(
+        _config_for_tmp(
+            tmp_path,
+            request_timeout_seconds=300,
+            daily_request_timeout_seconds=900,
+        )
+    )
+    try:
+        assert services.lmstudio_client.daily_timeout_seconds == 900
+    finally:
+        services.shutdown()
+
+
+def test_daily_request_timeout_fallback_uses_double_request_timeout_when_above_minimum(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path, request_timeout_seconds=400))
+    try:
+        assert services.lmstudio_client.daily_timeout_seconds == 800
+    finally:
+        services.shutdown()
+
+
+def test_daily_request_timeout_fallback_honors_minimum(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path, request_timeout_seconds=200))
+    try:
+        assert services.lmstudio_client.daily_timeout_seconds == 600
+    finally:
+        services.shutdown()
+
+
 
 def test_flush_now_returns_none_when_drain_already_running(tmp_path: Path) -> None:
     services = MonitoringServices(_config_for_tmp(tmp_path))
@@ -150,6 +180,35 @@ def test_flush_now_runs_full_pipeline_on_real_sqlite(tmp_path: Path) -> None:
         assert services.storage.get_pending_counts()["intervals"] == 0
         assert services.storage.get_summary_job_status_counts()["succeeded"] == result.summaries_created
         assert not shot_path.exists()
+    finally:
+        services.shutdown()
+
+
+def test_flush_now_releases_lock_after_paused_by_lock_skip(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    services.summarizer.lm_client = SuccessfulClient()
+    try:
+        services.handle_session_locked()
+        assert services.flush_now(reason="manual") is None
+
+        services.handle_session_unlocked()
+        services.storage.insert_text_segments(
+            [
+                TextSegment(
+                    id=None,
+                    start_ts=1.0,
+                    end_ts=1.1,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="post-skip",
+                    hotkeys=[],
+                    raw_key_count=1,
+                )
+            ]
+        )
+        result = services.flush_now(reason="manual")
+        assert result is not None
+        assert result.summaries_created == 1
     finally:
         services.shutdown()
 

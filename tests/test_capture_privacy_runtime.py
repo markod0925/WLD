@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from worklog_diary.core.config import native_hooks_disabled
@@ -59,6 +60,50 @@ def test_blocked_app_never_creates_screenshots_even_if_state_is_stale(tmp_path: 
 
     assert service.capture_once() is False
     assert storage.get_diagnostics_snapshot()["table_counts"]["screenshots"] == 0
+    storage.close()
+
+
+def test_update_dedup_config_waits_for_dedup_lock(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "test.db"))
+    state = SharedState()
+    service = ScreenshotCaptureService(
+        storage=storage,
+        state=state,
+        privacy=PrivacyPolicyEngine(set()),
+        screenshot_dir=str(tmp_path / "shots"),
+        interval_seconds=30,
+    )
+
+    service._dedup_lock.acquire()
+    started = threading.Event()
+    finished = threading.Event()
+
+    def worker() -> None:
+        started.set()
+        service.update_dedup_config(
+            exact_hash_enabled=False,
+            perceptual_hash_enabled=False,
+            phash_threshold=11,
+            ssim_enabled=False,
+            ssim_threshold=0.91,
+            resize_width=48,
+            compare_recent_count=4,
+            min_keep_interval_seconds=30.0,
+        )
+        finished.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        assert started.wait(timeout=1.0)
+        assert not finished.wait(timeout=0.1)
+    finally:
+        service._dedup_lock.release()
+
+    assert finished.wait(timeout=1.0)
+    thread.join(timeout=1.0)
+    assert service._dedup_state.phash_threshold == 11
+    assert service._dedup_resize_width == 48
     storage.close()
 
 

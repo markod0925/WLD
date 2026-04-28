@@ -13,9 +13,9 @@ def test_app_config_default_settings_match_ui_defaults() -> None:
     assert cfg.capture_mode == "active_window"
     assert cfg.max_text_segments_per_summary == 400
     assert cfg.request_timeout_seconds == 600
+    assert cfg.daily_request_timeout_seconds is None
     assert cfg.lmstudio_max_prompt_chars == 20000
     assert cfg.screenshot_dedup_enabled is True
-    assert cfg.screenshot_dedup_threshold == 6
     assert cfg.screenshot_min_keep_interval_seconds == 120
 
 
@@ -91,7 +91,7 @@ def test_legacy_dedup_threshold_maps_to_canonical_when_canonical_missing(tmp_pat
 
     cfg = config_module.AppConfig.from_dict(payload, source=str(tmp_path / "config.json"))
     assert cfg.screenshot_dedup_phash_threshold == 13
-    assert cfg.screenshot_dedup_threshold == 13
+    assert "screenshot_dedup_threshold" not in cfg.to_dict()
 
 
 def test_legacy_dedup_threshold_conflict_prefers_canonical_and_logs_warning(tmp_path: Path, caplog) -> None:
@@ -103,7 +103,7 @@ def test_legacy_dedup_threshold_conflict_prefers_canonical_and_logs_warning(tmp_
     cfg = config_module.AppConfig.from_dict(payload, source=str(tmp_path / "config.json"))
 
     assert cfg.screenshot_dedup_phash_threshold == 7
-    assert cfg.screenshot_dedup_threshold == 7
+    assert "screenshot_dedup_threshold" not in cfg.to_dict()
     assert any("event=config_legacy_field_conflict" in record.message for record in caplog.records)
 
 
@@ -119,3 +119,25 @@ def test_matching_legacy_dedup_threshold_does_not_log_conflict_or_force_save(cap
 
     assert needs_save is False
     assert not any("event=config_legacy_field_conflict" in record.message for record in caplog.records)
+    assert "screenshot_dedup_threshold" not in config_module.safe_config_snapshot(normalized)
+
+
+def test_safe_config_snapshot_and_diff_include_semantic_changes() -> None:
+    before = config_module.AppConfig()
+    after = config_module.AppConfig(
+        semantic_coalescing_enabled=True,
+        semantic_embedding_model="new-embedding-model",
+        semantic_min_merge_score=0.91,
+    )
+
+    snapshot = config_module.safe_config_snapshot(after)
+    assert snapshot["semantic_coalescing_enabled"] is True
+    assert snapshot["semantic_embedding_model"] == "new-embedding-model"
+    assert snapshot["semantic_min_merge_score"] == 0.91
+    assert "screenshot_dedup_threshold" not in snapshot
+
+    diff = config_module.safe_config_diff(before, after)
+    assert diff["semantic_coalescing_enabled"] == (False, True)
+    assert diff["semantic_embedding_model"] == ("text-embedding-nomic-embed-text-v1.5", "new-embedding-model")
+    assert diff["semantic_min_merge_score"] == (0.85, 0.91)
+    assert "screenshot_dedup_threshold" not in diff

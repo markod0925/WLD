@@ -27,7 +27,25 @@ SAFE_CONFIG_KEYS: tuple[str, ...] = (
     "process_backlog_only_while_locked",
     "max_parallel_summary_jobs",
     "request_timeout_seconds",
+    "daily_request_timeout_seconds",
     "capture_mode",
+    "semantic_coalescing_enabled",
+    "semantic_embedding_base_url",
+    "semantic_embedding_model",
+    "semantic_max_candidate_gap_seconds",
+    "semantic_max_neighbor_count",
+    "semantic_min_cosine_similarity",
+    "semantic_min_merge_score",
+    "semantic_same_app_boost",
+    "semantic_window_title_boost",
+    "semantic_keyword_overlap_boost",
+    "semantic_temporal_gap_penalty_weight",
+    "semantic_app_switch_penalty",
+    "semantic_lock_boundary_blocks_merge",
+    "semantic_pause_boundary_blocks_merge",
+    "semantic_transition_keywords",
+    "semantic_store_merge_diagnostics",
+    "semantic_recompute_missing_embeddings_on_startup",
 )
 
 
@@ -57,6 +75,7 @@ class AppConfig:
     max_parallel_summary_jobs: int = 2
     process_backlog_only_while_locked: bool = True
     request_timeout_seconds: int = 600
+    daily_request_timeout_seconds: int | None = None
     activity_segment_min_duration_seconds: float = 180.0
     activity_segment_max_duration_seconds: float = 900.0
     activity_segment_idle_gap_seconds: float = 20.0
@@ -73,7 +92,6 @@ class AppConfig:
     screenshot_dedup_resize_width: int = 32
     screenshot_dedup_compare_recent_count: int = 8
     screenshot_dedup_enabled: bool = True
-    screenshot_dedup_threshold: int = 6
     screenshot_min_keep_interval_seconds: int = 120
 
     semantic_coalescing_enabled: bool = False
@@ -116,6 +134,8 @@ class AppConfig:
         self.max_parallel_summary_jobs = max(1, int(self.max_parallel_summary_jobs))
         self.process_backlog_only_while_locked = bool(self.process_backlog_only_while_locked)
         self.lmstudio_max_prompt_chars = max(2000, int(self.lmstudio_max_prompt_chars))
+        if self.daily_request_timeout_seconds is not None:
+            self.daily_request_timeout_seconds = max(1, int(self.daily_request_timeout_seconds))
         self.activity_segment_min_duration_seconds = max(0.0, float(self.activity_segment_min_duration_seconds))
         self.activity_segment_max_duration_seconds = max(
             self.activity_segment_min_duration_seconds,
@@ -141,8 +161,6 @@ class AppConfig:
         self.screenshot_dedup_resize_width = max(8, int(self.screenshot_dedup_resize_width))
         self.screenshot_dedup_compare_recent_count = max(1, int(self.screenshot_dedup_compare_recent_count))
         self.screenshot_dedup_enabled = bool(self.screenshot_dedup_enabled)
-        self.screenshot_dedup_threshold = max(0, min(64, int(self.screenshot_dedup_threshold)))
-        self.screenshot_dedup_threshold = self.screenshot_dedup_phash_threshold
         self.screenshot_min_keep_interval_seconds = max(0, int(self.screenshot_min_keep_interval_seconds))
         self.semantic_coalescing_enabled = bool(self.semantic_coalescing_enabled)
         self.semantic_embedding_base_url = str(self.semantic_embedding_base_url).strip() or "http://127.0.0.1:1234/v1"
@@ -230,6 +248,14 @@ def _coerce_str(value: Any, field_name: str, *, source: str | None = None) -> st
     raise ValueError(_format_config_error(source, field_name, "expected a string", value))
 
 
+def _coerce_optional_int(value: Any, field_name: str, *, source: str | None = None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return _coerce_int(value, field_name, source=source)
+
+
 def _coerce_bool(value: Any, field_name: str, *, source: str | None = None) -> bool:
     if isinstance(value, bool):
         return value
@@ -254,9 +280,6 @@ def _coerce_blocked_processes(value: Any, field_name: str, *, source: str | None
             coerced.append(stripped)
     return coerced
 
-
-
-
 def _coerce_str_list(value: Any, field_name: str, *, source: str | None = None) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(_format_config_error(source, field_name, "expected a list of strings", value))
@@ -267,6 +290,8 @@ def _coerce_str_list(value: Any, field_name: str, *, source: str | None = None) 
         if item.strip():
             result.append(item.strip())
     return result
+
+
 def _format_config_error(source: str | None, field_name: str, expected: str, value: Any) -> str:
     location = f" in {source}" if source else ""
     return f"Invalid config value{location} for '{field_name}': {expected}, got {value!r}"
@@ -281,7 +306,7 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
     values = defaults.copy()
     needs_save = False
 
-    unknown_fields = sorted(name for name in data.keys() if name not in field_names)
+    unknown_fields = sorted(name for name in data.keys() if name not in field_names and name != "screenshot_dedup_threshold")
     if unknown_fields:
         needs_save = True
         _LOGGER.warning(
@@ -322,6 +347,7 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "max_parallel_summary_jobs": _coerce_int,
         "process_backlog_only_while_locked": _coerce_bool,
         "request_timeout_seconds": _coerce_int,
+        "daily_request_timeout_seconds": _coerce_optional_int,
         "activity_segment_min_duration_seconds": _coerce_float,
         "activity_segment_max_duration_seconds": _coerce_float,
         "activity_segment_idle_gap_seconds": _coerce_float,
@@ -338,7 +364,6 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "screenshot_dedup_resize_width": _coerce_int,
         "screenshot_dedup_compare_recent_count": _coerce_int,
         "screenshot_dedup_enabled": _coerce_bool,
-        "screenshot_dedup_threshold": _coerce_int,
         "screenshot_min_keep_interval_seconds": _coerce_int,
         "semantic_coalescing_enabled": _coerce_bool,
         "semantic_embedding_base_url": _coerce_str,

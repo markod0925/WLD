@@ -120,6 +120,41 @@ def test_apply_config_noop_reports_zero_changes(tmp_path: Path, caplog) -> None:
         services.shutdown()
 
 
+def test_apply_config_updates_screenshot_dedup_through_public_method(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    try:
+        captured: list[dict[str, object]] = []
+        initial_resize_width = services.screenshot_capture._dedup_resize_width
+        initial_phash_threshold = services.screenshot_capture._dedup_state.phash_threshold
+
+        def record_update(**kwargs: object) -> None:
+            captured.append(kwargs)
+
+        services.screenshot_capture.update_dedup_config = record_update  # type: ignore[method-assign]
+
+        updated = _config_for_tmp(
+            tmp_path,
+            screenshot_dedup_exact_hash_enabled=False,
+            screenshot_dedup_perceptual_hash_enabled=False,
+            screenshot_dedup_phash_threshold=11,
+            screenshot_dedup_ssim_enabled=False,
+            screenshot_dedup_ssim_threshold=0.91,
+            screenshot_dedup_resize_width=48,
+            screenshot_dedup_compare_recent_count=4,
+            screenshot_min_keep_interval_seconds=45,
+        )
+        services.apply_config(updated)
+
+        assert len(captured) == 1
+        assert captured[0]["phash_threshold"] == 11
+        assert captured[0]["resize_width"] == 48
+        assert captured[0]["compare_recent_count"] == 4
+        assert services.screenshot_capture._dedup_resize_width == initial_resize_width
+        assert services.screenshot_capture._dedup_state.phash_threshold == initial_phash_threshold
+    finally:
+        services.shutdown()
+
+
 def test_summary_admission_state_logs_transition_without_spam(tmp_path: Path, caplog) -> None:
     services = MonitoringServices(_config_for_tmp(tmp_path, process_backlog_only_while_locked=True))
     try:

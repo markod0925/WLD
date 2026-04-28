@@ -30,6 +30,12 @@ from .startup_errors import ENCRYPTED_DATABASE_STARTUP_ERRORS
 from .. import __version__
 
 
+def _resolve_daily_request_timeout_seconds(config: AppConfig) -> int:
+    if config.daily_request_timeout_seconds is not None:
+        return max(1, int(config.daily_request_timeout_seconds))
+    return max(config.request_timeout_seconds * 2, 600)
+
+
 class MonitoringServices:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -154,23 +160,22 @@ class MonitoringServices:
             self.window_tracker.poll_interval_seconds = max(0.2, self.config.foreground_poll_interval_seconds)
             self.screenshot_capture.interval_seconds = max(5, self.config.screenshot_interval_seconds)
             self.screenshot_capture.capture_mode = self.config.capture_mode
-            self.screenshot_capture._dedup_state.exact_hash_enabled = self.config.screenshot_dedup_exact_hash_enabled
-            self.screenshot_capture._dedup_state.perceptual_hash_enabled = self.config.screenshot_dedup_perceptual_hash_enabled
-            self.screenshot_capture._dedup_state.phash_threshold = self.config.screenshot_dedup_phash_threshold
-            self.screenshot_capture._dedup_state.ssim_enabled = self.config.screenshot_dedup_ssim_enabled
-            self.screenshot_capture._dedup_state.ssim_threshold = self.config.screenshot_dedup_ssim_threshold
-            self.screenshot_capture._dedup_state.compare_recent_count = self.config.screenshot_dedup_compare_recent_count
-            self.screenshot_capture._dedup_state.min_interval_same_visual_context_seconds = (
-                self.config.screenshot_min_keep_interval_seconds
+            self.screenshot_capture.update_dedup_config(
+                exact_hash_enabled=self.config.screenshot_dedup_exact_hash_enabled,
+                perceptual_hash_enabled=self.config.screenshot_dedup_perceptual_hash_enabled,
+                phash_threshold=self.config.screenshot_dedup_phash_threshold,
+                ssim_enabled=self.config.screenshot_dedup_ssim_enabled,
+                ssim_threshold=self.config.screenshot_dedup_ssim_threshold,
+                resize_width=self.config.screenshot_dedup_resize_width,
+                compare_recent_count=self.config.screenshot_dedup_compare_recent_count,
+                min_keep_interval_seconds=self.config.screenshot_min_keep_interval_seconds,
             )
-            self.screenshot_capture._dedup_state._trim_history()
-            self.screenshot_capture._dedup_resize_width = max(8, self.config.screenshot_dedup_resize_width)
             self.text_service.poll_interval_seconds = max(0.5, self.config.reconstruction_poll_interval_seconds)
             self.text_reconstructor.inactivity_gap_seconds = self.config.text_inactivity_gap_seconds
             self.batch_builder.max_text_segments = self.config.max_text_segments_per_summary
             self.batch_builder.max_screenshots = self.config.max_screenshots_per_summary
             self.batch_builder.dedup_enabled = self.config.screenshot_dedup_enabled
-            self.batch_builder.dedup_threshold = self.config.screenshot_dedup_threshold
+            self.batch_builder.dedup_threshold = self.config.screenshot_dedup_phash_threshold
             self.batch_builder.min_keep_interval_seconds = self.config.screenshot_min_keep_interval_seconds
             self.batch_builder.activity_segment_min_duration_seconds = self.config.activity_segment_min_duration_seconds
             self.batch_builder.activity_segment_max_duration_seconds = self.config.activity_segment_max_duration_seconds
@@ -183,10 +188,7 @@ class MonitoringServices:
             self.lmstudio_client.base_url = self.config.lmstudio_base_url.rstrip("/")
             self.lmstudio_client.model = self.config.lmstudio_model
             self.lmstudio_client.timeout_seconds = self.config.request_timeout_seconds
-            self.lmstudio_client.daily_timeout_seconds = max(
-                self.config.request_timeout_seconds * 2,
-                self.config.request_timeout_seconds,
-            )
+            self.lmstudio_client.daily_timeout_seconds = _resolve_daily_request_timeout_seconds(self.config)
             self.lmstudio_client.prompt_builder.max_prompt_chars = self.config.lmstudio_max_prompt_chars
             max_summary_text_segments = max(1, int(self.config.max_text_segments_per_summary))
             self.lmstudio_client.prompt_builder.max_summary_text_segments = max_summary_text_segments

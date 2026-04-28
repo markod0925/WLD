@@ -68,6 +68,7 @@ class ScreenshotCaptureService:
         )
         self._dedup_resize_width = max(8, int(dedup_resize_width))
         self._dedup_hash_size = 8
+        self._dedup_lock = threading.Lock()
         self._seed_dedup_history()
 
         self._shutdown_event = shutdown_event or threading.Event()
@@ -88,6 +89,29 @@ class ScreenshotCaptureService:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         self.logger.info("Screenshot capture service stopped")
+
+    def update_dedup_config(
+        self,
+        *,
+        exact_hash_enabled: bool,
+        perceptual_hash_enabled: bool,
+        phash_threshold: int,
+        ssim_enabled: bool,
+        ssim_threshold: float,
+        resize_width: int,
+        compare_recent_count: int,
+        min_keep_interval_seconds: float,
+    ) -> None:
+        with self._dedup_lock:
+            self._dedup_state.exact_hash_enabled = bool(exact_hash_enabled)
+            self._dedup_state.perceptual_hash_enabled = bool(perceptual_hash_enabled)
+            self._dedup_state.phash_threshold = max(0, int(phash_threshold))
+            self._dedup_state.ssim_enabled = bool(ssim_enabled)
+            self._dedup_state.ssim_threshold = max(0.0, min(1.0, float(ssim_threshold)))
+            self._dedup_state.compare_recent_count = max(1, int(compare_recent_count))
+            self._dedup_state.min_interval_same_visual_context_seconds = max(0.0, float(min_keep_interval_seconds))
+            self._dedup_resize_width = max(8, int(resize_width))
+            self._dedup_state._trim_history()
 
     def capture_once(self) -> bool:
         snapshot = self.state.snapshot()
@@ -155,10 +179,12 @@ class ScreenshotCaptureService:
 
             image = sct.grab(capture_region)
             decision = None
+            with self._dedup_lock:
+                resize_width = self._dedup_resize_width
             analysis = analyze_screenshot(
                 image.rgb,
                 image.size,
-                resize_width=self._dedup_resize_width,
+                resize_width=resize_width,
                 hash_size=self._dedup_hash_size,
             )
             if analysis is None:
@@ -169,18 +195,34 @@ class ScreenshotCaptureService:
                     self.capture_mode,
                 )
             else:
-                decision = self._dedup_state.consider(
-                    ts=ts,
-                    process_name=current_info.process_name,
-                    window_title=current_info.window_title,
-                    window_hwnd=current_info.hwnd,
-                    active_interval_id=snapshot.active_interval_id,
-                    analysis=analysis,
-                )
-                if not decision.keep:
+                with self._dedup_lock:
+                    decision = self._dedup_state.consider(
+                        ts=ts,
+                        process_name=current_info.process_name,
+                        window_title=current_info.window_title,
+                        window_hwnd=current_info.hwnd,
+                        active_interval_id=snapshot.active_interval_id,
+                        analysis=analysis,
+                    )
+                    if not decision.keep:
+                        self.logger.info(
+                            (
+                                "event=screenshot_skipped reason=%s process=%s title=%s interval_id=%s "
+                                "phash_distance=%s ssim=%s streak=%s"
+                            ),
+                            decision.reason,
+                            current_info.process_name,
+                            current_info.window_title,
+                            snapshot.active_interval_id,
+                            decision.nearest_phash_distance,
+                            decision.nearest_ssim,
+                            decision.visual_context_streak,
+                        )
+                        return False
+
                     self.logger.info(
                         (
-                            "event=screenshot_skipped reason=%s process=%s title=%s interval_id=%s "
+                            "event=screenshot_dedup_keep reason=%s process=%s title=%s interval_id=%s "
                             "phash_distance=%s ssim=%s streak=%s"
                         ),
                         decision.reason,
@@ -191,29 +233,14 @@ class ScreenshotCaptureService:
                         decision.nearest_ssim,
                         decision.visual_context_streak,
                     )
-                    return False
-
-                self.logger.info(
-                    (
-                        "event=screenshot_dedup_keep reason=%s process=%s title=%s interval_id=%s "
-                        "phash_distance=%s ssim=%s streak=%s"
-                    ),
-                    decision.reason,
-                    current_info.process_name,
-                    current_info.window_title,
-                    snapshot.active_interval_id,
-                    decision.nearest_phash_distance,
-                    decision.nearest_ssim,
-                    decision.visual_context_streak,
-                )
-                self._dedup_state.record_kept(
-                    ts=ts,
-                    process_name=current_info.process_name,
-                    window_title=current_info.window_title,
-                    window_hwnd=current_info.hwnd,
-                    active_interval_id=snapshot.active_interval_id,
-                    analysis=analysis,
-                )
+                    self._dedup_state.record_kept(
+                        ts=ts,
+                        process_name=current_info.process_name,
+                        window_title=current_info.window_title,
+                        window_hwnd=current_info.hwnd,
+                        active_interval_id=snapshot.active_interval_id,
+                        analysis=analysis,
+                    )
 
             mss.tools.to_png(image.rgb, image.size, output=str(file_path))
 
@@ -252,7 +279,8 @@ class ScreenshotCaptureService:
         except Exception as exc:
             self.logger.debug("event=screenshot_dedup_seed_failed error=%s", exc)
             return
-        self._dedup_state.seed(list(reversed(recent)))
+        with self._dedup_lock:
+            self._dedup_state.seed(list(reversed(recent)))
 
     def _run(self) -> None:
         while not self._stop_event.is_set() and not self._shutdown_event.is_set():
