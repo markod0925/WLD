@@ -654,6 +654,8 @@ class DiagnosticsService:
                 "screenshots": 0,
             }
         summary_runtime = self.services.summarizer.get_runtime_status()
+        keyboard_diag = self.services.keyboard_capture.get_runtime_diagnostics()
+        text_diag = self.services.text_reconstructor.get_runtime_diagnostics()
         lifecycle = self.lifecycle_manager.snapshot()
         drain = self.flush_coordinator.snapshot()
         monitoring_state = "Monitoring"
@@ -674,6 +676,11 @@ class DiagnosticsService:
             "pending": pending,
             "pending_screenshot_count": pending["screenshots"],
             "pending_text_segment_count": pending["text_segments"],
+            "pending_key_event_buffer_count": int(keyboard_diag["pending_key_event_buffer_count"]),
+            "keyboard_hook_installed": bool(keyboard_diag["hook_installed"]),
+            "open_text_segment_active": bool(text_diag["has_open_segment"]),
+            "open_text_segment_char_count": int(text_diag["open_segment_char_count"]),
+            "open_text_segment_raw_key_count": int(text_diag["open_segment_raw_key_count"]),
             "pending_summary_job_count": int(summary_runtime["pending_summary_jobs"]),
             "summary_running": int(summary_runtime["running_jobs"]) > 0,
             "summary_jobs": {

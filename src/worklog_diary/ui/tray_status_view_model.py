@@ -42,6 +42,10 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
     pending_text_segments = _coerce_int(status.get("pending_text_segment_count"))
     pending_screenshots = _coerce_int(status.get("pending_screenshot_count"))
     pending_summary_jobs = _coerce_int(status.get("pending_summary_job_count"))
+    pending_key_events = _coerce_int(status.get("pending_key_event_buffer_count"))
+    keyboard_hook_installed = bool(status.get("keyboard_hook_installed", True))
+    open_text_segment_active = bool(status.get("open_text_segment_active"))
+    open_text_segment_chars = _coerce_int(status.get("open_text_segment_char_count"))
 
     summary_jobs = status.get("summary_jobs")
     if isinstance(summary_jobs, Mapping):
@@ -99,11 +103,19 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
             capture_line = "Capture: blocked by foreground app"
         elif has_pending_activity:
             capture_line = _format_capture_line(pending_screenshots, pending_text_segments)
+        elif open_text_segment_active or pending_key_events > 0:
+            capture_line = "Capture: active, building current text segment"
         else:
             capture_line = "Capture: no pending activity"
         detail_lines.append(capture_line)
         if blocked and has_pending_activity:
             detail_lines.append(_format_pending_line(pending_screenshots, pending_text_segments))
+        elif open_text_segment_active:
+            detail_lines.append(f"Current: {open_text_segment_chars} chars, {pending_key_events} raw keys buffered")
+        elif pending_key_events > 0:
+            detail_lines.append(f"Current: {pending_key_events} raw keys buffered")
+        if not keyboard_hook_installed:
+            detail_lines.append("Capture hook: unavailable")
     elif has_pending_activity and not shutdown_in_progress:
         detail_lines.append(_format_capture_line(pending_screenshots, pending_text_segments))
 
@@ -185,13 +197,17 @@ def build_tray_menu_actions(snapshot: TrayStatusSnapshot) -> list[TrayMenuAction
 
 def _format_capture_line(pending_screenshots: int, pending_text_segments: int) -> str:
     screenshot_label = _format_count_label(pending_screenshots, "screenshot buffered", "screenshots buffered")
-    text_label = _format_count_label(pending_text_segments, "text segment buffered", "text segments buffered")
+    text_label = _format_count_label(
+        pending_text_segments, "finalized text segment buffered", "finalized text segments buffered"
+    )
     return f"Capture: {screenshot_label}, {text_label}"
 
 
 def _format_pending_line(pending_screenshots: int, pending_text_segments: int) -> str:
     screenshot_label = _format_count_label(pending_screenshots, "screenshot buffered", "screenshots buffered")
-    text_label = _format_count_label(pending_text_segments, "text segment buffered", "text segments buffered")
+    text_label = _format_count_label(
+        pending_text_segments, "finalized text segment buffered", "finalized text segments buffered"
+    )
     return f"Pending: {screenshot_label}, {text_label}"
 
 

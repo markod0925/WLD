@@ -154,3 +154,16 @@ def test_inactivity_flush_without_followup_event() -> None:
 
     assert segment is not None
     assert segment.text == "ab"
+
+
+def test_runtime_diagnostics_track_open_segment_state() -> None:
+    reconstructor = TextReconstructor(inactivity_gap_seconds=10.0)
+    reconstructor.feed([_event(1.0, "a"), _event(1.1, "b")], force_flush=False)
+    diagnostics = reconstructor.get_runtime_diagnostics()
+    assert diagnostics["has_open_segment"] is True
+    assert diagnostics["open_segment_char_count"] == 2
+    assert diagnostics["open_segment_raw_key_count"] == 2
+
+    reconstructor.feed([], force_flush=True)
+    diagnostics_after = reconstructor.get_runtime_diagnostics()
+    assert diagnostics_after["has_open_segment"] is False

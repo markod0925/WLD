@@ -33,6 +33,10 @@ def _base_status(**overrides: object) -> dict[str, object]:
         "summary_admission_paused": False,
         "process_backlog_only_while_locked": False,
         "unrecoverable_summary_error": None,
+        "pending_key_event_buffer_count": 0,
+        "keyboard_hook_installed": True,
+        "open_text_segment_active": False,
+        "open_text_segment_char_count": 0,
     }
     status.update(overrides)
     return status
@@ -49,7 +53,7 @@ def test_tray_snapshot_and_menu_share_the_same_state_model() -> None:
     tooltip_lines = format_tray_tooltip(snapshot).splitlines()
     assert tooltip_lines == [
         "WorkLog Diary: Active",
-        "Capture: 1 screenshot buffered, 0 text segments buffered",
+        "Capture: 1 screenshot buffered, 0 finalized text segments buffered",
         "LLM: idle",
         "Queue: 0 queued, 0 in flight, max 2",
     ]
@@ -122,6 +126,34 @@ def test_tray_snapshot_marks_llm_unavailable_compactly() -> None:
 
     tooltip_lines = format_tray_tooltip(snapshot).splitlines()
     assert "LLM: unavailable" in tooltip_lines
+
+
+def test_tray_snapshot_surfaces_unfinalized_text_capture_buffer() -> None:
+    snapshot = build_tray_status_snapshot(
+        _base_status(
+            pending_screenshot_count=0,
+            pending_text_segment_count=0,
+            pending_key_event_buffer_count=6,
+            open_text_segment_active=True,
+            open_text_segment_char_count=4,
+        )
+    )
+
+    tooltip = format_tray_tooltip(snapshot)
+    assert "Capture: active, building current text segment" in tooltip
+    assert "Current: 4 chars, 6 raw keys buffered" in tooltip
+
+
+def test_tray_snapshot_surfaces_blocked_capture_state() -> None:
+    snapshot = build_tray_status_snapshot(
+        _base_status(
+            blocked=True,
+            pending_screenshot_count=0,
+            pending_text_segment_count=0,
+        )
+    )
+    tooltip = format_tray_tooltip(snapshot)
+    assert "Capture: blocked by foreground app" in tooltip
 
 
 def test_tray_snapshot_distinguishes_paused_and_stopped_states() -> None:
