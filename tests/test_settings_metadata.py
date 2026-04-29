@@ -57,6 +57,9 @@ def test_settings_are_grouped_by_exposure_level() -> None:
         "max_screenshots_per_summary",
         "max_text_segments_per_summary",
         "request_timeout_seconds",
+        "daily_summary_auto_backfill_enabled",
+        "daily_summary_auto_backfill_min_age_hours",
+        "daily_summary_auto_backfill_max_days",
     }
 
     assert {item.key for item in DEBUG_SETTINGS} == {

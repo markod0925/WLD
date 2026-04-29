@@ -372,7 +372,9 @@ class Summarizer:
         )
         return self._run_summary_job(job_id=job_id, batch=batch, reason=reason)
 
-    def generate_daily_recap_for_day(self, day: date) -> tuple[int, bool]:
+    def generate_daily_recap_for_day(self, day: date, *, reason: str = "manual") -> tuple[int, bool]:
+        if self._shutdown_event.is_set() or self._stop_event.is_set() or not self._accepting_new_jobs:
+            raise LLMJobCancelledError("Daily summary generation skipped during shutdown")
         day_key = day.isoformat()
         with self._condition:
             while day_key in self._daily_recap_inflight:
@@ -500,6 +502,12 @@ class Summarizer:
                 )
 
             try:
+                with self._condition:
+                    while not self._can_start_summary_job_now_locked(reason=reason):
+                        if self._shutdown_event.is_set() or self._stop_event.is_set() or not self._accepting_new_jobs:
+                            raise LLMJobCancelledError("Daily summary generation cancelled during shutdown")
+                        self._log_admission_paused_once_locked()
+                        self._condition.wait(timeout=0.5)
                 with llm_job_context(
                     f"daily_recap:{day.isoformat()}",
                     job_type="day_summary",
@@ -795,6 +803,71 @@ class Summarizer:
             self._lock_state_label(),
             trigger,
         )
+
+    def reconcile_missing_daily_summaries(
+        self,
+        *,
+        reason: str = "startup_backfill",
+        min_age_hours: float = 2.0,
+        max_days: int = 60,
+        enabled: bool = True,
+    ) -> dict[str, int | str | bool]:
+        if not enabled:
+            self.logger.info("event=daily_summary_backfill_noop reason=disabled")
+            return {"enabled": False, "scanned_days": 0, "missing_days": 0, "enqueued": 0}
+        now = datetime.now()
+        today = now.date()
+        cutoff_day = (now - timedelta(hours=max(0.0, min_age_hours))).date()
+        candidate_days = [
+            day for day in self.storage.list_summary_days(limit=max(1, int(max_days)))
+            if day < today and day < cutoff_day
+        ]
+        self.logger.info(
+            "event=daily_summary_backfill_scan_started scanned_days=%s cutoff_day=%s max_days=%s",
+            len(candidate_days),
+            cutoff_day.isoformat(),
+            int(max_days),
+        )
+        enqueued = 0
+        missing = 0
+        use_coalesced = bool(self.semantic_coalescer and self.semantic_coalescer.enabled)
+        for day in sorted(candidate_days):
+            if self._shutdown_event.is_set() or self._stop_event.is_set() or not self._accepting_new_jobs:
+                self.logger.info("event=daily_summary_backfill_noop reason=shutdown")
+                break
+            if self.storage.get_daily_summary_for_day(day) is not None:
+                continue
+            existing_job = self.storage.get_daily_summary_job_for_day(day)
+            if existing_job is not None and str(existing_job["status"]) in {"queued", "running"}:
+                continue
+            summaries = self.storage.list_effective_summaries_for_day(day, use_coalesced=use_coalesced)
+            if not summaries:
+                continue
+            missing += 1
+            try:
+                summary_id, replaced = self.generate_daily_recap_for_day(day, reason=reason)
+            except LLMJobCancelledError:
+                self.logger.info("event=daily_summary_backfill_noop reason=queue_stopped target_day=%s", day.isoformat())
+                break
+            enqueued += 1
+            job = self.storage.get_daily_summary_job_for_day(day)
+            self.logger.info(
+                "event=daily_summary_backfill_job_enqueued target_day=%s job_id=%s reason=%s daily_summary_id=%s replaced=%s",
+                day.isoformat(),
+                int(job["id"]) if job is not None else 0,
+                reason,
+                summary_id,
+                replaced,
+            )
+        self.logger.info(
+            "event=daily_summary_backfill_scan_completed scanned_days=%s missing_days=%s enqueued=%s",
+            len(candidate_days),
+            missing,
+            enqueued,
+        )
+        if enqueued == 0:
+            self.logger.info("event=daily_summary_backfill_noop scanned_days=%s", len(candidate_days))
+        return {"enabled": True, "scanned_days": len(candidate_days), "missing_days": missing, "enqueued": enqueued, "reason": reason}
 
     def _lock_state_label(self) -> str:
         if self._session_locked is None:

@@ -86,6 +86,9 @@ EXPOSURE_BY_KEY: dict[str, ExposureLevel] = {
     "semantic_transition_keywords": "debug",
     "semantic_store_merge_diagnostics": "debug",
     "semantic_recompute_missing_embeddings_on_startup": "debug",
+    "daily_summary_auto_backfill_enabled": "advanced",
+    "daily_summary_auto_backfill_min_age_hours": "advanced",
+    "daily_summary_auto_backfill_max_days": "advanced",
 }
 
 
@@ -571,6 +574,47 @@ EXPOSED_SETTINGS: tuple[SettingUiMetadata, ...] = (
         ),
         exposure="advanced",
         widget="bool",
+    ),
+    _setting(
+        key="daily_summary_auto_backfill_enabled",
+        label="Auto backfill daily summaries:",
+        tooltip=(
+            "Description: Automatically queue missing historical daily summaries during startup.\n"
+            "Impact: Repairs summary gaps without manual intervention.\n"
+            "Behavior: Uses non-manual queue reasons so lock-gated admission still applies.\n"
+            f"Default: {DEFAULTS['daily_summary_auto_backfill_enabled']}."
+        ),
+        exposure="advanced",
+        widget="bool",
+    ),
+    _setting(
+        key="daily_summary_auto_backfill_min_age_hours",
+        label="Backfill min age (hours):",
+        tooltip=(
+            "Description: Minimum age after day end before startup backfill considers a day eligible.\n"
+            "Impact: Prevents summarizing the most recent day too early.\n"
+            "Range: Runtime enforces a minimum of 0 hours.\n"
+            f"Default: {DEFAULTS['daily_summary_auto_backfill_min_age_hours']}."
+        ),
+        exposure="advanced",
+        widget="float",
+        min_value=0.0,
+        max_value=48.0,
+        step=0.5,
+    ),
+    _setting(
+        key="daily_summary_auto_backfill_max_days",
+        label="Backfill scan max days:",
+        tooltip=(
+            "Description: Maximum number of historical days scanned for startup backfill per launch.\n"
+            "Impact: Caps startup reconciliation work on large datasets.\n"
+            "Range: Runtime enforces at least 1 day.\n"
+            f"Default: {DEFAULTS['daily_summary_auto_backfill_max_days']}."
+        ),
+        exposure="advanced",
+        widget="int",
+        min_value=1,
+        max_value=365,
     ),
     _setting(
         key="semantic_min_cosine_similarity",
