@@ -5,12 +5,21 @@ import sqlite3
 import threading
 import time
 
+from .capture_repository import CaptureRepository
+
 
 class StorageDiagnosticsRepository:
-    def __init__(self, conn: sqlite3.Connection, lock: threading.Lock, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        lock: threading.Lock,
+        logger: logging.Logger,
+        capture_repository: CaptureRepository,
+    ) -> None:
         self._conn = conn
         self._lock = lock
         self._logger = logger
+        self._capture_repository = capture_repository
 
     def get_pending_counts(self) -> dict[str, int]:
         started_at = time.perf_counter()
@@ -20,28 +29,16 @@ class StorageDiagnosticsRepository:
                     "SELECT COUNT(1) AS c FROM active_intervals WHERE summarized = 0 AND end_ts IS NOT NULL"
                 ).fetchone()["c"]
             )
-            keys = int(self._conn.execute("SELECT COUNT(1) AS c FROM key_events WHERE processed = 0").fetchone()["c"])
-            processed_keys = int(
-                self._conn.execute("SELECT COUNT(1) AS c FROM key_events WHERE processed = 1").fetchone()["c"]
-            )
-            segments = int(self._conn.execute("SELECT COUNT(1) AS c FROM text_segments").fetchone()["c"])
-            screenshots = int(self._conn.execute("SELECT COUNT(1) AS c FROM screenshots").fetchone()["c"])
+            capture_counts = self._capture_repository._pending_counts_locked()
 
-        result = {
-            "intervals": intervals,
-            "key_events": keys,
-            "processed_key_events": processed_keys,
-            "text_segments": segments,
-            "screenshots": screenshots,
-        }
+        result = {"intervals": intervals, **capture_counts}
         self._log_db_query_timing("get_pending_counts", started_at, rows=5)
         return result
 
     def count_unprocessed_key_events(self) -> int:
         started_at = time.perf_counter()
         with self._lock:
-            row = self._conn.execute("SELECT COUNT(1) AS c FROM key_events WHERE processed = 0").fetchone()
-        count = int(row["c"])
+            count = self._capture_repository._count_unprocessed_key_events_locked()
         self._log_db_query_timing("count_unprocessed_key_events", started_at, rows=1)
         return count
 

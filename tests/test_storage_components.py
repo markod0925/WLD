@@ -4,11 +4,11 @@ import os
 from pathlib import Path
 from datetime import date
 
-from worklog_diary.core.models import ForegroundInfo, TextSegment
-from worklog_diary.core.storage import SQLiteStorage
-from worklog_diary.core.models import ScreenshotRecord
-import worklog_diary.core.summary_repository as summary_repository_module
+import worklog_diary.core.capture_repository as capture_repository_module
 import worklog_diary.core.storage_cleanup as storage_cleanup_module
+from worklog_diary.core.models import ForegroundInfo, KeyEvent, ScreenshotRecord, TextSegment
+from worklog_diary.core.storage import SQLiteStorage
+import worklog_diary.core.summary_repository as summary_repository_module
 
 
 def test_storage_bootstrap_enables_wal(tmp_path: Path) -> None:
@@ -26,6 +26,52 @@ def test_storage_diagnostics_delegates_to_repository(tmp_path: Path) -> None:
     try:
         assert storage.get_pending_counts() == storage.diagnostics_repository.get_pending_counts()
         assert storage.get_diagnostics_snapshot() == storage.diagnostics_repository.get_diagnostics_snapshot()
+    finally:
+        storage.close()
+
+
+def test_storage_capture_methods_delegate_to_repository(tmp_path: Path, monkeypatch) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    captured: dict[str, object] = {}
+
+    def fake_insert_key_event(self, event):
+        captured["insert_key_event_self"] = self
+        captured["insert_key_event_arg"] = event
+        return 321
+
+    def fake_fetch_unsummarized_screenshots(self, limit: int = 20):
+        captured["fetch_unsummarized_screenshots_self"] = self
+        captured["fetch_unsummarized_screenshots_limit"] = limit
+        return []
+
+    monkeypatch.setattr(capture_repository_module.CaptureRepository, "insert_key_event", fake_insert_key_event)
+    monkeypatch.setattr(
+        capture_repository_module.CaptureRepository,
+        "fetch_unsummarized_screenshots",
+        fake_fetch_unsummarized_screenshots,
+    )
+    try:
+        key_event_id = storage.insert_key_event(
+            KeyEvent(
+                id=None,
+                ts=1.0,
+                key="a",
+                event_type="down",
+                modifiers=[],
+                process_name="code.exe",
+                window_title="Editor",
+                hwnd=42,
+                active_interval_id=None,
+            )
+        )
+        screenshots = storage.fetch_unsummarized_screenshots(limit=7)
+
+        assert key_event_id == 321
+        assert captured["insert_key_event_self"] is storage.capture_repository
+        assert captured["insert_key_event_arg"].key == "a"
+        assert captured["fetch_unsummarized_screenshots_self"] is storage.capture_repository
+        assert captured["fetch_unsummarized_screenshots_limit"] == 7
+        assert screenshots == []
     finally:
         storage.close()
 
