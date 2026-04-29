@@ -13,5 +13,4 @@ def require_qt() -> None:
     except Exception as exc:  # noqa: BLE001
         pytest.skip(
             f"Qt/PySide6 unavailable in this environment: {exc}",
-            allow_module_level=True,
         )
