@@ -466,6 +466,7 @@ class FlushCoordinator:
             )
 
             stop_reason = "empty"
+            idle_rounds = 0
 
             try:
                 self.lifecycle_manager.set_draining()
@@ -528,7 +529,13 @@ class FlushCoordinator:
                         stop_reason = "empty"
                         break
 
-                    self.services.summarizer.wait_for_activity(timeout_seconds=0.4)
+                    made_progress = bool(dispatched) or int(runtime["running_jobs"]) > 0
+                    if made_progress:
+                        idle_rounds = 0
+                    else:
+                        idle_rounds += 1
+                    adaptive_wait = min(2.0, 0.4 * (2**min(idle_rounds, 3)))
+                    self.services.summarizer.wait_for_activity(timeout_seconds=adaptive_wait)
 
                 self.services.summarizer.wait_for_idle(timeout_seconds=30.0)
 

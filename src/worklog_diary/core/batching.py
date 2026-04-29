@@ -249,6 +249,42 @@ class BatchBuilder:
             activity_segments=ordered_segments,
         )
 
+    def reconfigure(
+        self,
+        *,
+        max_text_segments: int,
+        max_screenshots: int,
+        dedup_enabled: bool,
+        dedup_threshold: int,
+        min_keep_interval_seconds: float,
+        activity_segment_min_duration_seconds: float,
+        activity_segment_max_duration_seconds: float,
+        activity_segment_idle_gap_seconds: float,
+        activity_segment_title_similarity_threshold: float,
+        activity_segment_screenshot_phash_threshold: int,
+        activity_segment_screenshot_ssim_threshold: float,
+    ) -> None:
+        self.max_text_segments = max(1, int(max_text_segments))
+        self.max_screenshots = max(1, int(max_screenshots))
+        self.dedup_enabled = bool(dedup_enabled)
+        self.dedup_threshold = max(0, int(dedup_threshold))
+        self.min_keep_interval_seconds = max(0.0, float(min_keep_interval_seconds))
+        self.activity_segment_min_duration_seconds = max(0.0, float(activity_segment_min_duration_seconds))
+        self.activity_segment_max_duration_seconds = max(
+            self.activity_segment_min_duration_seconds,
+            float(activity_segment_max_duration_seconds),
+        )
+        self.activity_segment_idle_gap_seconds = max(0.0, float(activity_segment_idle_gap_seconds))
+        self.activity_segment_title_similarity_threshold = max(
+            0.0,
+            min(1.0, float(activity_segment_title_similarity_threshold)),
+        )
+        self.activity_segment_screenshot_phash_threshold = max(0, int(activity_segment_screenshot_phash_threshold))
+        self.activity_segment_screenshot_ssim_threshold = max(
+            0.0,
+            min(1.0, float(activity_segment_screenshot_ssim_threshold)),
+        )
+
     @staticmethod
     def _expanded_fetch_limit(
         base_limit: int,

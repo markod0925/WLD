@@ -4,12 +4,32 @@ from pathlib import Path
 
 from worklog_diary.core.config import AppConfig
 from worklog_diary.core.models import ForegroundInfo, KeyEvent, ScreenshotRecord, TextSegment
+from worklog_diary.core.monitoring_components import FlushCoordinator
 from worklog_diary.core.services import MonitoringServices
 
 
 class SuccessfulClient:
     def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
         return "ok", {"summary_text": "ok", "key_points": [], "blocked_activity": []}
+
+
+class _FakeSummarizer:
+    def __init__(self, wait_values: list[float], running_values: list[int]) -> None:
+        self.wait_values = wait_values
+        self.running_values = running_values
+        self._idx = 0
+
+    def clear_unrecoverable_error(self) -> None: ...
+    def cancel_queued_jobs(self, reason: str = "") -> int: return 0
+    def dispatch_pending_jobs(self, reason: str = "") -> int: return 0
+    def wait_for_idle(self, timeout_seconds: float) -> None: ...
+    def get_runtime_status(self) -> dict[str, int | bool]:
+        idx = min(self._idx, len(self.running_values) - 1)
+        pending_jobs = 0 if idx >= 3 else 1
+        return {"queued_jobs": 0, "running_jobs": self.running_values[idx], "pending_summary_jobs": pending_jobs, "has_unrecoverable_error": False, "summary_admission_paused": False, "max_concurrent_summary_llm_requests": 1}
+    def wait_for_activity(self, timeout_seconds: float) -> None:
+        self.wait_values.append(timeout_seconds)
+        self._idx += 1
 
 
 
@@ -265,6 +285,45 @@ def test_scheduled_flush_stops_when_admission_paused(tmp_path: Path) -> None:
         assert services.storage.get_pending_counts()["text_segments"] == 1
     finally:
         services.shutdown()
+
+
+def test_flush_coordinator_adaptive_wait_increases_and_resets() -> None:
+    class _FakeStorage:
+        def __init__(self) -> None:
+            self.calls = 0
+        def get_summary_job_status_counts(self): return {}
+        def count_unprocessed_key_events(self): return 0
+        def get_pending_counts(self):
+            self.calls += 1
+            if self.calls == 4:
+                return {"text_segments": 0, "screenshots": 0, "intervals": 0, "key_events": 0, "processed_key_events": 0}
+            return {"text_segments": 1, "screenshots": 0, "intervals": 0, "key_events": 0, "processed_key_events": 0}
+
+    class _FakeState:
+        def set_flush_times(self, **_kwargs): ...
+
+    class _FakeLifecycle:
+        paused_by_lock = False
+        def set_draining(self): ...
+        def set_idle(self): ...
+
+    class _FakeKeyboard:
+        def flush_pending_events(self, reason: str): ...
+    class _FakeTextService:
+        def process_once(self, force_flush: bool = False): ...
+
+    class _FakeNotifier:
+        def resolve(self, _key: str): ...
+        def notify(self, *_args, **_kwargs): ...
+
+    wait_values: list[float] = []
+    summarizer = _FakeSummarizer(wait_values=wait_values, running_values=[0, 0, 1, 0])
+    services = type("S", (), {"shutdown_event": type("E", (), {"is_set": lambda self: False})(), "summarizer": summarizer, "storage": _FakeStorage(), "state": _FakeState(), "keyboard_capture": _FakeKeyboard(), "text_service": _FakeTextService(), "error_notifier": _FakeNotifier()})()
+    coordinator = FlushCoordinator(services, _FakeLifecycle(), 60, __import__("logging").getLogger(__name__))
+    result = coordinator.flush_now("manual")
+    assert result is not None
+    assert wait_values[:2] == [0.8, 1.6]
+    assert wait_values[2] == 0.4
 
 
 def test_late_scheduler_callback_after_shutdown_is_ignored(tmp_path: Path, caplog) -> None:

@@ -119,6 +119,9 @@ class Summarizer:
         self.logger.info("event=summary_admission_decision allowed=false reason=shutdown lock_state=%s trigger=shutdown", self._lock_state_label())
         self._emit_admission_state_if_changed(reason="shutdown")
 
+    def reconfigure(self, *, summary_deduplicator: SummaryDeduplicator) -> None:
+        self.summary_deduplicator = summary_deduplicator
+
     def update_max_parallel_jobs(self, max_parallel_jobs: int) -> None:
         with self._condition:
             self._max_parallel_jobs = max(1, int(max_parallel_jobs))

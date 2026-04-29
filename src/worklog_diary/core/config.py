@@ -306,7 +306,7 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
     values = defaults.copy()
     needs_save = False
 
-    deprecated_aliases = {"max_parallel_summary_jobs"}
+    deprecated_aliases = {"max_parallel_summary_jobs", "screenshot_dedup_threshold"}
     unknown_fields = sorted(name for name in data.keys() if name not in field_names and name not in deprecated_aliases)
     if unknown_fields:
         needs_save = True

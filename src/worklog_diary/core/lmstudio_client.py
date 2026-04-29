@@ -84,6 +84,19 @@ class LMStudioClient:
     def set_summary_queue_concurrency(self, max_concurrent_jobs: int) -> None:
         self.job_queue.set_max_concurrent_jobs(max_concurrent_jobs)
 
+    def reconfigure(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        timeout_seconds: int,
+        daily_timeout_seconds: int,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self.daily_timeout_seconds = max(1, int(daily_timeout_seconds))
+
     def summarize_batch(
         self,
         batch: SummaryBatch,
