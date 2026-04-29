@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from worklog_diary.core.models import ForegroundInfo, TextSegment
@@ -203,3 +204,32 @@ def test_orphan_cleanup_queries_by_candidate_paths_only(tmp_path: Path) -> None:
         storage.close()
     assert any("WHERE lower(file_path) IN" in sql for sql in executed_sql)
     assert not any(sql.strip() == "SELECT file_path FROM screenshots" for sql in executed_sql)
+
+
+def test_orphan_cleanup_preserves_referenced_file_with_relative_db_path(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    screenshot_dir = tmp_path / "shots"
+    screenshot_dir.mkdir()
+    keep = screenshot_dir / "keep.png"
+    keep.write_bytes(b"img")
+
+    relative_path = Path("shots") / "keep.png"
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        storage.insert_screenshot(
+            ScreenshotRecord(
+                id=None,
+                ts=10.0,
+                file_path=str(relative_path),
+                process_name="code.exe",
+                window_title="Editor",
+                active_interval_id=None,
+            )
+        )
+        removed = storage.cleanup_service._cleanup_orphaned_screenshot_files({screenshot_dir})
+        assert removed == 0
+        assert keep.exists()
+    finally:
+        os.chdir(cwd)
+        storage.close()

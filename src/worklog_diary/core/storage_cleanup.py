@@ -101,12 +101,21 @@ class StorageCleanupService:
             for start in range(0, len(key_values), chunk_size):
                 chunk = key_values[start : start + chunk_size]
                 placeholders = ",".join(["?"] * len(chunk))
+                chunk_basenames = sorted({Path(key).name.lower() for key in chunk})
+                basename_filters = " OR ".join(["lower(file_path) LIKE ? OR lower(file_path) LIKE ?" for _ in chunk_basenames])
+                where_clause = f"lower(file_path) IN ({placeholders})"
+                if basename_filters:
+                    where_clause = f"{where_clause} OR {basename_filters}"
+                params: list[str] = [key.lower() for key in chunk]
+                for basename in chunk_basenames:
+                    params.append(f"%/{basename}")
+                    params.append(f"%\\{basename}")
                 rows = self._conn.execute(
                     (
                         "SELECT file_path FROM screenshots "
-                        f"WHERE lower(file_path) IN ({placeholders})"
+                        f"WHERE {where_clause}"
                     ),
-                    tuple(key.lower() for key in chunk),
+                    tuple(params),
                 ).fetchall()
                 referenced_paths.update(_normalized_path_key(str(row["file_path"])) for row in rows)
 
