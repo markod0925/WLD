@@ -7,6 +7,7 @@ import time as time_module
 from worklog_diary.core.batching import BatchBuilder
 from worklog_diary.core.models import ForegroundInfo, KeyEvent, ScreenshotRecord, TextSegment
 from worklog_diary.core.llm_job_queue import LLMJobMetadata
+from worklog_diary.core.llm_job_queue import LLMJobCancelledError
 from worklog_diary.core.storage import SQLiteStorage
 from worklog_diary.core.summarizer import Summarizer
 
@@ -29,6 +30,27 @@ class FailingClient:
     def summarize_daily_recap(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
         _emit_started(_kwargs)
         raise RuntimeError("LM Studio unavailable")
+
+
+class QueueClosingClient:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+        raise AssertionError("not used")
+
+    def summarize_daily_recap(self, *_args: object, **kwargs: object) -> tuple[str, dict]:
+        on_cancelled = kwargs.get("on_cancelled")
+        if callable(on_cancelled):
+            on_cancelled(
+                LLMJobMetadata(
+                    job_id=kwargs.get("job_id", "test-job"),
+                    job_type=str(kwargs.get("job_type", "day_summary")),
+                    queued_at=time_module.time(),
+                    timeout_s=float(kwargs.get("timeout_s", 600)),
+                    attempt=1,
+                ),
+                "queue_closing",
+            )
+        raise LLMJobCancelledError("LLM queue is shutting down")
+
 
 
 def _emit_started(kwargs: dict[str, object]) -> None:
@@ -270,6 +292,142 @@ def test_daily_summary_is_idempotent_per_day(tmp_path: Path) -> None:
         assert job["status"] == "completed"
         assert job["attempt"] == 1
         assert storage.get_diagnostics_snapshot()["daily_summaries"] == 1
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_reconcile_missing_daily_summaries_enqueues_oldest_first(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "worklog.db"
+    storage = SQLiteStorage(str(db_path))
+    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient())
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 29, 12, 0, 0)
+    monkeypatch.setattr("worklog_diary.core.summarizer.datetime", _FixedDateTime)
+    try:
+        for day in (date(2026, 4, 26), date(2026, 4, 27)):
+            start = datetime.combine(day, time.min).timestamp()
+            _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text=day.isoformat())
+        result = summarizer.reconcile_missing_daily_summaries(min_age_hours=2.0, max_days=60)
+        assert result["enqueued"] == 2
+        rows = storage._conn.execute("SELECT target_day FROM summary_jobs WHERE job_type='day_summary' ORDER BY id ASC").fetchall()  # noqa: SLF001
+        assert [str(row["target_day"]) for row in rows] == ["2026-04-26", "2026-04-27"]
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_reconcile_excludes_today_and_recent_day(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "worklog.db"
+    storage = SQLiteStorage(str(db_path))
+    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient())
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 29, 1, 0, 0)
+    monkeypatch.setattr("worklog_diary.core.summarizer.datetime", _FixedDateTime)
+    try:
+        for day in (date(2026, 4, 28), date(2026, 4, 29)):
+            start = datetime.combine(day, time.min).timestamp()
+            _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text=day.isoformat())
+        result = summarizer.reconcile_missing_daily_summaries(min_age_hours=2.0, max_days=60)
+        assert result["enqueued"] == 0
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_reconcile_is_idempotent_with_existing_active_job(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "worklog.db"
+    storage = SQLiteStorage(str(db_path))
+    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient())
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 29, 12, 0, 0)
+    monkeypatch.setattr("worklog_diary.core.summarizer.datetime", _FixedDateTime)
+    day = date(2026, 4, 27)
+    start = datetime.combine(day, time.min).timestamp()
+    _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text="x")
+    storage.create_or_reuse_daily_summary_job(day=day, start_ts=start, end_ts=start + 86400, status="queued")
+    try:
+        result = summarizer.reconcile_missing_daily_summaries(min_age_hours=2.0, max_days=60)
+        assert result["enqueued"] == 0
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_reconcile_skips_when_shutdown_already_started(tmp_path: Path) -> None:
+    import threading
+    evt = threading.Event()
+    evt.set()
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient(), shutdown_event=evt)
+    try:
+        result = summarizer.reconcile_missing_daily_summaries()
+        assert result["enqueued"] == 0
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_reconcile_queue_closing_stops_cleanly(tmp_path: Path, monkeypatch) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=QueueClosingClient())
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 29, 12, 0, 0)
+    monkeypatch.setattr("worklog_diary.core.summarizer.datetime", _FixedDateTime)
+    day = date(2026, 4, 27)
+    start = datetime.combine(day, time.min).timestamp()
+    _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text="x")
+    try:
+        result = summarizer.reconcile_missing_daily_summaries()
+        assert result["enqueued"] == 0
+        job = storage.get_daily_summary_job_for_day(day)
+        assert job is not None
+        assert job["status"] == "cancelled"
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_daily_recap_marks_job_cancelled_when_shutdown_hits_while_admission_blocked(tmp_path: Path) -> None:
+    import threading
+
+    evt = threading.Event()
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage),
+        lm_client=SuccessfulClient(),
+        shutdown_event=evt,
+        process_backlog_only_while_locked=True,
+    )
+    day = date(2026, 4, 27)
+    start = datetime.combine(day, time.min).timestamp()
+    _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text="x")
+    summarizer.handle_session_lock_state_change(False)
+
+    def _trip_shutdown() -> None:
+        time_module.sleep(0.05)
+        evt.set()
+
+    trigger = threading.Thread(target=_trip_shutdown, daemon=True)
+    trigger.start()
+
+    try:
+        try:
+            summarizer.generate_daily_recap_for_day(day, reason="auto_backfill")
+        except LLMJobCancelledError:
+            pass
+        job = storage.get_daily_summary_job_for_day(day)
+        assert job is not None
+        assert job["status"] == "cancelled"
     finally:
         summarizer.stop()
         storage.close()

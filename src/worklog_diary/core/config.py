@@ -46,6 +46,9 @@ SAFE_CONFIG_KEYS: tuple[str, ...] = (
     "semantic_transition_keywords",
     "semantic_store_merge_diagnostics",
     "semantic_recompute_missing_embeddings_on_startup",
+    "daily_summary_auto_backfill_enabled",
+    "daily_summary_auto_backfill_min_age_hours",
+    "daily_summary_auto_backfill_max_days",
 )
 
 
@@ -111,6 +114,9 @@ class AppConfig:
     semantic_transition_keywords: list[str] = field(default_factory=lambda: ["then", "afterward", "next", "switched", "meeting", "call", "pausa", "riunione", "poi", "successivamente"])
     semantic_store_merge_diagnostics: bool = True
     semantic_recompute_missing_embeddings_on_startup: bool = False
+    daily_summary_auto_backfill_enabled: bool = True
+    daily_summary_auto_backfill_min_age_hours: float = 2.0
+    daily_summary_auto_backfill_max_days: int = 30
 
     def normalize(self) -> None:
         if not self.app_data_dir:
@@ -179,6 +185,9 @@ class AppConfig:
         self.semantic_transition_keywords = [str(item).strip().lower() for item in self.semantic_transition_keywords if str(item).strip()]
         self.semantic_store_merge_diagnostics = bool(self.semantic_store_merge_diagnostics)
         self.semantic_recompute_missing_embeddings_on_startup = bool(self.semantic_recompute_missing_embeddings_on_startup)
+        self.daily_summary_auto_backfill_enabled = bool(self.daily_summary_auto_backfill_enabled)
+        self.daily_summary_auto_backfill_min_age_hours = max(0.0, float(self.daily_summary_auto_backfill_min_age_hours))
+        self.daily_summary_auto_backfill_max_days = max(1, int(self.daily_summary_auto_backfill_max_days))
         self.config_version = CONFIG_VERSION
 
     @classmethod
@@ -376,6 +385,9 @@ def _build_config_from_mapping(data: Mapping[str, Any], *, source: str | None = 
         "semantic_transition_keywords": _coerce_str_list,
         "semantic_store_merge_diagnostics": _coerce_bool,
         "semantic_recompute_missing_embeddings_on_startup": _coerce_bool,
+        "daily_summary_auto_backfill_enabled": _coerce_bool,
+        "daily_summary_auto_backfill_min_age_hours": _coerce_float,
+        "daily_summary_auto_backfill_max_days": _coerce_int,
     }
 
     for field_name, converter in converters.items():

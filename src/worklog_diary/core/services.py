@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from datetime import date
 
@@ -110,6 +111,18 @@ class MonitoringServices:
             self.flush_coordinator,
             self.logger,
         )
+        self._startup_backfill_thread = threading.Thread(
+            target=self.summarizer.reconcile_missing_daily_summaries,
+            kwargs={
+                "reason": "startup_backfill",
+                "min_age_hours": self.config.daily_summary_auto_backfill_min_age_hours,
+                "max_days": self.config.daily_summary_auto_backfill_max_days,
+                "enabled": self.config.daily_summary_auto_backfill_enabled,
+            },
+            name="startup-daily-summary-backfill",
+            daemon=True,
+        )
+        self._startup_backfill_thread.start()
         self._shutdown_completed = False
 
     def set_error_notification_sink(self, sink: Callable[[str, str], None] | None) -> None:
@@ -253,7 +266,7 @@ class MonitoringServices:
         day_key = day.isoformat()
         self.logger.info("event=daily_recap_generation_started day=%s", day_key)
         try:
-            summary_id, replaced = self.summarizer.generate_daily_recap_for_day(day)
+            summary_id, replaced = self.summarizer.generate_daily_recap_for_day(day, reason="manual")
             stored = self.storage.get_daily_summary_for_day(day)
             source_batch_count = (
                 stored.source_batch_count if stored is not None else self.storage.count_batch_summaries_for_day(day)
