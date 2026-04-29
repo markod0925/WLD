@@ -154,12 +154,13 @@ class TextReconstructor:
         return segment
 
     def get_runtime_diagnostics(self) -> dict[str, int | bool]:
-        if self._current is None:
+        current = self._current
+        if current is None:
             return {"has_open_segment": False, "open_segment_raw_key_count": 0, "open_segment_char_count": 0}
         return {
             "has_open_segment": True,
-            "open_segment_raw_key_count": self._current.raw_key_count,
-            "open_segment_char_count": len(self._current.chars),
+            "open_segment_raw_key_count": current.raw_key_count,
+            "open_segment_char_count": len(current.chars),
         }
 
 

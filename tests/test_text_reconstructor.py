@@ -167,3 +167,25 @@ def test_runtime_diagnostics_track_open_segment_state() -> None:
     reconstructor.feed([], force_flush=True)
     diagnostics_after = reconstructor.get_runtime_diagnostics()
     assert diagnostics_after["has_open_segment"] is False
+
+
+def test_runtime_diagnostics_reads_open_segment_from_single_snapshot() -> None:
+    reconstructor = TextReconstructor()
+
+    class _RaceyCurrent:
+        def __init__(self, parent: TextReconstructor) -> None:
+            self._parent = parent
+            self.chars = ["a", "b"]
+
+        @property
+        def raw_key_count(self) -> int:
+            self._parent._current = None
+            return 2
+
+    reconstructor._current = _RaceyCurrent(reconstructor)  # type: ignore[assignment]
+
+    diagnostics = reconstructor.get_runtime_diagnostics()
+
+    assert diagnostics["has_open_segment"] is True
+    assert diagnostics["open_segment_char_count"] == 2
+    assert diagnostics["open_segment_raw_key_count"] == 2
