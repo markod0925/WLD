@@ -153,6 +153,16 @@ class TextReconstructor:
             return None
         return segment
 
+    def get_runtime_diagnostics(self) -> dict[str, int | bool]:
+        current = self._current
+        if current is None:
+            return {"has_open_segment": False, "open_segment_raw_key_count": 0, "open_segment_char_count": 0}
+        return {
+            "has_open_segment": True,
+            "open_segment_raw_key_count": current.raw_key_count,
+            "open_segment_char_count": len(current.chars),
+        }
+
 
 class TextReconstructionService:
     def __init__(
@@ -235,13 +245,10 @@ class TextReconstructionService:
 
     def _log_segments(self, segments: list[TextSegment]) -> None:
         for segment in segments:
-            text_preview = segment.text.replace("\n", "\\n")
-            if len(text_preview) > 80:
-                text_preview = text_preview[:80] + "..."
             self.logger.info(
                 (
                     "event=text_segment_finalized start_ts=%.3f end_ts=%.3f process=%s "
-                    "title=%s raw_keys=%s hotkeys=%s text_preview=%r"
+                    "title=%s raw_keys=%s hotkeys=%s char_count=%s"
                 ),
                 segment.start_ts,
                 segment.end_ts,
@@ -249,7 +256,7 @@ class TextReconstructionService:
                 segment.window_title,
                 segment.raw_key_count,
                 ",".join(segment.hotkeys),
-                text_preview,
+                len(segment.text),
             )
 
 

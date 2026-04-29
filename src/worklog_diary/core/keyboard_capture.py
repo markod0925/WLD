@@ -56,10 +56,10 @@ class KeyboardCaptureService:
         if self._listener is not None:
             return
         if native_hooks_disabled():
-            self.logger.info("Keyboard capture disabled in test/native-hook-off mode")
+            self.logger.info("event=keyboard_hook_disabled reason=native_hooks_disabled")
             return
         if pynput_keyboard is None:
-            self.logger.warning("Keyboard capture disabled: %s", PYNPUT_KEYBOARD_IMPORT_ERROR)
+            self.logger.warning("event=keyboard_hook_disabled reason=import_error error=%s", PYNPUT_KEYBOARD_IMPORT_ERROR)
             return
 
         self._listener = pynput_keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
@@ -69,7 +69,7 @@ class KeyboardCaptureService:
         self._last_flush_started_at = time.monotonic()
         self._flush_thread = threading.Thread(target=self._run_flush_loop, name="KeyboardCaptureFlush", daemon=True)
         self._flush_thread.start()
-        self.logger.info("Keyboard capture service started")
+        self.logger.info("event=keyboard_hook_installed service=keyboard_capture")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -92,6 +92,7 @@ class KeyboardCaptureService:
     def _handle_event(self, key: Any, event_type: str) -> None:
         key_name = _normalize_key_name(key)
         modifier = _modifier_for_key(key_name)
+        self.logger.debug("event=keyboard_event_observed event_type=%s key_class=%s", event_type, type(key).__name__)
 
         with self._lock:
             if event_type == "down" and modifier:
@@ -145,7 +146,7 @@ class KeyboardCaptureService:
                 self.logger.debug(
                     (
                         "event=key_capture_accepted key=%s event_type=%s modifiers=%s "
-                        "process=%s title=%s interval_id=%s"
+                        "process=%s title=%s interval_id=%s buffered_keys=%s"
                     ),
                     key_name,
                     event_type,
@@ -153,6 +154,7 @@ class KeyboardCaptureService:
                     snapshot.foreground_info.process_name,
                     snapshot.foreground_info.window_title,
                     snapshot.active_interval_id,
+                    len(self._pending_key_events),
                 )
             else:
                 reason = "blocked_process" if blocked_now else "foreground_mismatch"
@@ -211,9 +213,10 @@ class KeyboardCaptureService:
             self._last_flush_started_at = time.monotonic()
             duration_ms = (time.perf_counter() - started_at) * 1000.0
             self.logger.info(
-                "event=key_capture_buffer_flushed reason=%s inserted=%s duration_ms=%.3f",
+                "event=key_capture_buffer_flushed reason=%s inserted=%s buffered_keys_remaining=%s duration_ms=%.3f",
                 reason,
                 inserted,
+                len(self._pending_key_events),
                 duration_ms,
             )
             return inserted
@@ -233,6 +236,14 @@ class KeyboardCaptureService:
         if flush_thread.is_alive():
             flush_thread.join(timeout=3)
         self._flush_thread = None
+
+    def get_runtime_diagnostics(self) -> dict[str, int | bool]:
+        with self._lock:
+            buffered = len(self._pending_key_events)
+        return {
+            "hook_installed": self._listener is not None,
+            "pending_key_event_buffer_count": buffered,
+        }
 
 
 
