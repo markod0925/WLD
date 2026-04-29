@@ -81,34 +81,54 @@ class StorageCleanupService:
     def _cleanup_orphaned_screenshot_files(self, candidate_dirs: set[Path]) -> int:
         if not candidate_dirs:
             return 0
-        with self._lock:
-            rows = self._conn.execute("SELECT file_path FROM screenshots").fetchall()
-            referenced_paths = {_normalized_path_key(str(row["file_path"])) for row in rows}
-
-        removed = 0
-        failed = 0
+        candidate_files: list[Path] = []
+        candidate_keys_to_path: dict[str, Path] = {}
         for directory in candidate_dirs:
             if not directory.exists():
                 continue
             for file_path in directory.glob("*"):
                 if file_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
                     continue
-                if _normalized_path_key(str(file_path)) in referenced_paths:
-                    continue
-                try:
-                    os.remove(file_path)
-                    removed += 1
-                except Exception as exc:
-                    failed += 1
-                    self._logger.warning(
-                        "[CRASH] stage=orphan_file_delete status=error pid=%s thread=%s error_type=%s error=%s path=%s",
-                        os.getpid(),
-                        threading.current_thread().name,
-                        exc.__class__.__name__,
-                        exc,
-                        file_path,
-                    )
-                    continue
+                candidate_files.append(file_path)
+                candidate_keys_to_path[_normalized_path_key(str(file_path))] = file_path
+        if not candidate_files:
+            return 0
+
+        with self._lock:
+            referenced_paths: set[str] = set()
+            key_values = list(candidate_keys_to_path.keys())
+            chunk_size = 500
+            for start in range(0, len(key_values), chunk_size):
+                chunk = key_values[start : start + chunk_size]
+                placeholders = ",".join(["?"] * len(chunk))
+                rows = self._conn.execute(
+                    (
+                        "SELECT file_path FROM screenshots "
+                        f"WHERE lower(file_path) IN ({placeholders})"
+                    ),
+                    tuple(key.lower() for key in chunk),
+                ).fetchall()
+                referenced_paths.update(_normalized_path_key(str(row["file_path"])) for row in rows)
+
+        removed = 0
+        failed = 0
+        for file_path in candidate_files:
+            if _normalized_path_key(str(file_path)) in referenced_paths:
+                continue
+            try:
+                os.remove(file_path)
+                removed += 1
+            except Exception as exc:
+                failed += 1
+                self._logger.warning(
+                    "[CRASH] stage=orphan_file_delete status=error pid=%s thread=%s error_type=%s error=%s path=%s",
+                    os.getpid(),
+                    threading.current_thread().name,
+                    exc.__class__.__name__,
+                    exc,
+                    file_path,
+                )
+                continue
         if failed:
             self._logger.warning("[CRASH] stage=orphan_cleanup status=error pid=%s failed_deletes=%s", os.getpid(), failed)
         return removed

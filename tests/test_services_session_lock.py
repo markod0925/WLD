@@ -155,6 +155,31 @@ def test_apply_config_updates_screenshot_dedup_through_public_method(tmp_path: P
         services.shutdown()
 
 
+def test_apply_config_delegates_to_reconfigure_methods(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    try:
+        calls: dict[str, int] = {"batch": 0, "client": 0, "prompt": 0, "summarizer": 0}
+        services.batch_builder.reconfigure = lambda **_kwargs: calls.__setitem__("batch", calls["batch"] + 1)  # type: ignore[method-assign]
+        services.lmstudio_client.reconfigure = lambda **_kwargs: calls.__setitem__("client", calls["client"] + 1)  # type: ignore[method-assign]
+        services.lmstudio_client.prompt_builder.update_limits = lambda **_kwargs: calls.__setitem__("prompt", calls["prompt"] + 1)  # type: ignore[method-assign]
+        services.summarizer.reconfigure = lambda **_kwargs: calls.__setitem__("summarizer", calls["summarizer"] + 1)  # type: ignore[method-assign]
+        services.apply_config(_config_for_tmp(tmp_path, lmstudio_max_prompt_chars=25000))
+        assert calls == {"batch": 1, "client": 1, "prompt": 1, "summarizer": 1}
+    finally:
+        services.shutdown()
+
+
+def test_apply_config_updates_prompt_builder_derived_text_limit(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path, max_text_segments_per_summary=3))
+    try:
+        services.apply_config(_config_for_tmp(tmp_path, max_text_segments_per_summary=7))
+        builder = services.lmstudio_client.prompt_builder
+        assert builder.max_summary_text_segments == 7
+        assert builder.max_text_chars == 35
+    finally:
+        services.shutdown()
+
+
 def test_summary_admission_state_logs_transition_without_spam(tmp_path: Path, caplog) -> None:
     services = MonitoringServices(_config_for_tmp(tmp_path, process_backlog_only_while_locked=True))
     try:

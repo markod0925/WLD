@@ -34,6 +34,11 @@ class LMStudioPromptBuilder:
         derived_max_text_chars = self.max_summary_text_segments * TEXT_CHARS_PER_SUMMARY_SEGMENT
         self.max_text_chars = max(1, int(max_text_chars if max_text_chars is not None else derived_max_text_chars))
 
+    def update_limits(self, *, max_prompt_chars: int, max_summary_text_segments: int) -> None:
+        self.max_prompt_chars = max(2000, int(max_prompt_chars))
+        self.max_summary_text_segments = max(1, int(max_summary_text_segments))
+        self.max_text_chars = self.max_summary_text_segments * TEXT_CHARS_PER_SUMMARY_SEGMENT
+
     def build_summary_prompt(self, batch: SummaryBatch) -> PromptBuildResult:
         payload, metadata = self._build_summary_payload(batch)
         prompt_text = self._render_prompt(

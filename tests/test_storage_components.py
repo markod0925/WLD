@@ -147,3 +147,59 @@ def test_storage_roundtrip_persists_counts_across_reopen(tmp_path: Path) -> None
         assert diagnostics["summary_jobs"]["abandoned"] == 1
     finally:
         reopened.close()
+
+
+def test_orphan_cleanup_deletes_only_unreferenced_candidates(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    screenshot_dir = tmp_path / "shots"
+    other_dir = tmp_path / "other"
+    screenshot_dir.mkdir()
+    other_dir.mkdir()
+    keep = screenshot_dir / "keep.png"
+    remove = screenshot_dir / "remove.png"
+    outside = other_dir / "outside.png"
+    keep.write_bytes(b"img")
+    remove.write_bytes(b"img")
+    outside.write_bytes(b"img")
+    try:
+        storage.insert_screenshot(
+            ScreenshotRecord(
+                id=None,
+                ts=10.0,
+                file_path=str(keep),
+                process_name="code.exe",
+                window_title="Editor",
+                active_interval_id=None,
+            )
+        )
+        removed = storage.cleanup_service._cleanup_orphaned_screenshot_files({screenshot_dir})
+        assert removed == 1
+        assert keep.exists()
+        assert not remove.exists()
+        assert outside.exists()
+    finally:
+        storage.close()
+
+
+def test_orphan_cleanup_queries_by_candidate_paths_only(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    screenshot_dir = tmp_path / "shots"
+    screenshot_dir.mkdir()
+    candidate = screenshot_dir / "candidate.png"
+    candidate.write_bytes(b"img")
+    executed_sql: list[str] = []
+
+    class _ConnProxy:
+        def __init__(self, conn) -> None:
+            self._conn = conn
+        def execute(self, sql: str, params=()):
+            executed_sql.append(sql)
+            return self._conn.execute(sql, params)
+
+    storage.cleanup_service._conn = _ConnProxy(storage._conn)  # type: ignore[assignment]
+    try:
+        storage.cleanup_service._cleanup_orphaned_screenshot_files({screenshot_dir})
+    finally:
+        storage.close()
+    assert any("WHERE lower(file_path) IN" in sql for sql in executed_sql)
+    assert not any(sql.strip() == "SELECT file_path FROM screenshots" for sql in executed_sql)

@@ -172,33 +172,35 @@ class MonitoringServices:
             )
             self.text_service.poll_interval_seconds = max(0.5, self.config.reconstruction_poll_interval_seconds)
             self.text_reconstructor.inactivity_gap_seconds = self.config.text_inactivity_gap_seconds
-            self.batch_builder.max_text_segments = self.config.max_text_segments_per_summary
-            self.batch_builder.max_screenshots = self.config.max_screenshots_per_summary
-            self.batch_builder.dedup_enabled = self.config.screenshot_dedup_enabled
-            self.batch_builder.dedup_threshold = self.config.screenshot_dedup_phash_threshold
-            self.batch_builder.min_keep_interval_seconds = self.config.screenshot_min_keep_interval_seconds
-            self.batch_builder.activity_segment_min_duration_seconds = self.config.activity_segment_min_duration_seconds
-            self.batch_builder.activity_segment_max_duration_seconds = self.config.activity_segment_max_duration_seconds
-            self.batch_builder.activity_segment_idle_gap_seconds = self.config.activity_segment_idle_gap_seconds
-            self.batch_builder.activity_segment_title_similarity_threshold = (
-                self.config.activity_segment_title_similarity_threshold
+            self.batch_builder.reconfigure(
+                max_text_segments=self.config.max_text_segments_per_summary,
+                max_screenshots=self.config.max_screenshots_per_summary,
+                dedup_enabled=self.config.screenshot_dedup_enabled,
+                dedup_threshold=self.config.screenshot_dedup_phash_threshold,
+                min_keep_interval_seconds=self.config.screenshot_min_keep_interval_seconds,
+                activity_segment_min_duration_seconds=self.config.activity_segment_min_duration_seconds,
+                activity_segment_max_duration_seconds=self.config.activity_segment_max_duration_seconds,
+                activity_segment_idle_gap_seconds=self.config.activity_segment_idle_gap_seconds,
+                activity_segment_title_similarity_threshold=self.config.activity_segment_title_similarity_threshold,
+                activity_segment_screenshot_phash_threshold=self.config.screenshot_dedup_phash_threshold,
+                activity_segment_screenshot_ssim_threshold=self.config.screenshot_dedup_ssim_threshold,
             )
-            self.batch_builder.activity_segment_screenshot_phash_threshold = self.config.screenshot_dedup_phash_threshold
-            self.batch_builder.activity_segment_screenshot_ssim_threshold = self.config.screenshot_dedup_ssim_threshold
-            self.lmstudio_client.base_url = self.config.lmstudio_base_url.rstrip("/")
-            self.lmstudio_client.model = self.config.lmstudio_model
-            self.lmstudio_client.timeout_seconds = self.config.request_timeout_seconds
-            self.lmstudio_client.daily_timeout_seconds = _resolve_daily_request_timeout_seconds(self.config)
-            self.lmstudio_client.prompt_builder.max_prompt_chars = self.config.lmstudio_max_prompt_chars
-            max_summary_text_segments = max(1, int(self.config.max_text_segments_per_summary))
-            self.lmstudio_client.prompt_builder.max_summary_text_segments = max_summary_text_segments
-            self.lmstudio_client.prompt_builder.max_text_chars = max_summary_text_segments * 5
-            self.summarizer.summary_deduplicator = SummaryDeduplicator(
+            self.lmstudio_client.reconfigure(
+                base_url=self.config.lmstudio_base_url,
+                model=self.config.lmstudio_model,
+                timeout_seconds=self.config.request_timeout_seconds,
+                daily_timeout_seconds=_resolve_daily_request_timeout_seconds(self.config),
+            )
+            self.lmstudio_client.prompt_builder.update_limits(
+                max_prompt_chars=self.config.lmstudio_max_prompt_chars,
+                max_summary_text_segments=self.config.max_text_segments_per_summary,
+            )
+            self.summarizer.reconfigure(summary_deduplicator=SummaryDeduplicator(
                 suppress_threshold=self.config.summary_similarity_suppress_threshold,
                 merge_threshold=self.config.summary_similarity_merge_threshold,
                 cooldown_seconds=self.config.summary_cooldown_seconds,
                 recent_compare_count=self.config.recent_summary_compare_count,
-            )
+            ))
             if self.summarizer.semantic_coalescer is not None:
                 self.summarizer.semantic_coalescer.engine.config = SemanticCoalescingConfig(
                     enabled=self.config.semantic_coalescing_enabled,
