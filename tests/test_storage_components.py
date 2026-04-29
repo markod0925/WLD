@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from datetime import date
 
+import worklog_diary.core.activity_repository as activity_repository_module
 import worklog_diary.core.capture_repository as capture_repository_module
 import worklog_diary.core.storage_cleanup as storage_cleanup_module
 from worklog_diary.core.models import ForegroundInfo, KeyEvent, ScreenshotRecord, TextSegment
@@ -72,6 +73,86 @@ def test_storage_capture_methods_delegate_to_repository(tmp_path: Path, monkeypa
         assert captured["fetch_unsummarized_screenshots_self"] is storage.capture_repository
         assert captured["fetch_unsummarized_screenshots_limit"] == 7
         assert screenshots == []
+    finally:
+        storage.close()
+
+
+def test_storage_activity_methods_delegate_to_repository(tmp_path: Path, monkeypatch) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    captured: dict[str, object] = {}
+
+    def fake_start_interval(self, info, blocked: bool):
+        captured["start_self"] = self
+        captured["start_info"] = info
+        captured["start_blocked"] = blocked
+        return 123
+
+    def fake_close_interval(self, interval_id: int, end_ts: float) -> None:
+        captured["close_self"] = self
+        captured["close_interval_id"] = interval_id
+        captured["close_end_ts"] = end_ts
+
+    def fake_fetch_unsummarized_intervals(self, limit: int = 10000):
+        captured["fetch_self"] = self
+        captured["fetch_limit"] = limit
+        return []
+
+    def fake_fetch_unsummarized_blocked_intervals(self, limit: int = 10000):
+        captured["fetch_blocked_self"] = self
+        captured["fetch_blocked_limit"] = limit
+        return []
+
+    def fake_mark_intervals_summarized(self, start_ts: float, end_ts: float) -> None:
+        captured["mark_self"] = self
+        captured["mark_args"] = (start_ts, end_ts)
+
+    monkeypatch.setattr(activity_repository_module.SQLiteActivityRepository, "start_interval", fake_start_interval)
+    monkeypatch.setattr(activity_repository_module.SQLiteActivityRepository, "close_interval", fake_close_interval)
+    monkeypatch.setattr(
+        activity_repository_module.SQLiteActivityRepository,
+        "fetch_unsummarized_intervals",
+        fake_fetch_unsummarized_intervals,
+    )
+    monkeypatch.setattr(
+        activity_repository_module.SQLiteActivityRepository,
+        "fetch_unsummarized_blocked_intervals",
+        fake_fetch_unsummarized_blocked_intervals,
+    )
+    monkeypatch.setattr(
+        activity_repository_module.SQLiteActivityRepository,
+        "mark_intervals_summarized",
+        fake_mark_intervals_summarized,
+    )
+    try:
+        interval_id = storage.start_interval(
+            ForegroundInfo(
+                timestamp=1.0,
+                hwnd=2,
+                pid=3,
+                process_name="code.exe",
+                window_title="Editor",
+            ),
+            blocked=True,
+        )
+        storage.close_interval(7, end_ts=9.5)
+        intervals = storage.fetch_unsummarized_intervals(limit=4)
+        blocked_intervals = storage.fetch_unsummarized_blocked_intervals(limit=5)
+        storage.mark_intervals_summarized(10.0, 20.0)
+
+        assert interval_id == 123
+        assert captured["start_self"] is storage.activity_repository
+        assert captured["start_blocked"] is True
+        assert captured["close_self"] is storage.activity_repository
+        assert captured["close_interval_id"] == 7
+        assert captured["close_end_ts"] == 9.5
+        assert captured["fetch_self"] is storage.activity_repository
+        assert captured["fetch_limit"] == 4
+        assert captured["fetch_blocked_self"] is storage.activity_repository
+        assert captured["fetch_blocked_limit"] == 5
+        assert captured["mark_self"] is storage.activity_repository
+        assert captured["mark_args"] == (10.0, 20.0)
+        assert intervals == []
+        assert blocked_intervals == []
     finally:
         storage.close()
 
