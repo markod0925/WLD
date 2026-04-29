@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
 from datetime import date
 from types import SimpleNamespace
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import pytest
+
+from qt_test_utils import require_qt
+
+pytestmark = pytest.mark.qt
+
+require_qt()
 
 from PySide6.QtWidgets import QApplication
 
