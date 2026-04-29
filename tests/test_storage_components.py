@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from datetime import date
 
 from worklog_diary.core.models import ForegroundInfo, TextSegment
 from worklog_diary.core.storage import SQLiteStorage
 from worklog_diary.core.models import ScreenshotRecord
+import worklog_diary.core.summary_repository as summary_repository_module
 import worklog_diary.core.storage_cleanup as storage_cleanup_module
 
 
@@ -24,6 +26,80 @@ def test_storage_diagnostics_delegates_to_repository(tmp_path: Path) -> None:
     try:
         assert storage.get_pending_counts() == storage.diagnostics_repository.get_pending_counts()
         assert storage.get_diagnostics_snapshot() == storage.diagnostics_repository.get_diagnostics_snapshot()
+    finally:
+        storage.close()
+
+
+def test_storage_summary_methods_delegate_to_summary_repository(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    captured: dict[str, object] = {}
+
+    def fake_create_summary_job(
+        self,
+        start_ts: float,
+        end_ts: float,
+        status: str = "queued",
+        *,
+        job_type: str = "event_summary",
+        target_day: date | str | None = None,
+        timeout_s: float = 0,
+        attempt: int = 1,
+        input_chars: int = 0,
+        input_token_estimate: int | None = None,
+        priority: int = 100,
+    ) -> int:
+        captured["create_self"] = self
+        captured["create_args"] = (
+            start_ts,
+            end_ts,
+            status,
+            job_type,
+            target_day,
+            timeout_s,
+            attempt,
+            input_chars,
+            input_token_estimate,
+            priority,
+        )
+        return 987
+
+    def fake_get_daily_summary_for_day(self, day: date):
+        captured["daily_self"] = self
+        captured["daily_day"] = day
+        return None
+
+    monkeypatch.setattr(summary_repository_module.SummaryRepository, "create_summary_job", fake_create_summary_job)
+    monkeypatch.setattr(
+        summary_repository_module.SummaryRepository,
+        "get_daily_summary_for_day",
+        fake_get_daily_summary_for_day,
+    )
+    try:
+        assert storage.create_summary_job(
+            1.0,
+            2.0,
+            status="queued",
+            target_day=date(2026, 4, 10),
+        ) == 987
+        assert captured["create_self"] is storage.summary_repository
+        assert captured["create_args"] == (
+            1.0,
+            2.0,
+            "queued",
+            "event_summary",
+            date(2026, 4, 10),
+            0,
+            1,
+            0,
+            None,
+            100,
+        )
+
+        assert storage.get_daily_summary_for_day(date(2026, 4, 10)) is None
+        assert captured["daily_self"] is storage.summary_repository
+        assert captured["daily_day"] == date(2026, 4, 10)
     finally:
         storage.close()
 
