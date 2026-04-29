@@ -38,3 +38,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 addopts = "-q"
+markers = [
+  "qt: tests requiring PySide6/Qt native dependencies",
+]

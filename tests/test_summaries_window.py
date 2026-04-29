@@ -1,17 +1,21 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
 from datetime import date
 from types import SimpleNamespace
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import pytest
 
-from PySide6.QtWidgets import QApplication
-
+from qt_test_utils import require_qt
 from worklog_diary.core.models import DailySummaryRecord, SummaryRecord
-from worklog_diary.ui.summaries_window import SummariesWindow
+
+pytestmark = pytest.mark.qt
+
+
+@pytest.fixture(autouse=True)
+def _require_qt_runtime() -> None:
+    require_qt()
 
 
 class FakeStorage:
@@ -88,7 +92,9 @@ class FakeServices:
         }
 
 
-def _get_app() -> QApplication:
+def _get_app():
+    from PySide6.QtWidgets import QApplication
+
     app = QApplication.instance()
     if app is None:
         app = QApplication([])
@@ -96,6 +102,8 @@ def _get_app() -> QApplication:
 
 
 def test_daily_recap_generation_resets_button_after_background_completion() -> None:
+    from worklog_diary.ui.summaries_window import SummariesWindow
+
     app = _get_app()
     target_day = date(2026, 4, 10)
     storage = FakeStorage(target_day)
@@ -131,6 +139,8 @@ def test_daily_recap_generation_resets_button_after_background_completion() -> N
 
 
 def test_summaries_window_auto_refreshes_when_storage_changes() -> None:
+    from worklog_diary.ui.summaries_window import SummariesWindow
+
     app = _get_app()
     target_day = date(2026, 4, 10)
     storage = FakeStorage(target_day)
