@@ -24,6 +24,7 @@ from .security.sqlcipher import (
 )
 from .storage_cleanup import StorageCleanupService
 from .storage_diagnostics import StorageDiagnosticsRepository
+from .storage_logging import log_db_query_timing
 from .storage_schema import StorageSchemaManager
 from .summary_repository import SummaryRepository
 from .models import (
@@ -155,16 +156,7 @@ class SQLiteStorage(ActivityRepository):
             self._conn.close()
 
     def _log_db_query_timing(self, operation: str, started_at: float, *, rows: int | None = None) -> None:
-        duration_ms = (time.perf_counter() - started_at) * 1000.0
-        if rows is None:
-            self.logger.info("event=db_query_timing operation=%s duration_ms=%.3f", operation, duration_ms)
-        else:
-            self.logger.info(
-                "event=db_query_timing operation=%s duration_ms=%.3f rows=%s",
-                operation,
-                duration_ms,
-                rows,
-            )
+        log_db_query_timing(self.logger, operation, started_at, rows=rows)
 
     def _record_db_write(self) -> None:
         now = time.perf_counter()

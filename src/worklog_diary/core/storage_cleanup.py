@@ -7,6 +7,8 @@ import threading
 import time
 from pathlib import Path
 
+from .storage_logging import log_db_query_timing
+
 
 class StorageCleanupService:
     """Clean up raw activity rows and associated screenshot files."""
@@ -143,16 +145,7 @@ class StorageCleanupService:
         return removed
 
     def _log_db_query_timing(self, operation: str, started_at: float, *, rows: int | None = None) -> None:
-        duration_ms = (time.perf_counter() - started_at) * 1000.0
-        if rows is None:
-            self._logger.info("event=db_query_timing operation=%s duration_ms=%.3f", operation, duration_ms)
-        else:
-            self._logger.info(
-                "event=db_query_timing operation=%s duration_ms=%.3f rows=%s",
-                operation,
-                duration_ms,
-                rows,
-            )
+        log_db_query_timing(self._logger, operation, started_at, rows=rows)
 
 
 def _normalized_path_key(path: str) -> str:

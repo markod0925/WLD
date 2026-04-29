@@ -269,16 +269,8 @@ def _coerce_bool(value: Any, field_name: str, *, source: str | None = None) -> b
 
 
 def _coerce_blocked_processes(value: Any, field_name: str, *, source: str | None = None) -> list[str]:
-    if not isinstance(value, list):
-        raise ValueError(_format_config_error(source, field_name, "expected a list of strings", value))
-    coerced: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            raise ValueError(_format_config_error(source, field_name, "expected a list of strings", value))
-        stripped = item.strip()
-        if stripped:
-            coerced.append(stripped)
-    return coerced
+    return _coerce_str_list(value, field_name, source=source)
+
 
 def _coerce_str_list(value: Any, field_name: str, *, source: str | None = None) -> list[str]:
     if not isinstance(value, list):
@@ -287,8 +279,9 @@ def _coerce_str_list(value: Any, field_name: str, *, source: str | None = None) 
     for item in value:
         if not isinstance(item, str):
             raise ValueError(_format_config_error(source, field_name, "expected a list of strings", value))
-        if item.strip():
-            result.append(item.strip())
+        stripped = item.strip()
+        if stripped:
+            result.append(stripped)
     return result
 
 

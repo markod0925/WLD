@@ -136,6 +136,8 @@ class CoalescedSummaryRecord:
     summary_json: dict[str, Any]
     created_ts: float
     source_summary_ids: list[int]
+
+
 @dataclass(slots=True)
 class DailySummaryRecord:
     id: int | None

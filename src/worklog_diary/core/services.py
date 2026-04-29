@@ -278,13 +278,7 @@ class MonitoringServices:
                 "source_batch_count": int(source_batch_count),
                 "replaced": bool(replaced),
             }
-        except ValueError:
-            raise
-        except LMStudioConnectionError:
-            raise
-        except LMStudioServiceUnavailableError:
-            raise
-        except LMStudioTimeoutError:
+        except (ValueError, LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError):
             raise
         except Exception as exc:
             self.error_notifier.notify(

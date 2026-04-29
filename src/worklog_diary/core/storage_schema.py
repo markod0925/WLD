@@ -5,6 +5,8 @@ import sqlite3
 import threading
 import time
 
+from .storage_logging import log_db_query_timing
+
 
 class StorageSchemaManager:
     def __init__(self, conn: sqlite3.Connection, lock: threading.Lock, logger: logging.Logger) -> None:
@@ -406,13 +408,4 @@ class StorageSchemaManager:
             )
 
     def _log_db_query_timing(self, operation: str, started_at: float, *, rows: int | None = None) -> None:
-        duration_ms = (time.perf_counter() - started_at) * 1000.0
-        if rows is None:
-            self._logger.info("event=db_query_timing operation=%s duration_ms=%.3f", operation, duration_ms)
-        else:
-            self._logger.info(
-                "event=db_query_timing operation=%s duration_ms=%.3f rows=%s",
-                operation,
-                duration_ms,
-                rows,
-            )
+        log_db_query_timing(self._logger, operation, started_at, rows=rows)
