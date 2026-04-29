@@ -394,3 +394,40 @@ def test_reconcile_queue_closing_stops_cleanly(tmp_path: Path, monkeypatch) -> N
     finally:
         summarizer.stop()
         storage.close()
+
+
+def test_daily_recap_marks_job_cancelled_when_shutdown_hits_while_admission_blocked(tmp_path: Path) -> None:
+    import threading
+
+    evt = threading.Event()
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage),
+        lm_client=SuccessfulClient(),
+        shutdown_event=evt,
+        process_backlog_only_while_locked=True,
+    )
+    day = date(2026, 4, 27)
+    start = datetime.combine(day, time.min).timestamp()
+    _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text="x")
+    summarizer.handle_session_lock_state_change(False)
+
+    def _trip_shutdown() -> None:
+        time_module.sleep(0.05)
+        evt.set()
+
+    trigger = threading.Thread(target=_trip_shutdown, daemon=True)
+    trigger.start()
+
+    try:
+        try:
+            summarizer.generate_daily_recap_for_day(day, reason="auto_backfill")
+        except LLMJobCancelledError:
+            pass
+        job = storage.get_daily_summary_job_for_day(day)
+        assert job is not None
+        assert job["status"] == "cancelled"
+    finally:
+        summarizer.stop()
+        storage.close()

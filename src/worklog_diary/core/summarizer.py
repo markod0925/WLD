@@ -525,6 +525,17 @@ class Summarizer:
                         on_cancelled=_on_cancelled,
                     )
             except LLMJobCancelledError as exc:
+                self.storage.update_summary_job(
+                    job_id,
+                    status="cancelled",
+                    error=str(exc),
+                    job_type="day_summary",
+                    finished_at=time.time(),
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                )
                 raise
             except LMStudioTimeoutError as exc:
                 self._notify_lmstudio_error(
