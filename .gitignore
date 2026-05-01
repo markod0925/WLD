@@ -11,3 +11,4 @@ __pycache__/
 /logs
 .cymbal/index.db-shm
 .cymbal/index.db-wal
+docs/wld_audit_analysis_2026-05-01.md
