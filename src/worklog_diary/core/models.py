@@ -107,6 +107,24 @@ class SummaryRecord:
     created_ts: float
 
 
+@dataclass(slots=True)
+class ActivityEntityRecord:
+    id: int | None
+    summary_id: int | None
+    day: date
+    start_ts: float
+    end_ts: float
+    entity_type: str
+    entity_value: str
+    entity_normalized: str
+    source_kind: str
+    source_ref: str
+    evidence_kind: str
+    confidence: float
+    attributes: dict[str, Any]
+    created_at: float
+
+
 
 
 @dataclass(slots=True)

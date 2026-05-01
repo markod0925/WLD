@@ -7,6 +7,8 @@ from datetime import date, datetime, time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from worklog_diary.core.activity_extraction import extract_activity_entities
+from worklog_diary.core.activity_extraction import extract_activity_entities_with_coverage
 from worklog_diary.core.audit_export import AuditExportError, AuditExportOptions, export_audit_bundle
 from worklog_diary.core.config import AppConfig
 from worklog_diary.core.storage import SQLiteStorage
@@ -44,6 +46,19 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
     try:
         sid1 = _insert_summary(storage, start_ts=_ts(day, 9, 0), end_ts=_ts(day, 9, 15), text="alpha")
         _insert_summary(storage, start_ts=_ts(day, 10, 0), end_ts=_ts(day, 10, 15), text="beta")
+        storage.add_activity_entities(
+            day=day,
+            start_ts=_ts(day, 9, 0),
+            end_ts=_ts(day, 9, 15),
+            summary_id=sid1,
+            entities=extract_activity_entities(
+                start_ts=_ts(day, 9, 0),
+                end_ts=_ts(day, 9, 15),
+                process_name="MATLAB.exe",
+                window_title="Editor - U:\\PROJ1\\XXX\\data\\Input_cases.m *",
+                text_segments=["Working on ABC-1234"],
+            ),
+        )
         storage.create_daily_summary(day, "daily", {"metadata": {"schema": "worklog.daily"}}, 2)
         storage.replace_coalesced_summaries_for_day(
             day,
@@ -91,6 +106,13 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
         assert (result.output_dir / "summaries.jsonl").exists()
         assert (result.output_dir / "daily_summaries.jsonl").exists()
         assert (result.output_dir / "coalesced_summaries.jsonl").exists()
+        assert (result.output_dir / "activity_entities.jsonl").exists()
+        assert (result.output_dir / "evidence_quality.jsonl").exists()
+        assert (result.output_dir / "evidence_quality_summary.json").exists()
+        assert (result.output_dir / "parser_coverage.jsonl").exists()
+        assert (result.output_dir / "unknown_apps.jsonl").exists()
+        assert (result.output_dir / "unknown_window_patterns.jsonl").exists()
+        assert (result.output_dir / "low_confidence_entities.jsonl").exists()
         assert (result.output_dir / "merge_diagnostics.jsonl").exists()
         assert (result.output_dir / "config_snapshot.json").exists()
         assert (result.output_dir / "manifest.json").exists()
@@ -99,15 +121,90 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
         summaries = _read_jsonl(result.output_dir / "summaries.jsonl")
         daily = _read_jsonl(result.output_dir / "daily_summaries.jsonl")
         coalesced = _read_jsonl(result.output_dir / "coalesced_summaries.jsonl")
+        activity_entities = _read_jsonl(result.output_dir / "activity_entities.jsonl")
+        evidence_quality = _read_jsonl(result.output_dir / "evidence_quality.jsonl")
+        parser_coverage = _read_jsonl(result.output_dir / "parser_coverage.jsonl")
+        unknown_apps = _read_jsonl(result.output_dir / "unknown_apps.jsonl")
+        unknown_patterns = _read_jsonl(result.output_dir / "unknown_window_patterns.jsonl")
+        low_confidence = _read_jsonl(result.output_dir / "low_confidence_entities.jsonl")
         diagnostics = _read_jsonl(result.output_dir / "merge_diagnostics.jsonl")
+        evidence_quality_summary = json.loads((result.output_dir / "evidence_quality_summary.json").read_text(encoding="utf-8"))
         manifest = json.loads((result.output_dir / "manifest.json").read_text(encoding="utf-8"))
 
         assert manifest["counts"]["summaries.jsonl"] == len(summaries)
         assert manifest["counts"]["daily_summaries.jsonl"] == len(daily)
         assert manifest["counts"]["coalesced_summaries.jsonl"] == len(coalesced)
+        assert manifest["counts"]["activity_entities.jsonl"] == len(activity_entities)
+        assert manifest["counts"]["evidence_quality.jsonl"] == len(evidence_quality)
+        assert manifest["counts"]["evidence_quality_summary.json"] == 1
+        assert manifest["counts"]["parser_coverage.jsonl"] == len(parser_coverage)
+        assert manifest["counts"]["unknown_apps.jsonl"] == len(unknown_apps)
+        assert manifest["counts"]["unknown_window_patterns.jsonl"] == len(unknown_patterns)
+        assert manifest["counts"]["low_confidence_entities.jsonl"] == len(low_confidence)
         assert manifest["counts"]["merge_diagnostics.jsonl"] == len(diagnostics)
         assert manifest["contains_raw_activity_data"] is False
-        assert manifest["export_scope"] == "summaries_and_coalescing_diagnostics"
+        assert manifest["export_scope"] == "summaries_and_coalescing_diagnostics_and_activity_entities_and_parser_coverage_and_evidence_quality"
+        assert manifest["evidence_quality_count"] == len(evidence_quality)
+        assert manifest["evidence_quality_bucket_counts"]
+        assert 0.0 <= manifest["average_evidence_quality_score"] <= 1.0
+        assert isinstance(manifest["poor_or_weak_summary_count"], int)
+        assert evidence_quality_summary["summary_count"] == len(evidence_quality)
+        assert evidence_quality_summary["event_summary_count"] == len(summaries)
+        assert "parser_coverage_by_process" in evidence_quality_summary
+    finally:
+        storage.close()
+
+
+def test_export_includes_unknown_app_diagnostics(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "wld.db"))
+    day = date(2026, 4, 20)
+    try:
+        start_ts = _ts(day, 9, 0)
+        end_ts = _ts(day, 9, 15)
+        job_id = storage.create_summary_job(start_ts=start_ts, end_ts=end_ts, status="succeeded")
+        entities, coverage = extract_activity_entities_with_coverage(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            process_name="FooTool",
+            window_title="FooTool - Analysis for ABC-1234 - run_042.log",
+        )
+        summary_id = storage.insert_summary(
+            job_id=job_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            summary_text="Unknown app session",
+            summary_json={
+                "summary_text": "Unknown app session",
+                "source_context": {
+                    "process_name": "FooTool",
+                    "window_title": "FooTool - Analysis for ABC-1234 - run_042.log",
+                },
+                "parser_coverage": [coverage],
+            },
+        )
+        storage.add_activity_entities(
+            day=day,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            summary_id=summary_id,
+            entities=entities,
+        )
+
+        result = export_audit_bundle(storage, tmp_path / "exports", AuditExportOptions(), config=AppConfig())
+        unknown_apps = _read_jsonl(result.output_dir / "unknown_apps.jsonl")
+        unknown_patterns = _read_jsonl(result.output_dir / "unknown_window_patterns.jsonl")
+        coverage_rows = _read_jsonl(result.output_dir / "parser_coverage.jsonl")
+        evidence_quality = _read_jsonl(result.output_dir / "evidence_quality.jsonl")
+        evidence_quality_summary = json.loads((result.output_dir / "evidence_quality_summary.json").read_text(encoding="utf-8"))
+
+        assert unknown_apps
+        assert unknown_apps[0]["process_name"] == "FooTool"
+        assert unknown_patterns
+        assert unknown_patterns[0]["sample_window_title"] == "FooTool - Analysis for ABC-1234 - run_042.log"
+        assert coverage_rows[0]["unknown_app"] is True
+        assert evidence_quality
+        assert evidence_quality_summary["unknown_app_count"] >= 1
+        assert evidence_quality_summary["top_unknown_processes"]
     finally:
         storage.close()
 
@@ -118,6 +215,9 @@ def test_export_empty_database_works(tmp_path: Path) -> None:
         result = export_audit_bundle(storage, tmp_path / "exports", AuditExportOptions(), config=AppConfig())
         assert _read_jsonl(result.output_dir / "summaries.jsonl") == []
         assert _read_jsonl(result.output_dir / "daily_summaries.jsonl") == []
+        assert _read_jsonl(result.output_dir / "activity_entities.jsonl") == []
+        assert _read_jsonl(result.output_dir / "evidence_quality.jsonl") == []
+        assert json.loads((result.output_dir / "evidence_quality_summary.json").read_text(encoding="utf-8"))["summary_count"] == 0
     finally:
         storage.close()
 

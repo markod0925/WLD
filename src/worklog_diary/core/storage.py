@@ -6,6 +6,7 @@ import time
 from datetime import date as Day
 from pathlib import Path
 
+from .activity_extraction import ActivityEntityDraft
 from .activity_repository import ActivityRepository
 from .activity_repository import SQLiteActivityRepository
 from .capture_repository import CaptureRepository
@@ -34,6 +35,7 @@ from .models import (
     ForegroundInfo,
     KeyEvent,
     CoalescingDiagnosticRecord,
+    ActivityEntityRecord,
     ScreenshotRecord,
     SummaryRecord,
     TextSegment,
@@ -414,6 +416,21 @@ class SQLiteStorage(ActivityRepository):
     ) -> tuple[DailySummaryRecord, bool]:
         return self.summary_repository.create_daily_summary(day, recap_text, recap_json, source_batch_count)
 
+    def update_daily_summary_record(
+        self,
+        day: Day,
+        *,
+        recap_text: str | None = None,
+        recap_json: dict | None = None,
+        source_batch_count: int | None = None,
+    ) -> DailySummaryRecord | None:
+        return self.summary_repository.update_daily_summary_record(
+            day,
+            recap_text=recap_text,
+            recap_json=recap_json,
+            source_batch_count=source_batch_count,
+        )
+
     def get_daily_summary_for_day(self, day: Day) -> DailySummaryRecord | None:
         return self.summary_repository.get_daily_summary_for_day(day)
 
@@ -508,6 +525,62 @@ class SQLiteStorage(ActivityRepository):
 
     def get_coalesced_member_count(self, coalesced_summary_id: int) -> int:
         return self.summary_repository.get_coalesced_member_count(coalesced_summary_id)
+
+    def add_activity_entities(
+        self,
+        *,
+        day: Day | str,
+        start_ts: float,
+        end_ts: float,
+        summary_id: int | None,
+        entities: list[ActivityEntityDraft],
+    ) -> list[int]:
+        inserted_ids = self.summary_repository.add_activity_entities(
+            day=day,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            summary_id=summary_id,
+            entities=entities,
+        )
+        for _ in inserted_ids:
+            self._record_db_write()
+        return inserted_ids
+
+    def list_activity_entities_for_day(self, day: Day) -> list[ActivityEntityRecord]:
+        return self.summary_repository.list_activity_entities_for_day(day)
+
+    def list_activity_entities_for_summary(self, summary_id: int) -> list[ActivityEntityRecord]:
+        return self.summary_repository.list_activity_entities_for_summary(summary_id)
+
+    def search_activity_entities(
+        self,
+        *,
+        entity_type: str | None = None,
+        query: str | None = None,
+        day_from: Day | None = None,
+        day_to: Day | None = None,
+        min_confidence: float | None = None,
+        limit: int = 1000,
+    ) -> list[ActivityEntityRecord]:
+        return self.summary_repository.search_activity_entities(
+            entity_type=entity_type,
+            query=query,
+            day_from=day_from,
+            day_to=day_to,
+            min_confidence=min_confidence,
+            limit=limit,
+        )
+
+    def list_audit_activity_entities(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        return self.summary_repository.list_audit_activity_entities(
+            start_day=start_day,
+            end_day_exclusive=end_day_exclusive,
+        )
 
     def purge_raw_data(self, start_ts: float, end_ts: float) -> list[str]:
         return self.cleanup_service.purge_raw_data(start_ts, end_ts)

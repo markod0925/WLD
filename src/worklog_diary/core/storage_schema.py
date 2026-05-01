@@ -116,6 +116,23 @@ class StorageSchemaManager:
             FOREIGN KEY(job_id) REFERENCES summary_jobs(id)
         );
 
+        CREATE TABLE IF NOT EXISTS activity_entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary_id INTEGER,
+            day TEXT NOT NULL,
+            start_ts REAL NOT NULL,
+            end_ts REAL NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_value TEXT NOT NULL,
+            entity_normalized TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            evidence_kind TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            attributes_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY(summary_id) REFERENCES summaries(id) ON DELETE SET NULL
+        );
 
 
         CREATE TABLE IF NOT EXISTS summary_embeddings (
@@ -183,6 +200,11 @@ class StorageSchemaManager:
         CREATE INDEX IF NOT EXISTS idx_screenshots_ts ON screenshots(ts);
         CREATE INDEX IF NOT EXISTS idx_summaries_created ON summaries(created_ts DESC);
         CREATE INDEX IF NOT EXISTS idx_summaries_start ON summaries(start_ts);
+        CREATE INDEX IF NOT EXISTS idx_activity_entities_day ON activity_entities(day);
+        CREATE INDEX IF NOT EXISTS idx_activity_entities_type ON activity_entities(entity_type);
+        CREATE INDEX IF NOT EXISTS idx_activity_entities_normalized ON activity_entities(entity_normalized);
+        CREATE INDEX IF NOT EXISTS idx_activity_entities_time ON activity_entities(start_ts, end_ts);
+        CREATE INDEX IF NOT EXISTS idx_activity_entities_summary_id ON activity_entities(summary_id);
         CREATE INDEX IF NOT EXISTS idx_daily_summaries_day ON daily_summaries(day);
         CREATE INDEX IF NOT EXISTS idx_coalesced_summaries_day ON coalesced_summaries(day, start_ts);
         CREATE INDEX IF NOT EXISTS idx_semantic_merge_diagnostics_day ON semantic_merge_diagnostics(day, left_summary_id);

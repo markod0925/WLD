@@ -25,6 +25,56 @@ class FakeResponse:
         return {"choices": [{"message": {"content": self._content}}]}
 
 
+class StructuredClient:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+        _emit_started(_kwargs)
+        payload = {
+            "summary_text": "Edited Input_cases.m in MATLAB.",
+            "primary_activity": [{"text": "editing a MATLAB input file", "confidence": 0.93}],
+            "programs_used": [{"name": "MATLAB", "confidence": 0.98}],
+            "files": [
+                {
+                    "entity_type": "file_path",
+                    "entity_value": "U:\\PROJ1\\XXX\\data\\Input_cases.m",
+                    "entity_normalized": "u:/proj1/xxx/data/input_cases.m",
+                    "evidence_kind": "observed",
+                }
+            ],
+            "conversations": [],
+            "task_candidates": [{"text": "review input data shape", "confidence": 0.66}],
+            "outcomes": [{"text": "updated MATLAB input handling", "confidence": 0.84}],
+            "follow_ups": [{"text": "verify downstream test coverage", "confidence": 0.5}],
+            "blocked_activity": [],
+            "unknowns": [],
+            "evidence_quality": {
+                "overall_confidence": 0.91,
+                "confidence_notes": ["direct file evidence from window title"],
+                "field_confidence": {"files": 0.98},
+            },
+            "metadata": {"parse_status": "validated"},
+        }
+        return payload["summary_text"], payload
+
+    def summarize_daily_recap(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+        _emit_started(_kwargs)
+        payload = {
+            "executive_summary": "Prepared a focused work recap from structured event summaries.",
+            "program_activity_breakdown": [{"program": "MATLAB", "confidence": 0.98}],
+            "tasks_advanced": [{"text": "review input data shape", "confidence": 0.66}],
+            "files_observed": [{"path": "U:\\PROJ1\\XXX\\data\\Input_cases.m", "confidence": 0.98}],
+            "files_likely_modified": [],
+            "conversations_or_meetings": [],
+            "decisions": [{"text": "keep the MATLAB path as the source of truth", "confidence": 0.7}],
+            "blockers": [],
+            "follow_ups": [{"text": "verify downstream test coverage", "confidence": 0.5}],
+            "jira_update_candidates": [{"text": "summarize MATLAB input handling", "confidence": 0.55}],
+            "open_questions": [],
+            "confidence_notes": ["structured event payloads were available"],
+            "metadata": {"parse_status": "validated"},
+        }
+        return payload["executive_summary"], payload
+
+
 def _summary_batch() -> SummaryBatch:
     return SummaryBatch(
         start_ts=1.0,
@@ -129,7 +179,7 @@ def test_lmstudio_client_retries_malformed_response_then_parses(monkeypatch: pyt
     assert "invalid" in calls[1]["messages"][1]["content"].lower()
 
 
-def test_lmstudio_client_raises_on_malformed_responses_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lmstudio_client_degrades_on_malformed_responses_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
     responses = iter([FakeResponse("still bad"), FakeResponse("still bad again")])
 
@@ -138,13 +188,17 @@ def test_lmstudio_client_raises_on_malformed_responses_after_retries(monkeypatch
 
     monkeypatch.setattr(requests, "post", fake_post)
 
-    with pytest.raises(LMStudioServiceUnavailableError) as exc_info:
-        client.summarize_batch(_summary_batch())
+    summary_text, parsed = client.summarize_batch(_summary_batch())
 
-    assert getattr(exc_info.value, "failed_stage", None) == "response_parse"
+    assert summary_text == "still bad again"
+    assert parsed["summary_text"] == "still bad again"
+    assert parsed["unknowns"] == ["insufficient evidence"]
+    assert parsed["metadata"]["parse_status"] == "degraded"
+    assert parsed["metadata"]["parse_error"] == "Malformed JSON response"
+    assert parsed["raw_response"] == "still bad again"
 
 
-def test_lmstudio_client_raises_on_non_object_json(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lmstudio_client_degrades_on_non_object_json(monkeypatch: pytest.MonkeyPatch) -> None:
     client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
     responses = iter([FakeResponse("[1, 2, 3]"), FakeResponse("[1, 2, 3]")])
 
@@ -153,10 +207,13 @@ def test_lmstudio_client_raises_on_non_object_json(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(requests, "post", fake_post)
 
-    with pytest.raises(LMStudioServiceUnavailableError) as exc_info:
-        client.summarize_batch(_summary_batch())
+    summary_text, parsed = client.summarize_batch(_summary_batch())
 
-    assert getattr(exc_info.value, "failed_stage", None) == "response_parse"
+    assert summary_text == "[1, 2, 3]"
+    assert parsed["summary_text"] == "[1, 2, 3]"
+    assert parsed["unknowns"] == ["insufficient evidence"]
+    assert parsed["metadata"]["parse_status"] == "degraded"
+    assert parsed["raw_response"] == "[1, 2, 3]"
 
 
 def test_lmstudio_client_daily_recap_uses_structured_schema(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,10 +258,68 @@ def test_daily_recap_prompt_requests_short_highlight_list() -> None:
 
     result = builder.build_daily_recap_prompt(day=date(2026, 4, 14), summaries=summaries)
 
-    assert "key_points" in result.prompt_text
-    assert "3 to 6 entries" in result.prompt_text
-    assert "Category: short description" in result.prompt_text
-    assert "Programma/Attività" in result.prompt_text
+    assert "structured event outputs" in result.prompt_text
+    assert "confidence_notes" in result.prompt_text
+    assert "executive_summary" in result.prompt_text
+    assert "files_observed" in result.prompt_text
+
+
+def test_summary_prompt_keeps_blocked_intervals_as_unknown_or_blocked() -> None:
+    batch = SummaryBatch(
+        start_ts=1.0,
+        end_ts=2.0,
+        active_intervals=[
+            ActiveInterval(
+                id=1,
+                start_ts=1.0,
+                end_ts=2.0,
+                hwnd=1,
+                pid=2,
+                process_name="explorer.exe",
+                window_title="Downloads",
+                blocked=True,
+                summarized=False,
+            )
+        ],
+        blocked_intervals=[
+            ActiveInterval(
+                id=2,
+                start_ts=2.0,
+                end_ts=3.0,
+                hwnd=3,
+                pid=4,
+                process_name="explorer.exe",
+                window_title="Downloads",
+                blocked=True,
+                summarized=False,
+            )
+        ],
+        text_segments=[],
+        screenshots=[],
+    )
+    builder = LMStudioPromptBuilder()
+
+    result = builder.build_summary_prompt(batch)
+
+    assert "blocked or unknown" in result.prompt_text
+    assert "blocked_intervals" in result.prompt_text
+
+
+def test_lmstudio_client_degrades_generic_event_to_unknowns(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    response = FakeResponse(
+        '{"summary_text":"Worked on something","primary_activity":[],"programs_used":[],"files":[],"conversations":[],"task_candidates":[],"outcomes":[],"follow_ups":[],"blocked_activity":[],"unknowns":[],"evidence_quality":{"overall_confidence":0.1,"confidence_notes":["thin evidence"],"field_confidence":{}},"metadata":{}}'
+    )
+
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: response)
+
+    summary_text, parsed = client.summarize_batch(_summary_batch())
+
+    assert summary_text == "Worked on something"
+    assert parsed["unknowns"] == ["insufficient evidence"]
+    assert parsed["evidence_quality"]["overall_confidence"] == 0.1
+    assert parsed["files"] == []
+    assert parsed["task_candidates"] == []
 
 
 def test_prompt_builder_limits_daily_recap_prompt_budget() -> None:

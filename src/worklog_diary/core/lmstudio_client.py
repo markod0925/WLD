@@ -27,31 +27,59 @@ from .lmstudio_logging import (
 )
 
 
-STRUCTURED_SCHEMA_KEYS = ("summary_text", "key_points", "blocked_activity", "metadata")
+EVENT_SUMMARY_SCHEMA_KEYS = (
+    "summary_text",
+    "primary_activity",
+    "programs_used",
+    "files",
+    "conversations",
+    "task_candidates",
+    "outcomes",
+    "follow_ups",
+    "blocked_activity",
+    "unknowns",
+    "evidence_quality",
+    "metadata",
+)
+DAILY_RECAP_SCHEMA_KEYS = (
+    "executive_summary",
+    "program_activity_breakdown",
+    "tasks_advanced",
+    "files_observed",
+    "files_likely_modified",
+    "conversations_or_meetings",
+    "decisions",
+    "blockers",
+    "follow_ups",
+    "jira_update_candidates",
+    "open_questions",
+    "confidence_notes",
+    "metadata",
+)
 
 
 class LMStudioStructuredResponse:
     def __init__(
         self,
-        summary_text: str,
-        key_points: list[str],
-        blocked_activity: list[str],
-        metadata: dict[str, Any] | None = None,
+        payload: dict[str, Any],
+        primary_text: str,
         raw_response: str | None = None,
     ) -> None:
-        self.summary_text = summary_text
-        self.key_points = key_points
-        self.blocked_activity = blocked_activity
-        self.metadata = metadata or {}
+        self.payload = payload
+        self.primary_text = primary_text
         self.raw_response = raw_response
 
+    @property
+    def summary_text(self) -> str:
+        return self.primary_text
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        metadata = self.payload.get("metadata")
+        return metadata if isinstance(metadata, dict) else {}
+
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "summary_text": self.summary_text,
-            "key_points": self.key_points,
-            "blocked_activity": self.blocked_activity,
-            "metadata": self.metadata,
-        }
+        payload = dict(self.payload)
         if self.raw_response is not None:
             payload["raw_response"] = self.raw_response
         return payload
@@ -155,7 +183,7 @@ class LMStudioClient:
                 prompt_text=prompt_result.prompt_text,
                 system_message=(
                     "You summarize desktop work activity. "
-                    "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
+                    "Respond only with strict JSON matching the prompt schema."
                 ),
                 user_content=user_content,
             )
@@ -287,7 +315,7 @@ class LMStudioClient:
             chunk_label_prefix="source",
             system_message=(
                 "You generate concise daily work recaps. "
-                "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
+                "Respond only with strict JSON matching the prompt schema."
             ),
         )
 
@@ -325,7 +353,7 @@ class LMStudioClient:
                     system_message=(
                         "You generate concise daily work recaps. "
                         "Combine intermediate recap chunks into fewer recap chunks while preserving key outcomes. "
-                        "Respond only with JSON containing summary_text, key_points, blocked_activity, metadata."
+                        "Respond only with strict JSON matching the prompt schema."
                     ),
                 )
                 reduction_round += 1
@@ -339,19 +367,52 @@ class LMStudioClient:
         self, items: list[LMStudioStructuredResponse]
     ) -> LMStudioStructuredResponse:
         summary_lines: list[str] = []
-        key_points: list[str] = []
-        blocked_activity: list[str] = []
+        program_activity_breakdown: list[Any] = []
+        tasks_advanced: list[Any] = []
+        files_observed: list[Any] = []
+        files_likely_modified: list[Any] = []
+        conversations_or_meetings: list[Any] = []
+        decisions: list[Any] = []
+        blockers: list[Any] = []
+        follow_ups: list[Any] = []
+        jira_update_candidates: list[Any] = []
+        open_questions: list[Any] = []
+        confidence_notes: list[str] = []
         for item in items:
-            text = item.summary_text.strip()
+            payload = item.to_dict()
+            text = _coerce_text(payload.get("executive_summary") or payload.get("summary_text"))
             if text:
                 summary_lines.append(text)
-            key_points.extend(point for point in item.key_points if point)
-            blocked_activity.extend(entry for entry in item.blocked_activity if entry)
+            program_activity_breakdown.extend(_coerce_json_list(payload.get("program_activity_breakdown")))
+            tasks_advanced.extend(_coerce_json_list(payload.get("tasks_advanced") or payload.get("task_candidates")))
+            files_observed.extend(_coerce_json_list(payload.get("files_observed") or payload.get("files")))
+            files_likely_modified.extend(_coerce_json_list(payload.get("files_likely_modified")))
+            conversations_or_meetings.extend(_coerce_json_list(payload.get("conversations_or_meetings") or payload.get("conversations")))
+            decisions.extend(_coerce_json_list(payload.get("decisions") or payload.get("outcomes")))
+            blockers.extend(_coerce_json_list(payload.get("blockers") or payload.get("blocked_activity")))
+            follow_ups.extend(_coerce_json_list(payload.get("follow_ups")))
+            jira_update_candidates.extend(_coerce_json_list(payload.get("jira_update_candidates")))
+            open_questions.extend(_coerce_json_list(payload.get("open_questions") or payload.get("unknowns")))
+            evidence_quality = payload.get("evidence_quality") if isinstance(payload.get("evidence_quality"), dict) else {}
+            confidence_notes.extend(_coerce_string_list(evidence_quality.get("confidence_notes")))
         return LMStudioStructuredResponse(
-            summary_text="\n".join(summary_lines),
-            key_points=key_points[:20],
-            blocked_activity=blocked_activity[:20],
-            metadata={"aggregation_fallback": "local_merge"},
+            payload={
+                "executive_summary": "\n".join(summary_lines),
+                "summary_text": "\n".join(summary_lines),
+                "program_activity_breakdown": program_activity_breakdown[:20],
+                "tasks_advanced": tasks_advanced[:20],
+                "files_observed": files_observed[:20],
+                "files_likely_modified": files_likely_modified[:20],
+                "conversations_or_meetings": conversations_or_meetings[:20],
+                "decisions": decisions[:20],
+                "blockers": blockers[:20],
+                "follow_ups": follow_ups[:20],
+                "jira_update_candidates": jira_update_candidates[:20],
+                "open_questions": open_questions[:20],
+                "confidence_notes": confidence_notes[:20],
+                "metadata": {"aggregation_fallback": "local_merge", "parse_status": "degraded"},
+            },
+            primary_text="\n".join(summary_lines),
         )
 
     def _request_daily_recap_chunks(
@@ -732,28 +793,25 @@ class LMStudioClient:
                 if not isinstance(data, dict):
                     raise ValueError("LM Studio response must be a JSON object")
                 last_response_text, finish_reason = self._extract_message_content(data)
-                parsed = _parse_structured_response(last_response_text, response_kind=response_kind)
-                parsed.metadata.update(
-                    {
-                        "response_kind": response_kind,
-                        "prompt_metadata": prompt_result.metadata,
-                        "parse_status": "validated",
-                        "attempt": attempt,
-                    }
+                parsed = _parse_structured_response(last_response_text)
+                normalized = _normalize_structured_response(
+                    parsed,
+                    response_kind=response_kind,
+                    prompt_metadata=prompt_result.metadata,
+                    raw_response=last_response_text,
+                    finish_reason=finish_reason,
+                    attempt=attempt,
+                    validated=True,
                 )
-                if finish_reason is not None:
-                    parsed.metadata["finish_reason"] = finish_reason
-                if prompt_result.metadata.get("truncated"):
-                    parsed.metadata["truncated"] = True
                 log_llm_stage(
                     self.logger,
                     "response_parse",
                     "ok",
                     attempt=attempt,
-                    output_chars=len(parsed.summary_text),
+                    output_chars=len(normalized.summary_text),
                     finish_reason=finish_reason or "unknown",
                 )
-                return parsed
+                return normalized
             except ValueError as exc:
                 last_error = str(exc)
                 self.logger.error(
@@ -790,18 +848,29 @@ class LMStudioClient:
                 )
                 current_payload = self._retry_payload(current_payload, response_kind=response_kind, error=last_error)
 
-        raise set_failed_stage(
-            LMStudioServiceUnavailableError(
-                "Service unavailable: LM Studio returned an unexpected response."
-            ),
-            "response_parse",
+        degraded = _build_degraded_structured_response(
+            response_kind=response_kind,
+            prompt_metadata=prompt_result.metadata,
+            raw_response=last_response_text,
+            error=last_error or "Malformed JSON response",
+            attempt=self.max_response_attempts,
         )
+        log_llm_stage(
+            self.logger,
+            "response_parse",
+            "degraded",
+            attempt=self.max_response_attempts,
+            response_kind=response_kind,
+            error=last_error or "Malformed JSON response",
+        )
+        return degraded
 
     def _retry_payload(self, payload: dict[str, Any], *, response_kind: str, error: str) -> dict[str, Any]:
         retry_payload = json.loads(json.dumps(payload))
+        expected_keys = DAILY_RECAP_SCHEMA_KEYS if response_kind.startswith("daily_recap") else EVENT_SUMMARY_SCHEMA_KEYS
         retry_instruction = (
             "The previous response was invalid. Return only a single JSON object with keys "
-            f"{', '.join(STRUCTURED_SCHEMA_KEYS)}. No markdown. No commentary. Error: {error}"
+            f"{', '.join(expected_keys)}. No markdown. No commentary. Error: {error}"
         )
         retry_payload["messages"] = [
             payload["messages"][0],
@@ -828,7 +897,7 @@ class LMStudioClient:
         return text_content, str(finish_reason) if finish_reason is not None else None
 
 
-def _parse_structured_response(text: str, *, response_kind: str) -> LMStudioStructuredResponse:
+def _parse_structured_response(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
         fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
@@ -842,25 +911,172 @@ def _parse_structured_response(text: str, *, response_kind: str) -> LMStudioStru
 
     if not isinstance(parsed, dict):
         raise ValueError("LM Studio response must be a JSON object")
+    return parsed
 
-    summary_text = _coerce_text(parsed.get("summary_text") or parsed.get("summary") or parsed.get("recap_text") or cleaned)
-    key_points = _coerce_string_list(parsed.get("key_points") or parsed.get("major_activities") or [])
-    blocked_activity = _coerce_string_list(parsed.get("blocked_activity") or [])
-    metadata_value = parsed.get("metadata")
-    metadata = metadata_value if isinstance(metadata_value, dict) else {}
+
+def _normalize_structured_response(
+    parsed: dict[str, Any],
+    *,
+    response_kind: str,
+    prompt_metadata: dict[str, Any],
+    raw_response: str,
+    finish_reason: str | None,
+    attempt: int,
+    validated: bool,
+) -> LMStudioStructuredResponse:
+    if response_kind.startswith("daily_recap"):
+        payload = _normalize_daily_recap_payload(parsed, raw_response=raw_response, prompt_metadata=prompt_metadata)
+        primary_text = _coerce_text(payload.get("executive_summary"))
+    else:
+        payload = _normalize_event_summary_payload(parsed, raw_response=raw_response, prompt_metadata=prompt_metadata)
+        primary_text = _coerce_text(payload.get("summary_text"))
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
     metadata = {
         **metadata,
-        "schema": "worklog.lmstudio.response.v1",
         "response_kind": response_kind,
-        "parse_status": "validated",
+        "prompt_metadata": prompt_metadata,
+        "parse_status": "validated" if validated else "degraded",
+        "attempt": attempt,
     }
-    return LMStudioStructuredResponse(
-        summary_text=summary_text,
-        key_points=key_points,
-        blocked_activity=blocked_activity,
-        metadata=metadata,
-        raw_response=text,
+    if finish_reason is not None:
+        metadata["finish_reason"] = finish_reason
+    if prompt_metadata.get("truncated"):
+        metadata["truncated"] = True
+    payload["metadata"] = metadata
+    payload.setdefault("raw_response", raw_response)
+    return LMStudioStructuredResponse(payload=payload, primary_text=primary_text or raw_response.strip() or "Unavailable.", raw_response=raw_response)
+
+
+def _build_degraded_structured_response(
+    *,
+    response_kind: str,
+    prompt_metadata: dict[str, Any],
+    raw_response: str,
+    error: str,
+    attempt: int,
+) -> LMStudioStructuredResponse:
+    parsed: dict[str, Any] = {}
+    payload = (
+        _normalize_daily_recap_payload(parsed, raw_response=raw_response, prompt_metadata=prompt_metadata)
+        if response_kind.startswith("daily_recap")
+        else _normalize_event_summary_payload(parsed, raw_response=raw_response, prompt_metadata=prompt_metadata)
     )
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = {
+        **metadata,
+        "response_kind": response_kind,
+        "prompt_metadata": prompt_metadata,
+        "parse_status": "degraded",
+        "attempt": attempt,
+        "parse_error": error,
+    }
+    payload["metadata"] = metadata
+    payload["raw_response"] = raw_response
+    primary_text = _coerce_text(payload.get("summary_text") or payload.get("executive_summary")) or raw_response.strip() or "Unavailable."
+    return LMStudioStructuredResponse(payload=payload, primary_text=primary_text, raw_response=raw_response)
+
+
+def _normalize_event_summary_payload(
+    parsed: dict[str, Any],
+    *,
+    raw_response: str,
+    prompt_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    summary_text = _coerce_text(
+        parsed.get("summary_text") or parsed.get("summary") or parsed.get("recap_text") or raw_response
+    )
+    primary_activity = _coerce_json_list(parsed.get("primary_activity") or [])
+    programs_used = _coerce_json_list(parsed.get("programs_used") or [])
+    files = _coerce_json_list(parsed.get("files") or [])
+    conversations = _coerce_json_list(parsed.get("conversations") or [])
+    task_candidates = _coerce_json_list(parsed.get("task_candidates") or parsed.get("key_points") or [])
+    outcomes = _coerce_json_list(parsed.get("outcomes") or parsed.get("key_points") or [])
+    follow_ups = _coerce_json_list(parsed.get("follow_ups") or [])
+    blocked_activity = _coerce_json_list(parsed.get("blocked_activity") or [])
+    unknowns = _coerce_json_list(parsed.get("unknowns") or [])
+    evidence_quality = parsed.get("evidence_quality") if isinstance(parsed.get("evidence_quality"), dict) else {}
+    evidence_quality = {
+        "overall_confidence": _coerce_confidence(evidence_quality.get("overall_confidence"), default=0.25 if raw_response else 0.0),
+        "confidence_notes": _coerce_string_list(evidence_quality.get("confidence_notes")),
+        "field_confidence": evidence_quality.get("field_confidence") if isinstance(evidence_quality.get("field_confidence"), dict) else {},
+    }
+    if not unknowns and evidence_quality["overall_confidence"] < 0.5:
+        unknowns = ["insufficient evidence"]
+    metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
+    return {
+        "summary_text": summary_text,
+        "primary_activity": primary_activity,
+        "programs_used": programs_used,
+        "files": files,
+        "conversations": conversations,
+        "task_candidates": task_candidates,
+        "outcomes": outcomes,
+        "follow_ups": follow_ups,
+        "blocked_activity": blocked_activity,
+        "unknowns": unknowns,
+        "evidence_quality": evidence_quality,
+        "key_points": outcomes,
+        "metadata": {
+            **metadata,
+            "schema": "worklog.lmstudio.response.v2",
+            "prompt_metadata": prompt_metadata,
+        },
+    }
+
+
+def _normalize_daily_recap_payload(
+    parsed: dict[str, Any],
+    *,
+    raw_response: str,
+    prompt_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    executive_summary = _coerce_text(
+        parsed.get("executive_summary") or parsed.get("summary_text") or parsed.get("summary") or raw_response
+    )
+    program_activity_breakdown = _coerce_json_list(
+        parsed.get("program_activity_breakdown") or parsed.get("key_points") or []
+    )
+    tasks_advanced = _coerce_json_list(parsed.get("tasks_advanced") or [])
+    files_observed = _coerce_json_list(parsed.get("files_observed") or [])
+    files_likely_modified = _coerce_json_list(parsed.get("files_likely_modified") or [])
+    conversations_or_meetings = _coerce_json_list(parsed.get("conversations_or_meetings") or [])
+    decisions = _coerce_json_list(parsed.get("decisions") or parsed.get("key_points") or [])
+    blockers = _coerce_json_list(parsed.get("blockers") or parsed.get("blocked_activity") or [])
+    follow_ups = _coerce_json_list(parsed.get("follow_ups") or [])
+    jira_update_candidates = _coerce_json_list(parsed.get("jira_update_candidates") or [])
+    open_questions = _coerce_json_list(parsed.get("open_questions") or [])
+    confidence_notes = _coerce_string_list(parsed.get("confidence_notes") or [])
+    metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
+    if not open_questions and not confidence_notes:
+        confidence_notes = ["insufficient evidence"]
+    return {
+        "executive_summary": executive_summary,
+        "program_activity_breakdown": program_activity_breakdown,
+        "tasks_advanced": tasks_advanced,
+        "files_observed": files_observed,
+        "files_likely_modified": files_likely_modified,
+        "conversations_or_meetings": conversations_or_meetings,
+        "decisions": decisions,
+        "blockers": blockers,
+        "follow_ups": follow_ups,
+        "jira_update_candidates": jira_update_candidates,
+        "open_questions": open_questions,
+        "confidence_notes": confidence_notes,
+        "summary_text": executive_summary,
+        "key_points": program_activity_breakdown,
+        "major_activities": program_activity_breakdown,
+        "blocked_activity": blockers,
+        "metadata": {
+            **metadata,
+            "schema": "worklog.lmstudio.response.v2",
+            "prompt_metadata": prompt_metadata,
+        },
+    }
 
 
 def _coerce_text(value: Any) -> str:
@@ -878,6 +1094,25 @@ def _coerce_string_list(value: Any) -> list[str]:
         if text:
             result.append(text)
     return result
+
+
+def _coerce_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    if value is None:
+        return []
+    if isinstance(value, (str, int, float, bool)):
+        return [value]
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _coerce_confidence(value: Any, *, default: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return max(0.0, min(1.0, float(default)))
 
 
 def _file_to_data_uri(path: str) -> str | None:

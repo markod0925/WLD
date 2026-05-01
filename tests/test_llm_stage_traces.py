@@ -226,14 +226,14 @@ def test_llm_trace_parse_failure(tmp_path: Path, caplog: pytest.LogCaptureFixtur
     monkeypatch.setattr(summarizer.batch_builder, "build_pending_batch", lambda **_kwargs: _summary_batch())
 
     try:
-        assert summarizer.flush_pending(reason="test") is None
-        assert summarizer.storage.get_summary_job_status_counts()["failed"] == 1
+        assert summarizer.flush_pending(reason="test") is not None
+        assert summarizer.storage.get_summary_job_status_counts()["completed"] == 1
         output = _stage_lines(caplog)
         assert "stage=request_success status=ok" in output
         assert "stage=response_parse status=start" in output
         assert "stage=response_parse status=error" in output
-        assert "stage=summary_job_failed status=error" in output
-        assert "failed_stage=response_parse" in output
+        assert "stage=response_parse status=degraded" in output
+        assert "stage=summary_job_completed status=ok" in output
     finally:
         summarizer.stop()
         storage.close()

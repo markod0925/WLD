@@ -269,7 +269,9 @@ def test_daily_summary_uses_coalesced_when_enabled(tmp_path: Path) -> None:
         _, _ = summarizer.generate_daily_recap_for_day(day)
         saved = storage.get_daily_summary_for_day(day)
         assert saved is not None
-        assert saved.recap_json == {"count": 1}
+        assert saved.recap_json is not None
+        assert saved.recap_json["count"] == 1
+        assert saved.recap_json["evidence_quality_report"]["summary_kind"] == "daily"
         summarizer.stop()
     finally:
         storage.close()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 
+from .activity_extraction import ActivityEntityDraft, extract_activity_entities, extract_activity_entities_with_coverage
 from .activity_segmenter import ActivitySegment, ActivitySegmenter, build_activity_observations
 from .activity_repository import ActivityRepository
 from .models import ActiveInterval, BlockedInterval, ScreenshotRecord, TextSegment
@@ -22,6 +23,8 @@ class SummaryBatch:
     blocked_intervals: list[BlockedInterval] = field(default_factory=list)
     text_segments: list[TextSegment] = field(default_factory=list)
     screenshots: list[ScreenshotRecord] = field(default_factory=list)
+    activity_entities: list[ActivityEntityDraft] = field(default_factory=list)
+    parser_coverage: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -75,6 +78,20 @@ class SummaryBatch:
                 }
                 for item in self.screenshots
             ],
+            "activity_entities": [
+                {
+                    "entity_type": item.entity_type,
+                    "entity_value": item.entity_value,
+                    "entity_normalized": item.entity_normalized,
+                    "source_kind": item.source_kind,
+                    "source_ref": item.source_ref,
+                    "evidence_kind": item.evidence_kind,
+                    "confidence": item.confidence,
+                    "attributes": item.attributes,
+                }
+                for item in self.activity_entities
+            ],
+            "parser_coverage": [dict(item) for item in self.parser_coverage],
         }
 
 
@@ -240,6 +257,13 @@ class BatchBuilder:
 
         ordered_segments = [ready_segment]
         ordered_segments.extend(segment for segment in selected_segments if segment.segment_id != ready_segment.segment_id)
+        activity_entities, parser_coverage = _build_activity_entities(
+            ordered_segments,
+            text_segments=text_segments,
+            screenshots=screenshots,
+            start_ts=intervals[0].start_ts if intervals else (blocked_intervals[0].start_ts if blocked_intervals else ready_segment.start_ts),
+            end_ts=segment_end,
+        )
 
         return build_batch_from_pending(
             intervals=intervals,
@@ -247,6 +271,8 @@ class BatchBuilder:
             text_segments=text_segments,
             screenshots=screenshots,
             activity_segments=ordered_segments,
+            activity_entities=activity_entities,
+            parser_coverage=parser_coverage,
         )
 
     def reconfigure(
@@ -309,6 +335,8 @@ def build_batch_from_pending(
     text_segments: list[TextSegment],
     screenshots: list[ScreenshotRecord],
     activity_segments: list[ActivitySegment] | None = None,
+    activity_entities: list[ActivityEntityDraft] | None = None,
+    parser_coverage: list[dict[str, object]] | None = None,
 ) -> SummaryBatch | None:
     if not intervals and not blocked_intervals and not text_segments and not screenshots:
         return None
@@ -343,6 +371,8 @@ def build_batch_from_pending(
         blocked_intervals=sorted(blocked_intervals, key=lambda item: item.start_ts),
         text_segments=sorted(text_segments, key=lambda item: item.start_ts),
         screenshots=sorted(screenshots, key=lambda item: item.ts),
+        activity_entities=list(activity_entities or []),
+        parser_coverage=list(parser_coverage or []),
     )
 
 
@@ -355,3 +385,52 @@ def _overlaps_any_range(start_ts: float, end_ts: float, excluded_ranges: list[tu
 
 def _ranges_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
     return not (a_end < b_start or a_start > b_end)
+
+
+def _build_activity_entities(
+    segments: list[ActivitySegment],
+    *,
+    text_segments: list[TextSegment],
+    screenshots: list[ScreenshotRecord],
+    start_ts: float,
+    end_ts: float,
+) -> tuple[list[ActivityEntityDraft], list[dict[str, object]]]:
+    drafts: list[ActivityEntityDraft] = []
+    parser_coverage: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for segment in segments:
+        items, coverage = extract_activity_entities_with_coverage(
+            start_ts=segment.start_ts,
+            end_ts=segment.end_ts,
+            process_name=segment.dominant_process_name,
+            window_title=segment.dominant_window_title,
+            text_segments=segment.text_snippets,
+            screenshot_refs=segment.screenshot_ids,
+        )
+        parser_coverage.append(coverage)
+        for item in items:
+            key = (item.entity_type, item.entity_normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            drafts.append(item)
+
+    if drafts:
+        return drafts, parser_coverage
+
+    fallback_process = text_segments[0].process_name if text_segments else ""
+    fallback_title = text_segments[0].window_title if text_segments else ""
+    if not fallback_process and not fallback_title and screenshots:
+        fallback_process = screenshots[0].process_name
+        fallback_title = screenshots[0].window_title
+    if not fallback_process and not fallback_title:
+        return [], parser_coverage
+    items, coverage = extract_activity_entities_with_coverage(
+        start_ts=start_ts,
+        end_ts=end_ts,
+        process_name=fallback_process,
+        window_title=fallback_title,
+        text_segments=[segment.text for segment in text_segments],
+        screenshot_refs=[item.id for item in screenshots if item.id is not None],
+    )
+    return items, parser_coverage + [coverage]

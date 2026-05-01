@@ -8,7 +8,8 @@ import time
 from datetime import date as Day, datetime, time as DateTimeTime, timedelta
 from typing import Protocol
 
-from .models import CoalescingDiagnosticRecord, DailySummaryRecord, SummaryRecord
+from .activity_extraction import ActivityEntityDraft
+from .models import ActivityEntityRecord, CoalescingDiagnosticRecord, DailySummaryRecord, SummaryRecord
 
 
 _SUMMARY_JOB_TERMINAL_STATUSES = {
@@ -570,6 +571,51 @@ class SummaryRepository:
         self._log_db_query_timing("create_daily_summary", query_started_at, rows=1)
         return record, existing is not None
 
+    def update_daily_summary_record(
+        self,
+        day: Day,
+        *,
+        recap_text: str | None = None,
+        recap_json: dict | None = None,
+        source_batch_count: int | None = None,
+    ) -> DailySummaryRecord | None:
+        day_key = day.isoformat()
+        started_at = time.perf_counter()
+        updates: list[str] = []
+        values: list[object] = []
+        if recap_text is not None:
+            updates.append("recap_text = ?")
+            values.append(recap_text)
+        if recap_json is not None:
+            updates.append("recap_json = ?")
+            values.append(json.dumps(recap_json))
+        if source_batch_count is not None:
+            updates.append("source_batch_count = ?")
+            values.append(int(source_batch_count))
+        if not updates:
+            return self.get_daily_summary_for_day(day)
+        values.append(day_key)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE daily_summaries SET {', '.join(updates)} WHERE day = ?",
+                values,
+            )
+            row = self._conn.execute(
+                """
+                SELECT id, day, created_ts, recap_text, recap_json, source_batch_count
+                FROM daily_summaries
+                WHERE day = ?
+                """,
+                (day_key,),
+            ).fetchone()
+            self._conn.commit()
+        if row is None:
+            self._log_db_query_timing("update_daily_summary_record", started_at, rows=0)
+            return None
+        record = _row_to_daily_summary_record(row)
+        self._log_db_query_timing("update_daily_summary_record", started_at, rows=1)
+        return record
+
     def get_daily_summary_for_day(self, day: Day) -> DailySummaryRecord | None:
         day_key = day.isoformat()
         started_at = time.perf_counter()
@@ -1000,6 +1046,174 @@ class SummaryRepository:
             ).fetchone()
         return int(row["c"]) if row is not None else 0
 
+    def add_activity_entities(
+        self,
+        *,
+        day: Day | str,
+        start_ts: float,
+        end_ts: float,
+        summary_id: int | None,
+        entities: list[ActivityEntityDraft],
+    ) -> list[int]:
+        if not entities:
+            return []
+        day_key = _normalize_day_key(day)
+        if day_key is None:
+            raise ValueError("day is required for activity entity persistence")
+        now = time.time()
+        query_started_at = time.perf_counter()
+        inserted_ids: list[int] = []
+        with self._lock:
+            for entity in entities:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO activity_entities(
+                        summary_id, day, start_ts, end_ts, entity_type, entity_value, entity_normalized,
+                        source_kind, source_ref, evidence_kind, confidence, attributes_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        summary_id,
+                        day_key,
+                        float(start_ts),
+                        float(end_ts),
+                        entity.entity_type,
+                        entity.entity_value,
+                        entity.entity_normalized,
+                        entity.source_kind,
+                        entity.source_ref,
+                        entity.evidence_kind,
+                        float(entity.confidence),
+                        json.dumps(entity.attributes),
+                        now,
+                    ),
+                )
+                inserted_ids.append(int(cursor.lastrowid))
+            self._conn.commit()
+        self._log_db_query_timing("add_activity_entities", query_started_at, rows=len(inserted_ids))
+        return inserted_ids
+
+    def list_activity_entities_for_day(self, day: Day) -> list[ActivityEntityRecord]:
+        day_key = day.isoformat()
+        started_at = time.perf_counter()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, summary_id, day, start_ts, end_ts, entity_type, entity_value, entity_normalized,
+                    source_kind, source_ref, evidence_kind, confidence, attributes_json, created_at
+                FROM activity_entities
+                WHERE day = ?
+                ORDER BY start_ts ASC, end_ts ASC, id ASC
+                """,
+                (day_key,),
+            ).fetchall()
+        result = [_row_to_activity_entity_record(row) for row in rows]
+        self._log_db_query_timing("list_activity_entities_for_day", started_at, rows=len(result))
+        return result
+
+    def list_activity_entities_for_summary(self, summary_id: int) -> list[ActivityEntityRecord]:
+        started_at = time.perf_counter()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, summary_id, day, start_ts, end_ts, entity_type, entity_value, entity_normalized,
+                    source_kind, source_ref, evidence_kind, confidence, attributes_json, created_at
+                FROM activity_entities
+                WHERE summary_id = ?
+                ORDER BY day ASC, start_ts ASC, end_ts ASC, id ASC
+                """,
+                (int(summary_id),),
+            ).fetchall()
+        result = [_row_to_activity_entity_record(row) for row in rows]
+        self._log_db_query_timing("list_activity_entities_for_summary", started_at, rows=len(result))
+        return result
+
+    def search_activity_entities(
+        self,
+        *,
+        entity_type: str | None = None,
+        query: str | None = None,
+        day_from: Day | None = None,
+        day_to: Day | None = None,
+        min_confidence: float | None = None,
+        limit: int = 1000,
+    ) -> list[ActivityEntityRecord]:
+        started_at = time.perf_counter()
+        clauses: list[str] = []
+        values: list[object] = []
+        if entity_type:
+            clauses.append("entity_type = ?")
+            values.append(entity_type.strip())
+        if query is not None and query.strip():
+            raw_like = f"%{_escape_like_pattern(query.strip().lower())}%"
+            normalized_like = f"%{_escape_like_pattern(_normalize_activity_entity_query(query))}%"
+            clauses.append(
+                "(LOWER(entity_value) LIKE ? ESCAPE '\\' OR LOWER(entity_normalized) LIKE ? ESCAPE '\\')"
+            )
+            values.extend([raw_like, normalized_like])
+        if day_from is not None:
+            clauses.append("day >= ?")
+            values.append(day_from.isoformat())
+        if day_to is not None:
+            clauses.append("day <= ?")
+            values.append(day_to.isoformat())
+        if min_confidence is not None:
+            clauses.append("confidence >= ?")
+            values.append(float(min_confidence))
+        values.append(max(1, int(limit)))
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, summary_id, day, start_ts, end_ts, entity_type, entity_value, entity_normalized,
+                    source_kind, source_ref, evidence_kind, confidence, attributes_json, created_at
+                FROM activity_entities
+                """
+                + where_clause
+                + """
+                ORDER BY day DESC, start_ts DESC, end_ts DESC, id DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        result = [_row_to_activity_entity_record(row) for row in rows]
+        self._log_db_query_timing("search_activity_entities", started_at, rows=len(result))
+        return result
+
+    def list_audit_activity_entities(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if start_day is not None:
+            clauses.append("day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("day < ?")
+            values.append(end_day_exclusive.isoformat())
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, summary_id, day, start_ts, end_ts, entity_type, entity_value, entity_normalized,
+                    source_kind, source_ref, evidence_kind, confidence, attributes_json, created_at
+                FROM activity_entities
+                """
+                + where_clause
+                + """
+                ORDER BY day ASC, start_ts ASC, end_ts ASC, id ASC
+                """,
+                values,
+            ).fetchall()
+        return [_activity_entity_record_to_audit_row(row) for row in rows]
+
 
 def _row_to_summary_record(row: sqlite3.Row, *, job_id: int | None = None) -> SummaryRecord:
     return SummaryRecord(
@@ -1068,6 +1282,44 @@ def _row_to_coalescing_diagnostic_record(row: sqlite3.Row) -> CoalescingDiagnost
     )
 
 
+def _row_to_activity_entity_record(row: sqlite3.Row) -> ActivityEntityRecord:
+    return ActivityEntityRecord(
+        id=int(row["id"]),
+        summary_id=None if row["summary_id"] is None else int(row["summary_id"]),
+        day=datetime.strptime(str(row["day"]), "%Y-%m-%d").date(),
+        start_ts=float(row["start_ts"]),
+        end_ts=float(row["end_ts"]),
+        entity_type=str(row["entity_type"]),
+        entity_value=str(row["entity_value"]),
+        entity_normalized=str(row["entity_normalized"]),
+        source_kind=str(row["source_kind"]),
+        source_ref=str(row["source_ref"]),
+        evidence_kind=str(row["evidence_kind"]),
+        confidence=float(row["confidence"]),
+        attributes=json.loads(str(row["attributes_json"])),
+        created_at=float(row["created_at"]),
+    )
+
+
+def _activity_entity_record_to_audit_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "activity_entity_id": int(row["id"]),
+        "summary_id": None if row["summary_id"] is None else int(row["summary_id"]),
+        "day": str(row["day"]),
+        "start_ts": float(row["start_ts"]),
+        "end_ts": float(row["end_ts"]),
+        "entity_type": str(row["entity_type"]),
+        "entity_value": str(row["entity_value"]),
+        "entity_normalized": str(row["entity_normalized"]),
+        "source_kind": str(row["source_kind"]),
+        "source_ref": str(row["source_ref"]),
+        "evidence_kind": str(row["evidence_kind"]),
+        "confidence": float(row["confidence"]),
+        "attributes_json": json.loads(str(row["attributes_json"])),
+        "created_at": float(row["created_at"]),
+    }
+
+
 def _normalize_summary_job_status(status: str) -> str:
     normalized = status.strip().lower()
     if normalized == "succeeded":
@@ -1092,3 +1344,9 @@ def _day_epoch_bounds(day: Day) -> tuple[float, float]:
 
 def _escape_like_pattern(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _normalize_activity_entity_query(value: str) -> str:
+    text = value.strip().replace("\\", "/")
+    text = " ".join(text.split())
+    return text.lower()

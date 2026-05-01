@@ -4,12 +4,14 @@ import logging
 import threading
 import time
 from collections import deque
+from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from .batching import BatchBuilder, SummaryBatch
 from .error_notifications import ErrorNotificationManager
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError
+from .evidence_quality import score_daily_evidence_quality, score_event_evidence_quality
 from .lmstudio_client import LMStudioClient
 from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, safe_error
 from .llm_job_queue import LLMJobCancelledError, LLMJobMetadata
@@ -97,8 +99,11 @@ class Summarizer:
         job_queue = self._get_lmstudio_job_queue()
         if job_queue is not None:
             job_queue.stop()
+        deadline = time.monotonic() + 10.0
         for handle in self._workers + self._retired_workers:
-            handle.thread.join(timeout=2)
+            while handle.thread.is_alive() and time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                handle.thread.join(timeout=min(0.25, remaining))
         runtime = self.get_runtime_status()
         self.logger.info(
             "event=summary_workers_joined running=%s queued=%s cancelled=%s failed=%s",
@@ -590,6 +595,20 @@ class Summarizer:
             else:
                 self.error_notifier.resolve_many("lmstudio_connection", "lmstudio_service_unavailable", "lmstudio_timeout")
 
+            source_reports = [
+                score_event_evidence_quality(
+                    summary_id=summary.id,
+                    day=day,
+                    start_ts=summary.start_ts,
+                    end_ts=summary.end_ts,
+                    summary_json=summary.summary_json if isinstance(summary.summary_json, dict) else {},
+                    activity_entities=summary.summary_json.get("activity_entities") if isinstance(summary.summary_json, dict) else None,
+                    parser_coverage=summary.summary_json.get("parser_coverage") if isinstance(summary.summary_json, dict) else None,
+                    source_batch=summary.summary_json.get("source_batch") if isinstance(summary.summary_json, dict) else None,
+                    source_context=summary.summary_json.get("source_context") if isinstance(summary.summary_json, dict) else None,
+                )
+                for summary in summaries
+            ]
             log_llm_stage(
                 self.logger,
                 "daily_summary_store",
@@ -649,6 +668,21 @@ class Summarizer:
                 daily_summary_id=daily_summary.id,
                 replaced=replaced,
             )
+            daily_quality = score_daily_evidence_quality(
+                summary_id=daily_summary.id,
+                day=day,
+                start_ts=day_start.timestamp(),
+                end_ts=day_end.timestamp(),
+                recap_json=recap_json if isinstance(recap_json, dict) else None,
+                source_event_reports=source_reports,
+            )
+            if isinstance(recap_json, dict):
+                recap_json = dict(recap_json)
+                recap_json["evidence_quality_report"] = daily_quality.to_dict()
+                self.storage.update_daily_summary_record(
+                    day,
+                    recap_json=recap_json,
+                )
             self.storage.update_summary_job(
                 job_id,
                 status="completed",
@@ -993,6 +1027,7 @@ class Summarizer:
             )
 
             summary_id: int | None = None
+            persisted_summary_payload: dict[str, object] | None = None
             if dedup_decision.action == "merge_previous" and dedup_decision.matched_summary_id is not None:
                 merged_record = next(
                     (item for item in recent_summaries if item.id == dedup_decision.matched_summary_id),
@@ -1024,6 +1059,7 @@ class Summarizer:
                         summary_json=merged_payload,
                     )
                     summary_id = merged_record.id
+                    persisted_summary_payload = merged_payload
                     log_llm_stage(
                         self.logger,
                         "summary_store",
@@ -1055,6 +1091,7 @@ class Summarizer:
                         summary_text=summary_text,
                         summary_json=summary_payload,
                     )
+                    persisted_summary_payload = summary_payload
                     log_llm_stage(
                         self.logger,
                         "summary_store",
@@ -1097,6 +1134,7 @@ class Summarizer:
                     summary_text=summary_text,
                     summary_json=summary_payload,
                 )
+                persisted_summary_payload = summary_payload
                 log_llm_stage(
                     self.logger,
                     "summary_store",
@@ -1108,6 +1146,38 @@ class Summarizer:
                     action="insert",
                     summary_id=summary_id,
                 )
+
+            activity_entity_count = self._persist_activity_entities_for_batch(batch, summary_id=summary_id)
+            if activity_entity_count:
+                self.logger.info(
+                    "event=activity_entities_persisted day=%s summary_id=%s entity_count=%s",
+                    date.fromtimestamp(batch.start_ts).isoformat(),
+                    "none" if summary_id is None else int(summary_id),
+                    activity_entity_count,
+                )
+
+            if summary_id is not None and persisted_summary_payload is not None:
+                persisted_entities = [
+                    asdict(item)
+                    for item in self.storage.list_activity_entities_for_summary(summary_id)
+                ]
+                if not persisted_entities:
+                    persisted_entities = [asdict(item) for item in batch.activity_entities]
+                quality_report = score_event_evidence_quality(
+                    summary_id=summary_id,
+                    day=date.fromtimestamp(batch.start_ts),
+                    start_ts=batch.start_ts,
+                    end_ts=batch.end_ts,
+                    summary_json=persisted_summary_payload,
+                    activity_entities=persisted_entities,
+                    parser_coverage=batch.parser_coverage,
+                    source_batch=persisted_summary_payload.get("source_batch") if isinstance(persisted_summary_payload.get("source_batch"), dict) else None,
+                    source_context=persisted_summary_payload.get("source_context") if isinstance(persisted_summary_payload.get("source_context"), dict) else None,
+                )
+                quality_payload = dict(persisted_summary_payload)
+                quality_payload["evidence_quality_report"] = quality_report.to_dict()
+                self.storage.update_summary_record(summary_id, summary_json=quality_payload)
+                persisted_summary_payload = quality_payload
 
             self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
             self.storage.purge_raw_data(batch.start_ts, batch.end_ts)
@@ -1312,7 +1382,46 @@ class Summarizer:
         else:
             payload["source_context"] = {}
         payload["activity_segments"] = [segment.to_dict() for segment in batch.activity_segments]
+        payload["activity_entities"] = [
+            {
+                "entity_type": item.entity_type,
+                "entity_value": item.entity_value,
+                "entity_normalized": item.entity_normalized,
+                "source_kind": item.source_kind,
+                "source_ref": item.source_ref,
+                "evidence_kind": item.evidence_kind,
+                "confidence": item.confidence,
+                "attributes": item.attributes,
+            }
+            for item in batch.activity_entities
+        ]
+        payload["parser_coverage"] = [dict(item) for item in batch.parser_coverage]
+        payload["source_batch"]["active_interval_count"] = len(batch.active_intervals)
+        payload["source_batch"]["blocked_interval_count"] = len(batch.blocked_intervals)
+        payload["source_batch"]["text_segment_count"] = len(batch.text_segments)
+        payload["source_batch"]["screenshot_count"] = len(batch.screenshots)
+        payload["source_batch"]["activity_entity_count"] = len(batch.activity_entities)
+        payload["source_batch"]["parser_coverage_count"] = len(batch.parser_coverage)
         return payload
+
+    def _persist_activity_entities_for_batch(
+        self,
+        batch: SummaryBatch,
+        *,
+        summary_id: int | None,
+    ) -> int:
+        if not batch.activity_entities:
+            return 0
+
+        day = date.fromtimestamp(batch.start_ts)
+        inserted_ids = self.storage.add_activity_entities(
+            day=day,
+            start_ts=batch.start_ts,
+            end_ts=batch.end_ts,
+            summary_id=summary_id,
+            entities=batch.activity_entities,
+        )
+        return len(inserted_ids)
 
     def _merge_summary_payload(
         self,

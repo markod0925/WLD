@@ -22,6 +22,56 @@ class SuccessfulClient:
         return "daily done", {"summary_text": "daily done", "major_activities": []}
 
 
+class StructuredClient:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+        _emit_started(_kwargs)
+        payload = {
+            "summary_text": "Edited Input_cases.m in MATLAB.",
+            "primary_activity": [{"text": "editing a MATLAB input file", "confidence": 0.93}],
+            "programs_used": [{"name": "MATLAB", "confidence": 0.98}],
+            "files": [
+                {
+                    "entity_type": "file_path",
+                    "entity_value": "U:\\PROJ1\\XXX\\data\\Input_cases.m",
+                    "entity_normalized": "u:/proj1/xxx/data/input_cases.m",
+                    "evidence_kind": "observed",
+                }
+            ],
+            "conversations": [],
+            "task_candidates": [{"text": "review input data shape", "confidence": 0.66}],
+            "outcomes": [{"text": "updated MATLAB input handling", "confidence": 0.84}],
+            "follow_ups": [{"text": "verify downstream test coverage", "confidence": 0.5}],
+            "blocked_activity": [],
+            "unknowns": [],
+            "evidence_quality": {
+                "overall_confidence": 0.91,
+                "confidence_notes": ["direct file evidence from window title"],
+                "field_confidence": {"files": 0.98},
+            },
+            "metadata": {"parse_status": "validated"},
+        }
+        return payload["summary_text"], payload
+
+    def summarize_daily_recap(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+        _emit_started(_kwargs)
+        payload = {
+            "executive_summary": "Prepared a focused work recap from structured event summaries.",
+            "program_activity_breakdown": [{"program": "MATLAB", "confidence": 0.98}],
+            "tasks_advanced": [{"text": "review input data shape", "confidence": 0.66}],
+            "files_observed": [{"path": "U:\\PROJ1\\XXX\\data\\Input_cases.m", "confidence": 0.98}],
+            "files_likely_modified": [],
+            "conversations_or_meetings": [],
+            "decisions": [{"text": "keep the MATLAB path as the source of truth", "confidence": 0.7}],
+            "blockers": [],
+            "follow_ups": [{"text": "verify downstream test coverage", "confidence": 0.5}],
+            "jira_update_candidates": [{"text": "summarize MATLAB input handling", "confidence": 0.55}],
+            "open_questions": [],
+            "confidence_notes": ["structured event payloads were available"],
+            "metadata": {"parse_status": "validated"},
+        }
+        return payload["executive_summary"], payload
+
+
 class FailingClient:
     def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
         _emit_started(_kwargs)
@@ -192,6 +242,36 @@ def test_successful_summary_records_worker_timestamps(tmp_path: Path) -> None:
         storage.close()
 
 
+def test_successful_summary_persists_structured_payload(tmp_path: Path) -> None:
+    db_path = tmp_path / "worklog.db"
+    shot_path = tmp_path / "screens" / "shot.png"
+    storage = SQLiteStorage(str(db_path))
+    _seed_raw_data(storage, shot_path)
+
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
+        lm_client=StructuredClient(),
+    )
+    try:
+        summary_id = summarizer.flush_pending(reason="test")
+        assert summary_id is not None
+
+        summaries = storage.list_summaries_for_day(date(1970, 1, 1))
+        assert len(summaries) == 1
+        summary = summaries[0]
+        assert summary.summary_json["summary_text"] == "Edited Input_cases.m in MATLAB."
+        assert summary.summary_json["files"][0]["entity_value"] == "U:\\PROJ1\\XXX\\data\\Input_cases.m"
+        assert summary.summary_json["evidence_quality"]["overall_confidence"] == 0.91
+        assert summary.summary_json["evidence_quality_report"]["summary_kind"] == "event"
+        assert 0.0 <= summary.summary_json["evidence_quality_report"]["score"] <= 1.0
+        assert summary.summary_json["activity_entities"]
+        assert summary.summary_json["parser_coverage"]
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
 def test_failed_summary_keeps_raw_data_retryable(tmp_path: Path) -> None:
     db_path = tmp_path / "worklog.db"
     shot_path = tmp_path / "screens" / "shot.png"
@@ -291,6 +371,10 @@ def test_daily_summary_is_idempotent_per_day(tmp_path: Path) -> None:
         assert job is not None
         assert job["status"] == "completed"
         assert job["attempt"] == 1
+        daily_summary = storage.get_daily_summary_for_day(day)
+        assert daily_summary is not None
+        assert daily_summary.recap_json is not None
+        assert daily_summary.recap_json["evidence_quality_report"]["summary_kind"] == "daily"
         assert storage.get_diagnostics_snapshot()["daily_summaries"] == 1
     finally:
         summarizer.stop()

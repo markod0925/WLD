@@ -44,8 +44,12 @@ class LMStudioPromptBuilder:
         prompt_text = self._render_prompt(
             title="Summarize the following WorkLog Diary activity batch.",
             instructions=(
-                "Return only valid JSON with keys summary_text, key_points, blocked_activity, metadata. "
-                "Treat blocked intervals as intentionally redacted privacy windows."
+                "Return only strict JSON with top-level keys summary_text, primary_activity, programs_used, files, conversations, "
+                "task_candidates, outcomes, follow_ups, blocked_activity, unknowns, evidence_quality, metadata. "
+                "Use activity_entities and other observed evidence as the source of truth. Observed facts must stay separate from inference. "
+                "Do not invent file modifications or task names. "
+                "Blocked intervals may only be described as blocked or unknown. Preserve exact file paths and names. "
+                "Use explicit confidence values in evidence_quality. Avoid generic filler unless evidence is genuinely weak."
             ),
             payload=payload,
             metadata=metadata,
@@ -57,13 +61,12 @@ class LMStudioPromptBuilder:
         prompt_text = self._render_prompt(
             title=f"Create a short daily recap for {day.isoformat()} from the following batch summaries.",
             instructions=(
-                "Return only valid JSON with keys summary_text, key_points, blocked_activity, metadata. "
-                "Keep summary_text short, ideally 2 to 4 sentences. "
-                "Make key_points a compact highlights list with 3 to 6 entries, each using the format "
-                "\"Category: short description\". "
-                "Prefer categories such as \"Programma/Attività\", \"Decisioni\", \"Blocchi\", and \"Follow-up\". "
-                "Use key_points to capture the most useful actions and outcomes from the day, not generic prose. "
-                "Keep blocked_activity brief and only mention meaningful privacy or blocked-work notes."
+                "Return only strict JSON with top-level keys executive_summary, program_activity_breakdown, tasks_advanced, "
+                "files_observed, files_likely_modified, conversations_or_meetings, decisions, blockers, follow_ups, "
+                "jira_update_candidates, open_questions, confidence_notes, metadata. "
+                "Base the recap on structured event outputs, extracted entities, and confidence notes. "
+                "Do not invent file modifications or task names. Do not hallucinate blocked content. "
+                "Keep the recap concise and fact-oriented. Use confidence_notes to explain low-confidence or ambiguous evidence."
             ),
             payload=payload,
             metadata=metadata,
@@ -85,6 +88,20 @@ class LMStudioPromptBuilder:
             sanitized, truncated = self._truncate_structure(item)
             screenshots.append(sanitized)
             screenshots_truncated = screenshots_truncated or truncated
+
+        activity_entities: list[dict[str, Any]] = []
+        activity_entities_truncated = False
+        for item in source.get("activity_entities", []):
+            sanitized, truncated = self._truncate_structure(item)
+            activity_entities.append(sanitized)
+            activity_entities_truncated = activity_entities_truncated or truncated
+
+        parser_coverage: list[dict[str, Any]] = []
+        parser_coverage_truncated = False
+        for item in source.get("parser_coverage", []):
+            sanitized, truncated = self._truncate_structure(item)
+            parser_coverage.append(sanitized)
+            parser_coverage_truncated = parser_coverage_truncated or truncated
 
         activity_segments: list[dict[str, Any]] = []
         activity_truncated = False
@@ -117,6 +134,8 @@ class LMStudioPromptBuilder:
                 "blocked_intervals": blocked_intervals,
                 "text_segments": text_segments,
                 "screenshots": screenshots,
+                "activity_entities": activity_entities,
+                "parser_coverage": parser_coverage,
             },
         }
         metadata = self._payload_metadata(
@@ -127,6 +146,8 @@ class LMStudioPromptBuilder:
                 "text_segments": len(source["text_segments"]),
                 "screenshots": len(source["screenshots"]),
                 "activity_segments": len(source.get("activity_segments", [])),
+                "activity_entities": len(source.get("activity_entities", [])),
+                "parser_coverage": len(source.get("parser_coverage", [])),
             },
             included_counts={
                 "active_intervals": len(active_intervals),
@@ -134,6 +155,8 @@ class LMStudioPromptBuilder:
                 "text_segments": len(text_segments),
                 "screenshots": len(screenshots),
                 "activity_segments": len(activity_segments),
+                "activity_entities": len(activity_entities),
+                "parser_coverage": len(parser_coverage),
             },
             structure_truncated=(
                 text_truncated
@@ -141,6 +164,8 @@ class LMStudioPromptBuilder:
                 or active_truncated
                 or blocked_truncated
                 or activity_truncated
+                or activity_entities_truncated
+                or parser_coverage_truncated
             ),
         )
         return payload, metadata
@@ -149,21 +174,43 @@ class LMStudioPromptBuilder:
         included = summaries[: self.max_daily_summaries]
         recap_items: list[dict[str, Any]] = []
         recap_truncated = False
+        confidence_notes: list[str] = []
         for item in included:
+            structured = item.summary_json if isinstance(item.summary_json, dict) else {}
+            evidence_quality = structured.get("evidence_quality") if isinstance(structured.get("evidence_quality"), dict) else {}
+            metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
+            activity_entities = structured.get("activity_entities") if isinstance(structured.get("activity_entities"), list) else []
+            parser_coverage = structured.get("parser_coverage") if isinstance(structured.get("parser_coverage"), list) else []
             sanitized, truncated = self._truncate_structure(
                 {
                     "time_range": {"start_ts": item.start_ts, "end_ts": item.end_ts},
-                    "summary_text": item.summary_text,
-                    "summary_json": item.summary_json,
+                    "summary_id": item.id,
+                    "summary_text": structured.get("summary_text") or item.summary_text,
+                    "primary_activity": structured.get("primary_activity", []),
+                    "programs_used": structured.get("programs_used", []),
+                    "files": structured.get("files", []),
+                    "conversations": structured.get("conversations", []),
+                    "task_candidates": structured.get("task_candidates", []),
+                    "outcomes": structured.get("outcomes", []),
+                    "follow_ups": structured.get("follow_ups", []),
+                    "blocked_activity": structured.get("blocked_activity", []),
+                    "unknowns": structured.get("unknowns", []),
+                    "evidence_quality": evidence_quality,
+                    "metadata": metadata,
+                    "activity_entities": activity_entities,
+                    "parser_coverage": parser_coverage,
                 }
             )
             recap_items.append(sanitized)
             recap_truncated = recap_truncated or truncated
+            if isinstance(evidence_quality.get("confidence_notes"), list):
+                confidence_notes.extend(str(note) for note in evidence_quality["confidence_notes"] if str(note).strip())
 
         payload = {
             "schema": "worklog.lmstudio.daily_recap.v1",
             "day": day.isoformat(),
-            "summaries": recap_items,
+            "structured_event_outputs": recap_items,
+            "confidence_notes": confidence_notes,
         }
         metadata = self._payload_metadata(
             response_kind="daily_recap",

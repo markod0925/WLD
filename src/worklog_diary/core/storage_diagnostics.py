@@ -53,6 +53,7 @@ class StorageDiagnosticsRepository:
                 "screenshots": int(self._conn.execute("SELECT COUNT(1) AS c FROM screenshots").fetchone()["c"]),
                 "summary_jobs": int(self._conn.execute("SELECT COUNT(1) AS c FROM summary_jobs").fetchone()["c"]),
                 "summaries": int(self._conn.execute("SELECT COUNT(1) AS c FROM summaries").fetchone()["c"]),
+                "activity_entities": int(self._conn.execute("SELECT COUNT(1) AS c FROM activity_entities").fetchone()["c"]),
                 "daily_summaries": int(self._conn.execute("SELECT COUNT(1) AS c FROM daily_summaries").fetchone()["c"]),
             }
             pending_ranges = {
