@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-MAX_TOOLTIP_LINES = 6
-MAX_TOOLTIP_LINE_LENGTH = 96
+MAX_TOOLTIP_TOTAL_CHARS = 120
+MAX_TOOLTIP_LINES = 4
+MAX_TOOLTIP_LINE_LENGTH = 48
 
 
 @dataclass(slots=True, frozen=True)
@@ -43,7 +44,6 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
     pending_screenshots = _coerce_int(status.get("pending_screenshot_count"))
     pending_summary_jobs = _coerce_int(status.get("pending_summary_job_count"))
     pending_key_events = _coerce_int(status.get("pending_key_event_buffer_count"))
-    keyboard_hook_installed = bool(status.get("keyboard_hook_installed", True))
     open_text_segment_active = bool(status.get("open_text_segment_active"))
     open_text_segment_chars = _coerce_int(status.get("open_text_segment_char_count"))
 
@@ -98,48 +98,24 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
     elif state_label == "Stopped":
         detail_lines.append("Reason: capture stopped")
 
-    if state_label == "Active":
-        if blocked:
-            capture_line = "Capture: blocked by foreground app"
-        elif has_pending_activity:
-            capture_line = _format_capture_line(pending_screenshots, pending_text_segments)
-        elif open_text_segment_active or pending_key_events > 0:
-            capture_line = "Capture: active, building current text segment"
-        else:
-            capture_line = "Capture: no pending activity"
-        detail_lines.append(capture_line)
-        if blocked and has_pending_activity:
-            detail_lines.append(_format_pending_line(pending_screenshots, pending_text_segments))
-        elif open_text_segment_active:
-            detail_lines.append(f"Current: {open_text_segment_chars} chars, {pending_key_events} raw keys buffered")
-        elif pending_key_events > 0:
-            detail_lines.append(f"Current: {pending_key_events} raw keys buffered")
-        if not keyboard_hook_installed:
-            detail_lines.append("Capture hook: unavailable")
-    elif has_pending_activity and not shutdown_in_progress:
-        detail_lines.append(_format_capture_line(pending_screenshots, pending_text_segments))
+    detail_lines.append(_format_capture_line(pending_screenshots, pending_text_segments))
 
-    if shutdown_in_progress or unrecoverable_error or not llm_accepting_jobs or llm_closing or llm_closed:
-        llm_line = "LLM: unavailable"
-    elif running_jobs > 0:
-        llm_line = f"LLM: processing {_format_count_label(running_jobs, 'summary', 'summaries')}"
-    else:
-        llm_line = "LLM: idle"
-    detail_lines.append(llm_line)
+    if open_text_segment_active or pending_key_events > 0:
+        detail_lines.append(_format_current_line(open_text_segment_chars, pending_key_events))
 
-    if llm_max_concurrent > 0:
-        detail_lines.append(f"Queue: {queued_jobs} queued, {running_jobs} in flight, max {llm_max_concurrent}")
-    else:
-        detail_lines.append(f"Queue: {queued_jobs} queued, {running_jobs} running")
-
-    if (
+    waiting_for_lock = (
         process_backlog_only_while_locked
         and summary_admission_paused
         and has_pending_activity
         and not shutdown_in_progress
         and state_label == "Active"
-    ):
-        detail_lines.append("Backlog: waiting for PC lock")
+    )
+    detail_lines.append(_format_lm_queue_line(
+        running_jobs=running_jobs,
+        queued_jobs=queued_jobs,
+        waiting_for_lock=waiting_for_lock,
+        unavailable=(shutdown_in_progress or unrecoverable_error or not llm_accepting_jobs or llm_closing or llm_closed),
+    ))
 
     normalized_lines = tuple(
         _truncate_line(_normalize_whitespace(line), MAX_TOOLTIP_LINE_LENGTH)
@@ -159,9 +135,18 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
 
 
 def format_tray_tooltip(snapshot: TrayStatusSnapshot) -> str:
-    lines = [f"WorkLog Diary: {snapshot.state_label}", *snapshot.detail_lines]
-    normalized = [_truncate_line(_normalize_whitespace(line), MAX_TOOLTIP_LINE_LENGTH) for line in lines if line]
-    return "\n".join(normalized[:MAX_TOOLTIP_LINES])
+    lines = [f"WLD: {snapshot.state_label}", *snapshot.detail_lines]
+    lines = [_truncate_line(_normalize_whitespace(line), MAX_TOOLTIP_LINE_LENGTH) for line in lines if line]
+
+    if not _fits_budget(lines):
+        lines = [line for line in lines if not line.startswith("Cur:")]
+
+    if not _fits_budget(lines):
+        lines = lines[:MAX_TOOLTIP_LINES]
+        while lines and not _fits_budget(lines):
+            lines.pop()
+
+    return "\n".join(lines)
 
 
 def build_tray_menu_actions(snapshot: TrayStatusSnapshot) -> list[TrayMenuActionSpec]:
@@ -195,26 +180,50 @@ def build_tray_menu_actions(snapshot: TrayStatusSnapshot) -> list[TrayMenuAction
     ]
 
 
+
+def _format_current_line(open_text_segment_chars: int, pending_key_events: int) -> str:
+    return f"Cur: {_format_compact_number(open_text_segment_chars)} ch, {_format_compact_number(pending_key_events)} key"
+
+
+def _format_lm_queue_line(running_jobs: int, queued_jobs: int, waiting_for_lock: bool, unavailable: bool) -> str:
+    if unavailable:
+        lm_status = "unavail"
+    elif running_jobs > 0:
+        lm_status = f"{_format_compact_number(running_jobs)} run"
+    else:
+        lm_status = "idle"
+
+    if waiting_for_lock:
+        return f"LM: {lm_status}, wait lock"
+    return f"LM: {lm_status}, Q {_format_compact_number(queued_jobs)}"
+
+
+def _format_compact_number(value: int) -> str:
+    sign = "-" if value < 0 else ""
+    abs_value = abs(value)
+    if abs_value < 1000:
+        return str(value)
+    if abs_value < 10000:
+        whole = abs_value // 1000
+        tenths = (abs_value % 1000) // 100
+        return f"{sign}{whole}.{tenths}k"
+    return f"{sign}{abs_value // 1000}k"
+
+
+def _fits_budget(lines: list[str]) -> bool:
+    return len(lines) <= MAX_TOOLTIP_LINES and len("\n".join(lines)) <= MAX_TOOLTIP_TOTAL_CHARS and all(len(line) <= MAX_TOOLTIP_LINE_LENGTH for line in lines)
+
 def _format_capture_line(pending_screenshots: int, pending_text_segments: int) -> str:
-    screenshot_label = _format_count_label(pending_screenshots, "screenshot buffered", "screenshots buffered")
+    screenshot_label = _format_count_label(pending_screenshots, "img", "img")
     text_label = _format_count_label(
-        pending_text_segments, "finalized text segment buffered", "finalized text segments buffered"
+        pending_text_segments, "txt", "txt"
     )
-    return f"Capture: {screenshot_label}, {text_label}"
-
-
-def _format_pending_line(pending_screenshots: int, pending_text_segments: int) -> str:
-    screenshot_label = _format_count_label(pending_screenshots, "screenshot buffered", "screenshots buffered")
-    text_label = _format_count_label(
-        pending_text_segments, "finalized text segment buffered", "finalized text segments buffered"
-    )
-    return f"Pending: {screenshot_label}, {text_label}"
+    return f"Cap: {screenshot_label}, {text_label}"
 
 
 def _format_count_label(count: int, singular: str, plural: str) -> str:
-    if count == 1:
-        return f"1 {singular}"
-    return f"{count} {plural}"
+    label = singular if count == 1 else plural
+    return f"{_format_compact_number(count)} {label}"
 
 
 def _coerce_int(value: Any) -> int:
