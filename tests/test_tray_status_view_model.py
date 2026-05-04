@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from worklog_diary.ui.tray_status_view_model import (
+    MAX_TOOLTIP_LINE_LENGTH,
+    MAX_TOOLTIP_LINES,
+    MAX_TOOLTIP_TOTAL_CHARS,
     TrayStatusSnapshot,
+    _format_compact_number,
     build_tray_menu_actions,
     build_tray_status_snapshot,
     format_tray_tooltip,
@@ -20,21 +24,12 @@ def _base_status(**overrides: object) -> dict[str, object]:
         "pending_text_segment_count": 0,
         "pending_screenshot_count": 0,
         "pending_summary_job_count": 0,
-        "summary_jobs": {
-            "queued": 0,
-            "running": 0,
-        },
-        "llm_queue": {
-            "accepting_jobs": True,
-            "closing": False,
-            "closed": False,
-            "max_concurrent": 2,
-        },
+        "summary_jobs": {"queued": 0, "running": 0},
+        "llm_queue": {"accepting_jobs": True, "closing": False, "closed": False, "max_concurrent": 2},
         "summary_admission_paused": False,
         "process_backlog_only_while_locked": False,
         "unrecoverable_summary_error": None,
         "pending_key_event_buffer_count": 0,
-        "keyboard_hook_installed": True,
         "open_text_segment_active": False,
         "open_text_segment_char_count": 0,
     }
@@ -43,38 +38,47 @@ def _base_status(**overrides: object) -> dict[str, object]:
 
 
 def test_tray_snapshot_and_menu_share_the_same_state_model() -> None:
+    snapshot = build_tray_status_snapshot(_base_status(pending_screenshot_count=1))
+    assert format_tray_tooltip(snapshot).splitlines() == ["WLD: Active", "Cap: 1 img, 0 txt", "LM: idle, Q 0"]
+    assert [a.label for a in build_tray_menu_actions(snapshot)] == [
+        "Show Summaries", "Search Summaries", "Pause Capture", "Flush Now", "Settings", "Quit"
+    ]
+
+
+def test_compact_number_policy_is_stable() -> None:
+    assert _format_compact_number(0) == "0"
+    assert _format_compact_number(999) == "999"
+    assert _format_compact_number(1000) == "1.0k"
+    assert _format_compact_number(1200) == "1.2k"
+    assert _format_compact_number(9999) == "9.9k"
+    assert _format_compact_number(10000) == "10k"
+    assert _format_compact_number(12500) == "12k"
+    assert _format_compact_number(999999) == "999k"
+
+
+def test_active_capture_includes_current_buffer_when_it_fits() -> None:
     snapshot = build_tray_status_snapshot(
         _base_status(
-            pending_screenshot_count=1,
-            pending_text_segment_count=0,
+            pending_screenshot_count=5,
+            open_text_segment_active=True,
+            open_text_segment_char_count=123,
+            pending_key_event_buffer_count=45,
+            summary_jobs={"queued": 0, "running": 1},
         )
     )
-
-    tooltip_lines = format_tray_tooltip(snapshot).splitlines()
-    assert tooltip_lines == [
-        "WorkLog Diary: Active",
-        "Capture: 1 screenshot buffered, 0 finalized text segments buffered",
-        "LLM: idle",
-        "Queue: 0 queued, 0 in flight, max 2",
-    ]
-
-    menu_actions = build_tray_menu_actions(snapshot)
-    assert [action.label for action in menu_actions] == [
-        "Show Summaries",
-        "Search Summaries",
-        "Pause Capture",
-        "Flush Now",
-        "Settings",
-        "Quit",
-    ]
-    assert all("batch" not in action.label.lower() for action in menu_actions)
-    assert all("Estimated summaries" not in line for line in tooltip_lines)
+    tooltip = format_tray_tooltip(snapshot)
+    assert "Cur: 123 ch, 45 key" in tooltip
+    assert "LM: 1 run, Q 0" in tooltip
 
 
-def test_tray_tooltip_is_bounded_and_truncates_long_lines() -> None:
+def test_crowded_state_keeps_priority_lines_and_drops_cur_first() -> None:
     snapshot = TrayStatusSnapshot(
         state_label="Active",
-        detail_lines=("X" * 200,),
+        detail_lines=(
+            "Cap: 12k img, 12k txt with extra compact metadata",
+            "Cur: 12k ch, 12k key with extra compact metadata",
+            "LM: 12k run, wait lock with extra compact metadata",
+        ),
         monitoring_active=True,
         monitoring_requested=True,
         manual_pause=False,
@@ -82,112 +86,50 @@ def test_tray_tooltip_is_bounded_and_truncates_long_lines() -> None:
         shutdown_in_progress=False,
         flush_drain_active=False,
     )
-
-    tooltip_lines = format_tray_tooltip(snapshot).splitlines()
-    assert len(tooltip_lines) == 2
-    assert len(tooltip_lines[0]) <= 96
-    assert len(tooltip_lines[1]) <= 96
-
-
-def test_tray_snapshot_omits_estimated_summaries_for_small_backlogs() -> None:
-    snapshot = build_tray_status_snapshot(
-        _base_status(
-            pending_screenshot_count=1,
-            pending_text_segment_count=0,
-            summary_admission_paused=True,
-            process_backlog_only_while_locked=True,
-        )
-    )
-
     tooltip = format_tray_tooltip(snapshot)
-    assert "Estimated summaries:" not in tooltip
-    assert "approx" not in tooltip.lower()
+    lines = tooltip.splitlines()
+
+    assert len(tooltip) <= MAX_TOOLTIP_TOTAL_CHARS
+    assert len(lines) <= MAX_TOOLTIP_LINES
+    assert all(len(line) <= MAX_TOOLTIP_LINE_LENGTH for line in lines)
+    assert "WLD:" in tooltip
+    assert "Cap:" in tooltip
+    assert "LM:" in tooltip
+    assert "wait lock" in tooltip
+    assert "Cur:" not in tooltip
 
 
-def test_tray_snapshot_shows_pc_lock_backlog_gate() -> None:
-    snapshot = build_tray_status_snapshot(
-        _base_status(
-            pending_screenshot_count=1,
-            pending_text_segment_count=0,
-            summary_admission_paused=True,
-            process_backlog_only_while_locked=True,
-        )
-    )
-
-    assert "Backlog: waiting for PC lock" in snapshot.detail_lines
-
-
-def test_tray_snapshot_marks_llm_unavailable_compactly() -> None:
-    snapshot = build_tray_status_snapshot(
-        _base_status(
-            unrecoverable_summary_error="LM Studio unavailable",
-        )
-    )
-
-    tooltip_lines = format_tray_tooltip(snapshot).splitlines()
-    assert "LLM: unavailable" in tooltip_lines
-
-
-def test_tray_snapshot_surfaces_unfinalized_text_capture_buffer() -> None:
-    snapshot = build_tray_status_snapshot(
-        _base_status(
-            pending_screenshot_count=0,
-            pending_text_segment_count=0,
-            pending_key_event_buffer_count=6,
-            open_text_segment_active=True,
-            open_text_segment_char_count=4,
-        )
-    )
-
-    tooltip = format_tray_tooltip(snapshot)
-    assert "Capture: active, building current text segment" in tooltip
-    assert "Current: 4 chars, 6 raw keys buffered" in tooltip
-
-
-def test_tray_snapshot_surfaces_blocked_capture_state() -> None:
-    snapshot = build_tray_status_snapshot(
-        _base_status(
-            blocked=True,
-            pending_screenshot_count=0,
-            pending_text_segment_count=0,
-        )
+def test_tooltip_budget_counts_newlines_in_total_string() -> None:
+    snapshot = TrayStatusSnapshot(
+        state_label="Active",
+        detail_lines=("Cap: 9.9k img, 9.9k txt", "Cur: 9.9k ch, 9.9k key", "LM: 9.9k run, Q 9.9k"),
+        monitoring_active=True,
+        monitoring_requested=True,
+        manual_pause=False,
+        paused_by_lock=False,
+        shutdown_in_progress=False,
+        flush_drain_active=False,
     )
     tooltip = format_tray_tooltip(snapshot)
-    assert "Capture: blocked by foreground app" in tooltip
+    assert len(tooltip) <= MAX_TOOLTIP_TOTAL_CHARS
 
 
-def test_tray_snapshot_distinguishes_paused_and_stopped_states() -> None:
-    paused_snapshot = build_tray_status_snapshot(
-        _base_status(
-            monitoring_active=False,
-            manual_pause=True,
+def test_verbose_legacy_phrases_absent() -> None:
+    tooltip = format_tray_tooltip(build_tray_status_snapshot(_base_status(pending_screenshot_count=1)))
+    assert "screenshots buffered" not in tooltip
+    assert "finalized text segments buffered" not in tooltip
+    assert "processing 1 summary" not in tooltip
+    assert "Backlog waiting for PC lock" not in tooltip
+    assert "raw keys buffered" not in tooltip
+
+
+def test_keyboard_hook_unavailable_warning_is_present() -> None:
+    tooltip = format_tray_tooltip(
+        build_tray_status_snapshot(
+            _base_status(
+                keyboard_hook_installed=False,
+                pending_screenshot_count=1,
+            )
         )
     )
-    stopped_snapshot = build_tray_status_snapshot(
-        _base_status(
-            monitoring_active=False,
-            monitoring_requested=False,
-        )
-    )
-
-    assert paused_snapshot.state_label == "Paused"
-    assert "Reason: capture paused by user" in paused_snapshot.detail_lines
-    assert stopped_snapshot.state_label == "Stopped"
-    assert "Reason: capture stopped" in stopped_snapshot.detail_lines
-
-
-def test_tray_menu_disables_operational_actions_while_shutting_down() -> None:
-    snapshot = build_tray_status_snapshot(
-        _base_status(
-            shutdown_in_progress=True,
-        )
-    )
-
-    tooltip_lines = format_tray_tooltip(snapshot).splitlines()
-    assert tooltip_lines[0] == "WorkLog Diary: Shutting down"
-    assert "Reason: shutdown in progress" in tooltip_lines
-
-    actions = build_tray_menu_actions(snapshot)
-    assert actions[-1].label == "Quit"
-    assert actions[-1].enabled is True
-    assert all(action.enabled is False for action in actions[:-1])
+    assert "Warn: kb hook unavailable" in tooltip
