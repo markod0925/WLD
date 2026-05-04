@@ -36,6 +36,8 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
     paused_by_lock = bool(status.get("paused_by_lock"))
     shutdown_in_progress = bool(status.get("shutdown_in_progress"))
     flush_drain_active = bool(status.get("flush_drain_active"))
+    keyboard_hook_installed_raw = status.get("keyboard_hook_installed")
+    keyboard_hook_unavailable = keyboard_hook_installed_raw is False
     blocked = bool(status.get("blocked"))
     summary_admission_paused = bool(status.get("summary_admission_paused"))
     process_backlog_only_while_locked = bool(status.get("process_backlog_only_while_locked"))
@@ -97,6 +99,9 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
             detail_lines.append("Reason: capture paused")
     elif state_label == "Stopped":
         detail_lines.append("Reason: capture stopped")
+
+    if keyboard_hook_unavailable and monitoring_requested and not shutdown_in_progress:
+        detail_lines.append("Warn: kb hook unavailable")
 
     detail_lines.append(_format_capture_line(pending_screenshots, pending_text_segments))
 

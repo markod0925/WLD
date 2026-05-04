@@ -121,3 +121,15 @@ def test_verbose_legacy_phrases_absent() -> None:
     assert "processing 1 summary" not in tooltip
     assert "Backlog waiting for PC lock" not in tooltip
     assert "raw keys buffered" not in tooltip
+
+
+def test_keyboard_hook_unavailable_warning_is_present() -> None:
+    tooltip = format_tray_tooltip(
+        build_tray_status_snapshot(
+            _base_status(
+                keyboard_hook_installed=False,
+                pending_screenshot_count=1,
+            )
+        )
+    )
+    assert "Warn: kb hook unavailable" in tooltip
