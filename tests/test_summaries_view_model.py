@@ -121,3 +121,63 @@ def test_build_day_summary_view_combines_day_cards_and_recap_state() -> None:
     assert view.has_daily_recap is True
     assert view.daily_recap_text == "- did x"
     assert view.daily_recap_created_label is not None
+
+
+def test_build_summary_card_view_formats_task_first_sections() -> None:
+    record = SummaryRecord(
+        id=42,
+        job_id=1,
+        start_ts=1.0,
+        end_ts=2.0,
+        summary_text="fallback",
+        summary_json={
+            "task_candidates": [{"text": "Prepare JIRA update", "confidence": 0.7}],
+            "files_and_documents": [{"path/name": "ginopino.pdf", "status": "read_or_viewed"}],
+            "programs_used": [{"name": "chrome.exe", "confidence": 1.0}],
+            "conversations_or_references": [{"reference": "ginopino.pdf - Google Chrome"}],
+            "outcomes": [{"text": "Collected references for update"}],
+            "jira_update_candidates": [{"text": "Post references in WLD-42"}],
+            "unknowns_and_privacy_limits": ["Content not captured because browser is blocked."],
+        },
+        created_ts=3.0,
+    )
+
+    card = build_summary_card_view(record)
+
+    assert card.summary_text.startswith("Task / Workstream:")
+    assert "Files:" in card.summary_text
+    assert "Programs:" in card.summary_text
+    assert "Conversations / References:" in card.summary_text
+    assert "Outcome:" in card.summary_text
+    assert "JIRA candidate:" in card.summary_text
+    assert "Evidence limits:" in card.summary_text
+    assert card.major_activities == []
+    assert card.blocked_notes == []
+    assert card.uncertainty_notes == []
+
+
+def test_build_day_summary_view_formats_daily_recap_task_file_first() -> None:
+    target_day = date(2026, 4, 10)
+    daily = DailySummaryRecord(
+        id=5,
+        day=target_day,
+        recap_text="fallback recap",
+        recap_json={
+            "workstreams_or_task_candidates": [{"text": "Finalize audit notes"}],
+            "files_and_documents": [{"path/name": "ginopino.pdf", "status": "read_or_viewed"}],
+            "conversations_meetings_and_references": [{"reference": "Design review - Teams"}],
+            "program_activity_breakdown": [{"program": "code.exe"}, {"program": "teams.exe"}],
+            "outcomes": [{"text": "Prepared concise recap"}],
+            "follow_ups_or_jira_candidates": [{"text": "Update WLD-77"}],
+            "evidence_limits_and_unknowns": ["Blocked app content was not captured."],
+        },
+        source_batch_count=2,
+        created_ts=140.0,
+    )
+    view = build_day_summary_view(day=target_day, summaries=[], daily_summary=daily)
+
+    assert view.daily_recap_text is not None
+    assert view.daily_recap_text.startswith("Workstreams / task candidates:")
+    assert "Files and documents:" in view.daily_recap_text
+    assert "Program activity breakdown:" in view.daily_recap_text
+    assert "Evidence limits and unknowns:" in view.daily_recap_text

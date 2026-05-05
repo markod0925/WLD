@@ -242,6 +242,42 @@ def test_lmstudio_client_daily_recap_uses_structured_schema(monkeypatch: pytest.
     assert parsed["metadata"]["response_kind"] == "daily_recap"
 
 
+def test_lmstudio_client_daily_recap_accepts_task_file_first_sections(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    response = FakeResponse(
+        '{"executive_summary":"daily recap",'
+        '"workstreams_or_task_candidates":[{"text":"Finalize export notes"}],'
+        '"files_and_documents":[{"path/name":"ginopino.pdf","status":"read_or_viewed"}],'
+        '"conversations_meetings_and_references":[{"reference":"Backend review - Webex"}],'
+        '"program_activity_breakdown":[{"program":"code.exe"}],'
+        '"outcomes":[{"text":"Prepared update draft"}],'
+        '"follow_ups_or_jira_candidates":[{"text":"Update WLD-7"}],'
+        '"evidence_limits_and_unknowns":["Blocked content unavailable"],'
+        '"metadata":{}}'
+    )
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: response)
+
+    recap_text, parsed = client.summarize_daily_recap(
+        day=date(2026, 4, 14),
+        summaries=[
+            SummaryRecord(
+                id=1,
+                job_id=1,
+                start_ts=1.0,
+                end_ts=2.0,
+                summary_text="worked",
+                summary_json={"summary_text": "worked", "key_points": []},
+                created_ts=3.0,
+            )
+        ],
+    )
+
+    assert recap_text == "daily recap"
+    assert parsed["workstreams_or_task_candidates"]
+    assert parsed["files_and_documents"][0]["path/name"] == "ginopino.pdf"
+    assert parsed["evidence_limits_and_unknowns"] == ["Blocked content unavailable"]
+
+
 def test_daily_recap_prompt_requests_short_highlight_list() -> None:
     builder = LMStudioPromptBuilder(max_daily_summaries=5, max_summary_text_segments=20)
     summaries = [
@@ -261,7 +297,8 @@ def test_daily_recap_prompt_requests_short_highlight_list() -> None:
     assert "structured event outputs" in result.prompt_text
     assert "confidence_notes" in result.prompt_text
     assert "executive_summary" in result.prompt_text
-    assert "files_observed" in result.prompt_text
+    assert "workstreams_or_task_candidates" in result.prompt_text
+    assert "files_and_documents" in result.prompt_text
 
 
 def test_summary_prompt_keeps_blocked_intervals_as_unknown_or_blocked() -> None:
@@ -301,8 +338,18 @@ def test_summary_prompt_keeps_blocked_intervals_as_unknown_or_blocked() -> None:
 
     result = builder.build_summary_prompt(batch)
 
-    assert "blocked or unknown" in result.prompt_text
+    assert "blocked content" in result.prompt_text
+    assert "window-title metadata" in result.prompt_text
     assert "blocked_intervals" in result.prompt_text
+
+
+def test_summary_prompt_prioritizes_task_and_file_sections_before_program_prose() -> None:
+    builder = LMStudioPromptBuilder()
+    result = builder.build_summary_prompt(_summary_batch())
+
+    assert "task_candidates, files_and_documents, conversations_or_references, programs_used" in result.prompt_text
+    assert "Do not lead with generic program prose unless no better evidence exists." in result.prompt_text
+    assert "blocked_observed_references" in result.prompt_text
 
 
 def test_lmstudio_client_degrades_generic_event_to_unknowns(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,6 +367,48 @@ def test_lmstudio_client_degrades_generic_event_to_unknowns(monkeypatch: pytest.
     assert parsed["evidence_quality"]["overall_confidence"] == 0.1
     assert parsed["files"] == []
     assert parsed["task_candidates"] == []
+
+
+def test_lmstudio_client_accepts_new_event_structured_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    response = FakeResponse(
+        '{"summary_text":"task-focused","task_candidates":[{"text":"Prepare JIRA update"}],'
+        '"files_and_documents":[{"path/name":"ginopino.pdf","status":"read_or_viewed"}],'
+        '"conversations_or_references":[{"reference":"Backend review - Webex"}],'
+        '"blocked_observed_references":[{"process":"chrome.exe","window_title":"ginopino.pdf - Google Chrome","inferred_reference_type":"pdf","content_captured":false,"metadata_used":true}],'
+        '"jira_update_candidates":[{"text":"Update WLD-101"}],'
+        '"unknowns_and_privacy_limits":["Blocked browser content unavailable"],'
+        '"programs_used":[{"name":"chrome.exe"}],'
+        '"outcomes":[{"text":"Collected references"}],'
+        '"follow_ups":[{"text":"Post update"}],'
+        '"evidence_quality":{"overall_confidence":0.8,"confidence_notes":[],"field_confidence":{}},'
+        '"metadata":{}}'
+    )
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: response)
+
+    _summary_text, parsed = client.summarize_batch(_summary_batch())
+
+    assert parsed["task_candidates"]
+    assert parsed["files_and_documents"][0]["path/name"] == "ginopino.pdf"
+    assert parsed["blocked_observed_references"][0]["content_captured"] is False
+    assert parsed["unknowns_and_privacy_limits"] == ["Blocked browser content unavailable"]
+
+
+def test_lmstudio_client_program_only_event_keeps_generic_summary_with_unknowns(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    response = FakeResponse(
+        '{"summary_text":"Worked in Chrome","programs_used":[{"name":"chrome.exe"}],'
+        '"task_candidates":[],"files":[],"conversations":[],"outcomes":[],"follow_ups":[],"unknowns":[],"blocked_activity":[],'
+        '"evidence_quality":{"overall_confidence":0.2,"confidence_notes":["program-only evidence"],"field_confidence":{}},'
+        '"metadata":{}}'
+    )
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: response)
+
+    summary_text, parsed = client.summarize_batch(_summary_batch())
+
+    assert summary_text == "Worked in Chrome"
+    assert parsed["programs_used"] == [{"name": "chrome.exe"}]
+    assert parsed["unknowns"] == ["insufficient evidence"]
 
 
 def test_prompt_builder_limits_daily_recap_prompt_budget() -> None:

@@ -3,18 +3,39 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from statistics import mean
 from typing import Any, Callable
+
+from work_diary_readiness import (
+    build_work_diary_readiness,
+    render_work_diary_compare_deltas,
+    render_work_diary_section,
+)
 
 
 BUCKET_ORDER = ("excellent", "good", "weak", "poor")
 ENTITY_FILE_TYPES = {"file_path", "file_name", "folder_path"}
 TASK_ENTITY_HINTS = ("task", "ticket")
 CONVERSATION_ENTITY_TYPES = {"conversation_subject", "mail_subject", "web_page_title"}
+TITLE_ONLY_ENTITY_TYPES = {
+    "conversation_subject",
+    "mail_subject",
+    "web_page_title",
+    "title_subject_candidate",
+}
+TICKET_LABEL_RE = re.compile(r"\b[A-Z]{2,}[A-Z0-9]*-\d+\b")
+WINDOW_SUFFIX_RE = re.compile(
+    r"\s*-\s*(?:Microsoft\s+Edge|Google\s+Chrome|Outlook|Message\s+\(HTML\)|"
+    r"File\s+Explorer|Notepad\+\+|Word|Webex|Teams|LM\s+Studio|Profile\s+\d+)\s*$",
+    re.IGNORECASE,
+)
+WINDOW_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*:\s*", re.IGNORECASE)
 
 
 class AuditExportAnalysisError(RuntimeError):
@@ -65,6 +86,118 @@ class BundleMetrics:
     conversation_entity_count: int
     date_range_start: str | None
     date_range_end: str | None
+    work_diary_readiness: "WorkDiaryReadinessMetrics | None" = None
+
+
+@dataclass(slots=True)
+class DailyReadinessRow:
+    day: str
+    event_summary_count: int
+    daily_summary_present: bool
+    average_evidence_quality: float
+    evidence_bucket_counts: dict[str, int]
+    top_programs: list[tuple[str, int]]
+    top_files: list[tuple[str, int, str]]
+    top_task_candidates: list[tuple[str, int, str]]
+    top_conversation_subjects: list[tuple[str, int, str]]
+    unknown_evidence_count: int
+    unclassified_evidence_count: int
+    blocked_or_privacy_heavy_count: int
+    classification: str
+    diary_useful: bool
+    rationale: list[str]
+
+
+@dataclass(slots=True)
+class ProgramBreakdownRow:
+    program: str
+    summary_count: int
+    day_count: int
+    first_seen: str | None
+    last_seen: str | None
+    linked_files: list[tuple[str, int, str]]
+    linked_task_candidates: list[tuple[str, int, str]]
+    linked_conversations: list[tuple[str, int, str]]
+    evidence_bucket_counts: dict[str, int]
+    unknown_rows: int
+    unclassified_evidence_count: int
+    unknown_ratio: float
+    role: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class FileEvidenceRow:
+    entity_type: str
+    label: str
+    first_seen: str | None
+    last_seen: str | None
+    days_seen: int
+    linked_processes: list[str]
+    linked_summaries: list[int]
+    status: str
+    confidence: float
+    supporting_evidence_sources: list[str]
+
+
+@dataclass(slots=True)
+class ConversationEvidenceRow:
+    entity_type: str
+    title: str
+    app_process: str
+    first_seen: str | None
+    last_seen: str | None
+    linked_files: list[str]
+    linked_tasks: list[str]
+    content_known: bool
+    confidence: float
+    note: str
+
+
+@dataclass(slots=True)
+class TaskClusterRow:
+    task_label: str
+    related_programs: list[str]
+    related_files: list[str]
+    related_conversations: list[str]
+    related_days: list[str]
+    suggested_diary_interpretation: str
+    confidence: float
+    evidence_refs: list[str]
+
+
+@dataclass(slots=True)
+class JiraCandidateRow:
+    project_or_program: str
+    task_label: str
+    suggested_update_text: str
+    suggested_subtasks: list[str]
+    supporting_evidence: list[str]
+    confidence: str
+    caveats: list[str]
+
+
+@dataclass(slots=True)
+class WorkDiaryReadinessMetrics:
+    day_reports: list[DailyReadinessRow]
+    program_reports: list[ProgramBreakdownRow]
+    file_reports: list[FileEvidenceRow]
+    conversation_reports: list[ConversationEvidenceRow]
+    task_clusters: list[TaskClusterRow]
+    jira_candidates: list[JiraCandidateRow]
+    jira_ready_day_count: int
+    partially_ready_day_count: int
+    weak_day_count: int
+    not_ready_day_count: int
+    file_evidence_group_count: int
+    likely_edited_file_group_count: int
+    task_cluster_count: int
+    conversation_group_count: int
+    unknown_unclassified_count: int
+    missing_daily_recap_count: int
+    degraded_payload_count: int
+    parser_coverage_gap_count: int
+    average_evidence_quality_score: float
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -276,6 +409,383 @@ def _build_top_unknown_window_patterns(data: BundleData) -> list[tuple[str, int]
         label_for_row=lambda row: f"{_safe_str(row.get('process_name') or row.get('normalized_process_name'))}: {_safe_str(row.get('window_title') or row.get('normalized_window_title'))}",
         limit=5,
     )
+
+
+def _parse_attributes_json(row: dict[str, Any]) -> dict[str, Any]:
+    attributes = row.get("attributes_json")
+    if isinstance(attributes, dict):
+        return attributes
+    if isinstance(attributes, str) and attributes.strip():
+        try:
+            parsed = json.loads(attributes)
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _row_day(row: dict[str, Any]) -> str:
+    return _safe_str(row.get("day"))
+
+
+def _row_summary_id(row: dict[str, Any]) -> int | None:
+    summary_id = row.get("summary_id")
+    if summary_id is None:
+        return None
+    try:
+        return int(summary_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_start_ts(row: dict[str, Any]) -> float:
+    return _safe_float(row.get("start_ts"), default=0.0)
+
+
+def _row_end_ts(row: dict[str, Any]) -> float:
+    return _safe_float(row.get("end_ts"), default=0.0)
+
+
+def _row_confidence(row: dict[str, Any]) -> float:
+    return _safe_float(row.get("confidence"), default=0.0)
+
+
+def _row_entity_type(row: dict[str, Any]) -> str:
+    return _safe_str(row.get("entity_type"))
+
+
+def _row_entity_value(row: dict[str, Any]) -> str:
+    return _safe_str(row.get("entity_value") or row.get("entity_normalized"))
+
+
+def _row_process_name(row: dict[str, Any]) -> str:
+    return _safe_str(row.get("process_name") or row.get("normalized_process_name"))
+
+
+def _row_source_kind(row: dict[str, Any]) -> str:
+    return _safe_str(row.get("source_kind"))
+
+
+def _row_source_ref(row: dict[str, Any]) -> str:
+    return _safe_str(row.get("source_ref"))
+
+
+def _row_label_counts(rows: list[tuple[str, int]], *, limit: int = 5) -> str:
+    return _format_ranked_items(rows, limit=limit)
+
+
+def _row_label_counts_with_type(rows: list[tuple[str, int, str]], *, limit: int = 5) -> str:
+    return _format_ranked_items_with_type(rows, limit=limit)
+
+
+def _format_time_range(first_seen: str | None, last_seen: str | None) -> str:
+    if first_seen and last_seen:
+        if first_seen == last_seen:
+            return f"`{first_seen}`"
+        return f"`{first_seen}` to `{last_seen}`"
+    if first_seen:
+        return f"`{first_seen}`"
+    if last_seen:
+        return f"`{last_seen}`"
+    return "n/a"
+
+
+def _format_list(values: list[str], *, limit: int = 5) -> str:
+    if not values:
+        return "none"
+    selected = values[:limit]
+    return ", ".join(f"`{item}`" for item in selected)
+
+
+def _format_int_list(values: list[int], *, limit: int = 5) -> str:
+    if not values:
+        return "none"
+    selected = values[:limit]
+    return ", ".join(f"`{value}`" for value in selected)
+
+
+def _format_summary_ids(summary_ids: list[int], *, limit: int = 6) -> str:
+    if not summary_ids:
+        return "none"
+    selected = summary_ids[:limit]
+    return ", ".join(f"`{summary_id}`" for summary_id in selected)
+
+
+def _canonical_title(value: str) -> str:
+    text = _safe_str(value)
+    if not text:
+        return ""
+    text = WINDOW_PREFIX_RE.sub("", text)
+    text = WINDOW_SUFFIX_RE.sub("", text)
+    text = text.strip(" -")
+    return text.strip()
+
+
+def _normalize_cluster_label(value: str) -> str:
+    return _safe_str(value).casefold()
+
+
+def _is_generic_task_label(value: str) -> bool:
+    label = _safe_str(value)
+    if not label:
+        return True
+    lowered = label.casefold()
+    if lowered in {"file", "folder", "project", "projects", "untitled", "webex", "microsoft outlook", "outlook", "program manager"}:
+        return True
+    if lowered.isdigit():
+        return True
+    return len(lowered) < 3
+
+
+def _clean_path_label(path_value: str) -> list[str]:
+    labels: list[str] = []
+    path = _safe_str(path_value)
+    if not path:
+        return labels
+    path_obj = PureWindowsPath(path)
+    segments = [segment for segment in path_obj.parts if segment not in {"\\", "/"}]
+    if path_obj.stem and not _is_generic_task_label(path_obj.stem):
+        labels.append(path_obj.stem)
+    if path_obj.name and not _is_generic_task_label(path_obj.name):
+        labels.append(path_obj.name)
+    if path_obj.parent and str(path_obj.parent) not in {path, "."}:
+        parent_name = path_obj.parent.name
+        if parent_name and not _is_generic_task_label(parent_name):
+            labels.append(parent_name)
+    for segment in segments:
+        if _is_generic_task_label(segment):
+            continue
+        if segment.lower() in {"users", "desktop", "documents", "downloads", "projects", "proj", "tools"}:
+            continue
+        labels.append(segment)
+    for match in TICKET_LABEL_RE.findall(path):
+        labels.append(match.upper())
+    return list(dict.fromkeys(labels))
+
+
+def _clean_title_label(title: str) -> list[str]:
+    labels: list[str] = []
+    clean = _canonical_title(title)
+    if not clean:
+        return labels
+    for match in TICKET_LABEL_RE.findall(clean):
+        labels.append(match.upper())
+    if not _is_generic_task_label(clean):
+        labels.append(clean)
+    return list(dict.fromkeys(labels))
+
+
+def _unique_strings(values: list[str], *, limit: int | None = None) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        label = _safe_str(value)
+        if not label:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(label)
+        if limit is not None and len(result) >= limit:
+            break
+    return result
+
+
+def _summaries_by_day(summaries: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in summaries:
+        day = _row_day(row)
+        if day:
+            grouped[day].append(row)
+    for rows in grouped.values():
+        rows.sort(key=lambda item: (_row_start_ts(item), _row_summary_id(item) or 0))
+    return grouped
+
+
+def _quality_rows_by_day(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        day = _row_day(row)
+        if day and _safe_str(row.get("summary_kind") or "event") == "event":
+            grouped[day].append(row)
+    for items in grouped.values():
+        items.sort(key=lambda item: (_row_start_ts(item), _row_summary_id(item) or 0))
+    return grouped
+
+
+def _parser_rows_by_day(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        day = _row_day(row)
+        if day:
+            grouped[day].append(row)
+    for items in grouped.values():
+        items.sort(key=lambda item: (_row_start_ts(item), _row_summary_id(item) or 0))
+    return grouped
+
+
+def _activity_entities_by_day(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        day = _row_day(row)
+        if day:
+            grouped[day].append(row)
+    for items in grouped.values():
+        items.sort(key=lambda item: (_row_start_ts(item), _row_summary_id(item) or 0, _row_entity_type(item), _row_entity_value(item)))
+    return grouped
+
+
+def _confidence_label(value: float) -> str:
+    if value >= 0.8:
+        return "high"
+    if value >= 0.55:
+        return "medium"
+    return "low"
+
+
+def _quality_bucket_value(counts: dict[str, int], bucket: str) -> int:
+    return _safe_int(counts.get(bucket), default=0)
+
+
+def _score_day_readiness(
+    *,
+    average_score: float,
+    daily_summary_present: bool,
+    has_file_evidence: bool,
+    has_task_evidence: bool,
+    has_conversation_evidence: bool,
+    unknown_count: int,
+    unclassified_count: int,
+    blocked_or_privacy_heavy_count: int,
+    bucket_counts: dict[str, int],
+) -> tuple[str, bool, list[str], float]:
+    total_rows = sum(bucket_counts.get(bucket, 0) for bucket in BUCKET_ORDER)
+    weak_or_poor = bucket_counts.get("weak", 0) + bucket_counts.get("poor", 0)
+    unknown_pressure = (unknown_count + unclassified_count) / max(1, total_rows)
+    support_score = average_score
+    if daily_summary_present:
+        support_score += 0.06
+    if has_file_evidence:
+        support_score += 0.05
+    if has_task_evidence:
+        support_score += 0.05
+    if has_conversation_evidence:
+        support_score += 0.04
+    if blocked_or_privacy_heavy_count:
+        support_score -= min(0.08, blocked_or_privacy_heavy_count / max(1, total_rows) * 0.08)
+    support_score -= min(0.2, unknown_pressure * 0.2)
+    support_score = max(0.0, min(1.0, support_score))
+
+    rationale: list[str] = []
+    if daily_summary_present:
+        rationale.append("daily summary present")
+    else:
+        rationale.append("daily summary missing")
+    if has_file_evidence:
+        rationale.append("file evidence present")
+    if has_task_evidence:
+        rationale.append("task evidence present")
+    if has_conversation_evidence:
+        rationale.append("conversation evidence present")
+    if blocked_or_privacy_heavy_count:
+        rationale.append(f"{blocked_or_privacy_heavy_count} blocked/privacy-heavy summaries")
+    if unknown_count or unclassified_count:
+        rationale.append(f"unknown/unclassified evidence {unknown_count + unclassified_count}")
+    if weak_or_poor:
+        rationale.append(f"{weak_or_poor} weak/poor summaries")
+
+    classification = "not_ready"
+    diary_useful = False
+    if total_rows == 0:
+        return classification, diary_useful, rationale, support_score
+    if daily_summary_present and support_score >= 0.72 and (has_file_evidence or has_task_evidence or has_conversation_evidence) and weak_or_poor <= max(1, total_rows // 5):
+        classification = "jira_ready"
+        diary_useful = True
+    elif support_score >= 0.5 and (has_file_evidence or has_task_evidence or has_conversation_evidence):
+        classification = "partially_ready"
+        diary_useful = True
+    elif average_score >= 0.3 or has_file_evidence or has_task_evidence or has_conversation_evidence:
+        classification = "weak"
+    return classification, diary_useful, rationale, support_score
+
+
+def _role_for_program(program: str, *, linked_files: list[tuple[str, int, str]], linked_tasks: list[tuple[str, int, str]], linked_conversations: list[tuple[str, int, str]]) -> str:
+    lowered = program.casefold()
+    if lowered in {"outlook.exe", "ciscocollabhost.exe"} or len(linked_conversations) > len(linked_files):
+        return "communication_tool"
+    if lowered == "explorer.exe" or (linked_files and len(linked_files) >= len(linked_tasks) + len(linked_conversations)):
+        return "navigation_file_management"
+    if linked_files or linked_tasks or linked_conversations:
+        return "primary_work_tool"
+    return "unknown_tool"
+
+
+def _file_status_for_group(entity_type: str, attributes: list[dict[str, Any]], source_kinds: set[str]) -> tuple[str, float]:
+    explicit_saved = any(
+        bool(attr.get("saved_or_modified"))
+        or bool(attr.get("saved"))
+        or bool(attr.get("modified"))
+        or bool(attr.get("was_saved"))
+        for attr in attributes
+    )
+    dirty_marker = any(bool(attr.get("dirty_marker")) for attr in attributes)
+    likely_edited = any(bool(attr.get("likely_edited")) for attr in attributes)
+    if explicit_saved:
+        return "saved_or_modified", 0.95
+    if dirty_marker or likely_edited:
+        return "likely_edited", 0.9 if entity_type == "file_path" else 0.85
+    if entity_type == "file_path":
+        return "observed", 0.78
+    if entity_type == "folder_path":
+        return "referenced", 0.65
+    if entity_type == "file_name":
+        return "referenced", 0.62
+    if source_kinds:
+        return "observed", 0.55
+    return "unknown", 0.4
+
+
+def _build_summary_text_token_labels(text: str) -> list[str]:
+    labels = _clean_title_label(text)
+    path_labels = _clean_path_label(text)
+    combined = labels[:]
+    for label in path_labels:
+        if label not in combined:
+            combined.append(label)
+    return combined
+
+
+def _extract_cluster_labels_from_entity(row: dict[str, Any]) -> list[str]:
+    entity_type = _row_entity_type(row)
+    value = _row_entity_value(row)
+    labels: list[str] = []
+    if not value:
+        return labels
+    if entity_type in {"task_candidate", "project_candidate"}:
+        if not _is_generic_task_label(value):
+            labels.append(value)
+    elif entity_type in ENTITY_FILE_TYPES:
+        labels.extend(_clean_path_label(value))
+    elif entity_type in CONVERSATION_ENTITY_TYPES:
+        labels.extend(_build_summary_text_token_labels(value))
+    else:
+        labels.extend(_build_summary_text_token_labels(value))
+    return _unique_strings(labels)
+
+
+def _group_top_items_from_labels(items: list[tuple[str, int, str]], *, limit: int = 5) -> list[str]:
+    ranked = [f"{label} [{item_type}] ({count})" for label, count, item_type in items[:limit]]
+    return ranked
+
+
+def _join_processes(processes: list[str], *, limit: int = 5) -> str:
+    return _format_list(_unique_strings(processes, limit=limit), limit=limit)
+
+
+def _join_labels(labels: list[str], *, limit: int = 5) -> str:
+    return _format_list(_unique_strings(labels, limit=limit), limit=limit)
 
 
 def analyze_bundle(data: BundleData) -> BundleMetrics:
@@ -499,6 +1009,9 @@ def _format_date_range(metrics: BundleMetrics) -> str:
 
 
 def _render_current_report(metrics: BundleMetrics) -> str:
+    work_diary_sections: list[str] = []
+    if metrics.work_diary_readiness is not None:
+        work_diary_sections = render_work_diary_section(metrics.work_diary_readiness)
     sections = [
         "# WLD Audit Export Analysis",
         "",
@@ -513,6 +1026,8 @@ def _render_current_report(metrics: BundleMetrics) -> str:
         f"- Top conversation/mail/web subjects: {_format_ranked_items_with_type(metrics.top_conversation_subjects)}",
         f"- Top unknown processes: {_format_ranked_items(metrics.top_unknown_processes)}",
         f"- Top unknown window patterns: {_format_ranked_items(metrics.top_unknown_window_patterns)}",
+        "",
+        *work_diary_sections,
         "",
         "## Gaps",
         f"- Days with event summaries but missing daily recap: {', '.join(f'`{day}`' for day in metrics.missing_daily_recap_days) if metrics.missing_daily_recap_days else 'none'}",
@@ -532,6 +1047,12 @@ def _render_compare_report(current: BundleMetrics, baseline: BundleMetrics) -> s
     file_delta = current.file_entity_count - baseline.file_entity_count
     task_delta = current.task_candidate_count - baseline.task_candidate_count
     conversation_delta = current.conversation_entity_count - baseline.conversation_entity_count
+    current_work_diary: list[str] = []
+    baseline_work_diary: list[str] = []
+    if current.work_diary_readiness is not None:
+        current_work_diary = render_work_diary_section(current.work_diary_readiness)
+    if baseline.work_diary_readiness is not None:
+        baseline_work_diary = render_work_diary_section(baseline.work_diary_readiness)
 
     sections = [
         "# WLD Audit Export Analysis",
@@ -541,6 +1062,8 @@ def _render_compare_report(current: BundleMetrics, baseline: BundleMetrics) -> s
         "",
         "## Current Snapshot",
         * _render_metric_block(current),
+        "",
+        *current_work_diary,
         "",
         "## Delta vs Baseline",
         f"- Summary count delta: `{_format_signed_int(current.event_summary_count - baseline.event_summary_count)}`",
@@ -553,6 +1076,12 @@ def _render_compare_report(current: BundleMetrics, baseline: BundleMetrics) -> s
         f"- File/task/conversation entity deltas: files `{_format_signed_int(file_delta)}`, task candidates `{_format_signed_int(task_delta)}`, conversation/mail/web subjects `{_format_signed_int(conversation_delta)}`",
         f"- Missing daily recap delta: `{_format_signed_int(len(current.missing_daily_recap_days) - len(baseline.missing_daily_recap_days))}`",
         "",
+        "## Work Diary / JIRA Readiness Delta",
+        *([f"- {item}" for item in render_work_diary_compare_deltas(current.work_diary_readiness, baseline.work_diary_readiness)] if current.work_diary_readiness is not None and baseline.work_diary_readiness is not None else ["- Work diary readiness metrics unavailable for one or both bundles."]),
+        "",
+        "## Baseline Work Diary / JIRA Readiness",
+        *(baseline_work_diary if baseline_work_diary else ["- unavailable"]),
+        "",
         "## Recommendations",
         *[f"- {item}" for item in _recommendations(current)],
     ]
@@ -560,10 +1089,14 @@ def _render_compare_report(current: BundleMetrics, baseline: BundleMetrics) -> s
 
 
 def build_report(bundle_dir: Path, compare_dir: Path | None = None) -> str:
-    current = analyze_bundle(_load_bundle(bundle_dir))
+    current_data = _load_bundle(bundle_dir)
+    current = analyze_bundle(current_data)
+    current.work_diary_readiness = build_work_diary_readiness(current_data)
     if compare_dir is None:
         return _render_current_report(current)
-    baseline = analyze_bundle(_load_bundle(compare_dir))
+    baseline_data = _load_bundle(compare_dir)
+    baseline = analyze_bundle(baseline_data)
+    baseline.work_diary_readiness = build_work_diary_readiness(baseline_data)
     return _render_compare_report(current, baseline)
 
 

@@ -35,6 +35,23 @@ def _make_bundle(path: Path, *, include_optional: bool = True) -> None:
         {"day": "2026-04-20", "daily_summary_id": 10},
         {"day": "2026-04-22", "daily_summary_id": 11},
     ]
+    for index, row in enumerate(summaries):
+        day = row["day"]
+        if day == "2026-04-20":
+            row.setdefault("process_name", "code.exe")
+            row.setdefault("normalized_process_name", "code.exe")
+        elif day == "2026-04-21":
+            row.setdefault("process_name", "FooTool.exe")
+            row.setdefault("normalized_process_name", "footool.exe")
+        else:
+            row.setdefault("process_name", "code.exe")
+            row.setdefault("normalized_process_name", "code.exe")
+        row.setdefault("start_ts", float(index * 10 + 1))
+        row.setdefault("end_ts", float(index * 10 + 2))
+    for index, row in enumerate(daily):
+        row.setdefault("start_ts", float(index * 10 + 100))
+        row.setdefault("end_ts", float(index * 10 + 101))
+
     activity_entities = [
         {"entity_type": "program", "entity_value": "code.exe", "entity_normalized": "code.exe", "source_kind": "process_name", "source_ref": "code.exe", "confidence": 1.0},
         {"entity_type": "program", "entity_value": "code.exe", "entity_normalized": "code.exe", "source_kind": "process_name", "source_ref": "code.exe", "confidence": 1.0},
@@ -150,6 +167,29 @@ def _make_bundle(path: Path, *, include_optional: bool = True) -> None:
             "unknown_app": True,
         },
     ]
+    # Attach day/summary metadata so the readiness analysis can reconstruct diary structure.
+    for index, row in enumerate(activity_entities):
+        if index < 9:
+            row.setdefault("day", "2026-04-20")
+            row.setdefault("summary_id", 1 if index < 4 else 2)
+            row.setdefault("start_ts", float(index + 1))
+            row.setdefault("end_ts", float(index + 1.5))
+        elif index < 13:
+            row.setdefault("day", "2026-04-20")
+            row.setdefault("summary_id", 2)
+            row.setdefault("start_ts", float(index + 1))
+            row.setdefault("end_ts", float(index + 1.5))
+        else:
+            row.setdefault("day", "2026-04-22")
+            row.setdefault("summary_id", 6)
+            row.setdefault("start_ts", float(index + 1))
+            row.setdefault("end_ts", float(index + 1.5))
+    for index, row in enumerate(parser_coverage):
+        row.setdefault("day", "2026-04-21")
+        row.setdefault("summary_id", 3 if index == 0 else 4 if index == 1 else 5)
+        row.setdefault("start_ts", float(index + 1))
+        row.setdefault("end_ts", float(index + 1.5))
+
     low_confidence = [
         {"entity_type": "task_candidate", "entity_value": "ABC-1234", "entity_normalized": "abc-1234", "source_kind": "window_title", "source_ref": "Editor", "confidence": 0.77},
         {"entity_type": "mail_subject", "entity_value": "RE: Project Phoenix", "entity_normalized": "re: project phoenix", "source_kind": "window_title", "source_ref": "Mail", "confidence": 0.78},
@@ -599,3 +639,117 @@ def test_top_entity_aggregation(tmp_path: Path) -> None:
     assert "`Project Phoenix` (2) [conversation_subject]" in stdout
     assert "`RE: Project Phoenix` (1) [mail_subject]" in stdout
     assert "`Daily build notes` (2) [web_page_title]" in stdout
+
+
+def _read_jsonl_rows(path: Path) -> list[dict]:
+    rows = []
+    for line in path.read_text(encoding='utf-8').splitlines():
+        stripped = line.strip()
+        if stripped:
+            rows.append(json.loads(stripped))
+    return rows
+
+
+def test_work_diary_section_reports_readiness_and_title_only_signals(tmp_path: Path) -> None:
+    bundle = tmp_path / "current"
+    _make_bundle(bundle)
+
+    result = _run(bundle)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "## Work Diary / JIRA Readiness" in stdout
+    assert "2026-04-20: class `jira_ready`" in stdout
+    assert "2026-04-21: class `weak`" in stdout
+    assert "2026-04-22: class `jira_ready`" in stdout
+    assert "status `observed`" in stdout
+    assert "content_known `false` (title_only)" in stdout
+    assert "confidence `medium`" in stdout
+    assert "caveats No direct file evidence; No linked conversation evidence" in stdout
+
+
+def test_dirty_marker_files_are_reported_as_likely_edited(tmp_path: Path) -> None:
+    bundle = tmp_path / "dirty-marker"
+    _make_bundle(bundle)
+
+    activity_path = bundle / "activity_entities.jsonl"
+    rows = _read_jsonl_rows(activity_path)
+    for row in rows:
+        if row.get("entity_type") == "file_path" and row.get("entity_normalized") == r"u:\proj1\xxx\data\input_cases.m":
+            row["attributes_json"] = {"dirty_marker": True}
+    _write_jsonl(activity_path, rows)
+
+    result = _run(bundle)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "status `likely_edited`" in stdout
+    assert "dirty_marker" in stdout
+    assert "saved_or_modified" not in stdout
+
+
+def test_task_clustering_joins_file_folder_and_conversation_subjects(tmp_path: Path) -> None:
+    bundle = tmp_path / "cluster"
+    bundle.mkdir(parents=True, exist_ok=True)
+
+    summaries = [
+        {"summary_id": 1, "day": "2026-04-20", "summary_text": "task work", "process_name": "code.exe", "normalized_process_name": "code.exe", "start_ts": 100.0, "end_ts": 110.0},
+    ]
+    daily = [{"day": "2026-04-20", "daily_summary_id": 10, "start_ts": 200.0, "end_ts": 210.0}]
+    activity_entities = [
+        {"summary_id": 1, "day": "2026-04-20", "start_ts": 100.0, "end_ts": 101.0, "entity_type": "program", "entity_value": "code.exe", "entity_normalized": "code.exe", "source_kind": "process_name", "source_ref": "code.exe", "confidence": 1.0},
+        {"summary_id": 1, "day": "2026-04-20", "start_ts": 101.0, "end_ts": 102.0, "entity_type": "file_path", "entity_value": r"U:\PROJ\TaskOne\src\TaskOne.m", "entity_normalized": r"u:\proj\taskone\src\taskone.m", "source_kind": "window_title", "source_ref": "Editor", "confidence": 0.96},
+        {"summary_id": 1, "day": "2026-04-20", "start_ts": 101.5, "end_ts": 102.5, "entity_type": "folder_path", "entity_value": r"U:\PROJ\TaskOne\src", "entity_normalized": r"u:\proj\taskone\src", "source_kind": "window_title", "source_ref": "Editor", "confidence": 0.95},
+        {"summary_id": 1, "day": "2026-04-20", "start_ts": 102.0, "end_ts": 103.0, "entity_type": "conversation_subject", "entity_value": "TaskOne", "entity_normalized": "taskone", "source_kind": "window_title", "source_ref": "Mail", "confidence": 0.91},
+    ]
+    parser_coverage = [{"summary_id": 1, "day": "2026-04-20", "start_ts": 100.0, "end_ts": 110.0, "process_name": "code.exe", "normalized_process_name": "code.exe", "window_title": "Editor - TaskOne.m", "normalized_window_title": "editor - taskone.m", "matched_parser_names": ["generic_window"], "used_generic_parser": True, "used_specialized_parser": False, "extracted_entity_count": 3, "unclassified_evidence_count": 0, "parser_confidence": 0.9, "unknown_app": False}]
+    unknown_apps = []
+    unknown_window_patterns = []
+    low_confidence = []
+    evidence_quality = [{"summary_id": 1, "day": "2026-04-20", "start_ts": 100.0, "end_ts": 110.0, "score": 0.93, "bucket": "excellent", "strengths": ["file evidence present"], "weaknesses": [], "entity_counts_by_type": {"program": 1, "file_path": 1, "folder_path": 1, "conversation_subject": 1}, "unknown_app": False, "degraded_payload": False, "has_file_evidence": True, "has_task_evidence": False, "has_conversation_evidence": True, "has_text_evidence": True, "has_screenshot_evidence": False, "blocked_or_privacy_heavy": False, "summary_kind": "event", "source_summary_count": None}]
+    evidence_summary = {"summary_count": 1, "event_summary_count": 1, "daily_summary_count": 1, "bucket_counts": {"excellent": 1, "good": 0, "weak": 0, "poor": 0}, "average_score": 0.93, "poor_or_weak_summary_count": 0, "summaries_without_file_or_task_entities": 0, "summaries_with_only_unclassified_evidence": 0, "degraded_payload_count": 0, "unknown_app_count": 0, "top_unknown_processes": [], "top_low_confidence_entity_types": [], "parser_coverage_by_process": [{"process_name": "code.exe", "occurrence_count": 1}]}
+    manifest = {"audit_export_format_version": 1, "exported_at_utc": "2026-04-20T12:00:00Z", "app_version": "test", "export_scope": "summaries_and_coalescing_diagnostics_and_activity_entities_and_parser_coverage_and_evidence_quality", "contains_raw_activity_data": False, "counts": {"summaries.jsonl": 1, "daily_summaries.jsonl": 1, "activity_entities.jsonl": 4, "parser_coverage.jsonl": 1, "unknown_apps.jsonl": 0, "unknown_window_patterns.jsonl": 0, "low_confidence_entities.jsonl": 0, "evidence_quality.jsonl": 1, "evidence_quality_summary.json": 1}, "evidence_quality_count": 1, "evidence_quality_bucket_counts": evidence_summary["bucket_counts"], "average_evidence_quality_score": evidence_summary["average_score"], "poor_or_weak_summary_count": 0}
+
+    _write_jsonl(bundle / "summaries.jsonl", summaries)
+    _write_jsonl(bundle / "daily_summaries.jsonl", daily)
+    _write_jsonl(bundle / "activity_entities.jsonl", activity_entities)
+    _write_jsonl(bundle / "parser_coverage.jsonl", parser_coverage)
+    _write_jsonl(bundle / "unknown_apps.jsonl", unknown_apps)
+    _write_jsonl(bundle / "unknown_window_patterns.jsonl", unknown_window_patterns)
+    _write_jsonl(bundle / "low_confidence_entities.jsonl", low_confidence)
+    _write_jsonl(bundle / "evidence_quality.jsonl", evidence_quality)
+    _write_json(bundle / "evidence_quality_summary.json", evidence_summary)
+    _write_json(bundle / "manifest.json", manifest)
+
+    result = _run(bundle)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "### Task / Job Candidate Clustering" in stdout
+    assert "`TaskOne`" in stdout
+    assert "programs `code.exe`" in stdout
+    assert "files `TaskOne.m`" in stdout or "files `U:\\PROJ\\TaskOne\\src\\TaskOne.m`" in stdout
+    assert "### JIRA Update Candidates" in stdout
+    assert "confidence `medium`" in stdout
+
+
+def test_compare_mode_includes_work_diary_deltas(tmp_path: Path) -> None:
+    current = tmp_path / "current"
+    baseline = tmp_path / "baseline"
+    _make_bundle(current)
+    _make_bundle(baseline, include_optional=False)
+
+    result = _run(current, "--compare", str(baseline))
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout
+    assert "## Work Diary / JIRA Readiness Delta" in stdout
+    assert "jira_ready day count delta: `+2`" in stdout
+    assert "partially_ready day count delta:" in stdout
+    assert "average evidence quality delta:" in stdout
+    assert "file evidence count delta:" in stdout
+    assert "likely_edited count delta:" in stdout
+    assert "task candidate count delta:" in stdout
+    assert "conversation subject count delta:" in stdout
+    assert "unknown/unclassified evidence delta:" in stdout
+    assert "missing daily recap delta:" in stdout

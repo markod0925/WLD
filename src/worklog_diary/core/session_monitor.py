@@ -43,6 +43,52 @@ ATOM = _win_type("ATOM", ctypes.c_ushort)
 WNDPROC_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 
 
+def _bind_win32_function(dll: Any, name: str, argtypes: list[Any], restype: Any) -> Any:
+    func = getattr(dll, name)
+    func.argtypes = argtypes
+    func.restype = restype
+    return func
+
+
+def _configure_win32_bindings(kernel32: Any, user32: Any, wtsapi32: Any) -> None:
+    _bind_win32_function(kernel32, "GetCurrentThreadId", [], DWORD)
+    _bind_win32_function(kernel32, "GetModuleHandleW", [LPCWSTR], HINSTANCE)
+
+    _bind_win32_function(user32, "DefWindowProcW", [HWND, UINT, WPARAM, LPARAM], LRESULT)
+    _bind_win32_function(
+        user32,
+        "CreateWindowExW",
+        [
+            DWORD,
+            LPCWSTR,
+            LPCWSTR,
+            DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            HWND,
+            HMENU,
+            HINSTANCE,
+            ctypes.c_void_p,
+        ],
+        HWND,
+    )
+    _bind_win32_function(user32, "DestroyWindow", [HWND], BOOL)
+    _bind_win32_function(user32, "GetMessageW", [ctypes.POINTER(MSG), HWND, UINT, UINT], ctypes.c_int)
+    _bind_win32_function(user32, "TranslateMessage", [ctypes.POINTER(MSG)], BOOL)
+    _bind_win32_function(user32, "DispatchMessageW", [ctypes.POINTER(MSG)], LRESULT)
+    _bind_win32_function(user32, "PostQuitMessage", [ctypes.c_int], None)
+    _bind_win32_function(user32, "RegisterClassExW", [ctypes.POINTER(WNDCLASSEXW)], ATOM)
+    _bind_win32_function(user32, "UnregisterClassW", [LPCWSTR, HINSTANCE], BOOL)
+    _bind_win32_function(user32, "PostMessageW", [HWND, UINT, WPARAM, LPARAM], BOOL)
+    _bind_win32_function(user32, "PostThreadMessageW", [DWORD, UINT, WPARAM, LPARAM], BOOL)
+    _bind_win32_function(user32, "IsWindow", [HWND], BOOL)
+
+    _bind_win32_function(wtsapi32, "WTSRegisterSessionNotification", [HWND, DWORD], BOOL)
+    _bind_win32_function(wtsapi32, "WTSUnRegisterSessionNotification", [HWND], BOOL)
+
+
 class POINT(ctypes.Structure):
     _fields_ = [
         ("x", ctypes.c_long),
@@ -111,10 +157,12 @@ class SessionMonitor:
         *,
         on_locked: Callable[[], None],
         on_unlocked: Callable[[], None],
+        process_backlog_only_while_locked: bool = True,
     ) -> None:
         self.on_locked = on_locked
         self.on_unlocked = on_unlocked
         self.logger = logging.getLogger(__name__)
+        self._process_backlog_only_while_locked = bool(process_backlog_only_while_locked)
 
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
@@ -123,99 +171,160 @@ class SessionMonitor:
         self._startup_event = threading.Event()
         self._stop_requested = threading.Event()
         self._stop_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._startup_error: str | None = None
         self._startup_error_type: str | None = None
+        self._startup_error_category: str | None = None
         self._startup_last_error: int = 0
         self._wnd_proc_ref: Any | None = None
         self._thread_exit_reason = "unknown"
         self._window_destroyed_logged = False
+        self._notifications_registered = False
+        self._monitor_state = "unknown"
+        self._lock_state = "unknown"
+        self._stop_failure_logged = False
 
     def start(self) -> None:
         if os.name != "nt":
             return
         if self._thread and self._thread.is_alive():
             return
+        if self._monitor_state == "degraded":
+            return
         if native_hooks_disabled():
             self.logger.info("Session monitor disabled in test/native-hook-off mode")
             return
-        self.logger.info("event=session_monitor_start")
+        self.logger.info("event=session_monitor_starting")
 
         self._startup_event.clear()
         self._stop_requested.clear()
-        self._startup_error = None
-        self._startup_error_type = None
-        self._startup_last_error = 0
-        self._thread_exit_reason = "unknown"
-        self._window_destroyed_logged = False
+        with self._state_lock:
+            self._startup_error = None
+            self._startup_error_type = None
+            self._startup_error_category = None
+            self._startup_last_error = 0
+            self._thread_exit_reason = "unknown"
+            self._window_destroyed_logged = False
+            self._notifications_registered = False
+            self._monitor_state = "starting"
+            self._lock_state = "unknown"
+            self._stop_failure_logged = False
+            self._hwnd = None
+            self._thread_id = None
         self._thread = threading.Thread(target=self._run_windows_loop, name="SessionMonitor", daemon=True)
         self._thread.start()
         started = self._startup_event.wait(timeout=5.0)
 
         if not started and self._startup_error is None:
-            self._startup_error_type = "TimeoutError"
-            self._startup_error = "startup_timeout"
-            self._startup_last_error = 0
-            self._thread_exit_reason = "startup_timeout"
-            self.logger.warning(
-                "event=session_monitor_start_failed error_type=%s detail=%s last_error=%s",
-                self._startup_error_type,
-                self._startup_error,
-                self._startup_last_error,
+            self._record_start_failure(
+                error_category="startup_timeout",
+                error_type="TimeoutError",
+                exception_message="startup_timeout",
+                last_error=0,
             )
 
     def stop(self) -> None:
         if os.name != "nt":
             return
 
-        with self._stop_lock:
+        self.logger.info("event=session_monitor_stopping")
+        self._log_backlog_gate_state(
+            lock_state=self._lock_state_label(),
+            backlog_processing_allowed=False,
+            reason="blocked_shutdown",
+        )
+        self._stop_requested.set()
+
+        with self._state_lock:
             thread = self._thread
             hwnd = self._hwnd
             thread_id = self._thread_id
             destroyed_logged = self._window_destroyed_logged
+            notifications_registered = self._notifications_registered
 
-        if thread is None:
+        if thread is None and hwnd is None and not notifications_registered:
+            with self._state_lock:
+                if self._monitor_state != "active":
+                    self._monitor_state = "unavailable"
+            self.logger.info("event=session_monitor_stopped monitor_state=%s", self._monitor_state)
             return
 
-        self._stop_requested.set()
-
+        stop_failed_step: str | None = None
+        stop_failure_message: str | None = None
+        stop_failure_type: str = "RuntimeError"
         try:
             windll = getattr(ctypes, "windll", None)
             if windll is None:
                 raise RuntimeError("ctypes.windll unavailable")
             user32 = windll.user32
             kernel32 = windll.kernel32
+            wtsapi32 = windll.wtsapi32
 
-            posted = False
+            posted = True
             if hwnd:
                 try:
                     user32.PostMessageW(HWND(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0))
-                    posted = True
                 except Exception:
                     posted = False
+                    stop_failed_step = "post_message"
+                    stop_failure_message = "PostMessageW failed"
+                    stop_failure_type = "OSError"
             if not posted and thread_id is not None:
                 try:
                     user32.PostThreadMessageW(DWORD(thread_id), WM_QUIT, WPARAM(0), LPARAM(0))
                     posted = True
                 except Exception:
+                    stop_failed_step = "post_message"
                     posted = False
-            if not posted:
-                self.logger.warning(
-                    "event=session_monitor_stop_post_failed last_error=%s",
-                    _get_last_error(kernel32),
-                )
+                    stop_failure_message = "PostThreadMessageW failed"
+                    stop_failure_type = "OSError"
+            if not posted and hwnd is None and thread_id is None:
+                posted = True
+
+            if notifications_registered and hwnd:
+                try:
+                    if not wtsapi32.WTSUnRegisterSessionNotification(HWND(hwnd)):
+                        stop_failed_step = stop_failed_step or "unregister_notification"
+                        stop_failure_message = "WTSUnRegisterSessionNotification failed"
+                        stop_failure_type = "OSError"
+                except Exception:
+                    stop_failed_step = stop_failed_step or "unregister_notification"
+                    stop_failure_message = "WTSUnRegisterSessionNotification failed"
+                    stop_failure_type = "Exception"
         except Exception as exc:
+            stop_failed_step = stop_failed_step or "post_message"
+            stop_failure_message = str(exc)
+            stop_failure_type = exc.__class__.__name__
+
+        if thread is not None:
+            try:
+                thread.join(timeout=5.0)
+            except Exception as exc:
+                stop_failed_step = stop_failed_step or "join_thread"
+                stop_failure_message = str(exc)
+                stop_failure_type = exc.__class__.__name__
+
+        if hwnd and not destroyed_logged and not self._window_destroyed_logged and thread is not None and not thread.is_alive():
+            self._log_window_destroyed(hwnd)
+
+        if stop_failed_step is None and thread is not None and thread.is_alive():
+            stop_failed_step = "join_thread"
+            stop_failure_message = "thread_did_not_exit"
+            stop_failure_type = "TimeoutError"
+
+        with self._state_lock:
+            self._monitor_state = "unavailable"
+
+        if stop_failed_step is not None and not self._stop_failure_logged:
+            self._stop_failure_logged = True
             self.logger.warning(
-                "[CRASH] stage=session_monitor_stop_post_message status=error pid=%s thread=%s error_type=%s error=%s",
-                os.getpid(),
-                threading.current_thread().name,
-                exc.__class__.__name__,
-                exc,
+                "event=session_monitor_stop_failed step=%s error_category=win32_shutdown error_type=%s error_message=%s",
+                stop_failed_step,
+                stop_failure_type,
+                stop_failure_message or stop_failed_step,
             )
 
-        thread.join(timeout=5.0)
-
-        if hwnd and not destroyed_logged and not self._window_destroyed_logged and not thread.is_alive():
-            self._log_window_destroyed(hwnd)
+        self.logger.info("event=session_monitor_stopped monitor_state=unavailable")
 
     def _run_windows_loop(self) -> None:
         startup_complete = False
@@ -241,58 +350,19 @@ class SessionMonitor:
             kernel32 = windll.kernel32
             wtsapi32 = windll.wtsapi32
 
+            _configure_win32_bindings(kernel32, user32, wtsapi32)
+
             self._thread_id = int(kernel32.GetCurrentThreadId())
             self.logger.info("event=session_monitor_thread_start thread_id=%s", self._thread_id)
-
-            user32.DefWindowProcW.argtypes = [HWND, UINT, WPARAM, LPARAM]
-            user32.DefWindowProcW.restype = LRESULT
-            user32.CreateWindowExW.argtypes = [
-                DWORD,
-                LPCWSTR,
-                LPCWSTR,
-                DWORD,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                HWND,
-                HMENU,
-                HINSTANCE,
-                ctypes.c_void_p,
-            ]
-            user32.CreateWindowExW.restype = HWND
-            user32.DestroyWindow.argtypes = [HWND]
-            user32.DestroyWindow.restype = BOOL
-            user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), HWND, UINT, UINT]
-            user32.GetMessageW.restype = ctypes.c_int
-            user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
-            user32.TranslateMessage.restype = BOOL
-            user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
-            user32.DispatchMessageW.restype = LRESULT
-            user32.PostQuitMessage.argtypes = [ctypes.c_int]
-            user32.PostQuitMessage.restype = None
-            user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
-            user32.RegisterClassExW.restype = ATOM
-            user32.UnregisterClassW.argtypes = [LPCWSTR, HINSTANCE]
-            user32.UnregisterClassW.restype = BOOL
-            user32.GetModuleHandleW.argtypes = [LPCWSTR]
-            user32.GetModuleHandleW.restype = HINSTANCE
-            user32.PostMessageW.argtypes = [HWND, UINT, WPARAM, LPARAM]
-            user32.PostMessageW.restype = BOOL
-            user32.PostThreadMessageW.argtypes = [DWORD, UINT, WPARAM, LPARAM]
-            user32.PostThreadMessageW.restype = BOOL
-            user32.IsWindow.argtypes = [HWND]
-            user32.IsWindow.restype = BOOL
-
-            wtsapi32.WTSRegisterSessionNotification.argtypes = [HWND, DWORD]
-            wtsapi32.WTSRegisterSessionNotification.restype = BOOL
-            wtsapi32.WTSUnRegisterSessionNotification.argtypes = [HWND]
-            wtsapi32.WTSUnRegisterSessionNotification.restype = BOOL
-
             h_instance = kernel32.GetModuleHandleW(None)
             if not h_instance:
                 last_error = _get_last_error(kernel32)
-                self._record_start_failure("OSError", "GetModuleHandleW failed", last_error)
+                self._record_start_failure(
+                    error_category="kernel32_get_module_handle",
+                    error_type="OSError",
+                    exception_message="GetModuleHandleW failed",
+                    last_error=last_error,
+                )
                 return
 
             def wnd_proc(hwnd_value: int, msg: int, wparam: int, lparam: int) -> int:
@@ -334,7 +404,12 @@ class SessionMonitor:
             class_atom = user32.RegisterClassExW(ctypes.pointer(wnd_class))
             if not class_atom:
                 last_error = _get_last_error(kernel32)
-                self._record_start_failure("OSError", "RegisterClassExW failed", last_error)
+                self._record_start_failure(
+                    error_category="register_window_class",
+                    error_type="OSError",
+                    exception_message="RegisterClassExW failed",
+                    last_error=last_error,
+                )
                 return
             class_registered = True
             self.logger.info(
@@ -359,10 +434,16 @@ class SessionMonitor:
             )
             if not hwnd_value:
                 last_error = _get_last_error(kernel32)
-                self._record_start_failure("OSError", "CreateWindowExW failed", last_error)
+                self._record_start_failure(
+                    error_category="create_window",
+                    error_type="OSError",
+                    exception_message="CreateWindowExW failed",
+                    last_error=last_error,
+                )
                 return
             hwnd = int(hwnd_value)
-            self._hwnd = hwnd
+            with self._state_lock:
+                self._hwnd = hwnd
             self.logger.info("event=session_monitor_window_created hwnd=%s", _format_handle(hwnd))
 
             session_notification_registered = bool(
@@ -371,15 +452,33 @@ class SessionMonitor:
             if not session_notification_registered:
                 last_error = _get_last_error(kernel32)
                 self._record_start_failure(
-                    "OSError",
-                    "WTSRegisterSessionNotification failed",
-                    last_error,
+                    error_category="register_session_notification",
+                    error_type="OSError",
+                    exception_message="WTSRegisterSessionNotification failed",
+                    last_error=last_error,
                 )
                 return
 
             startup_complete = True
+            with self._state_lock:
+                self._monitor_state = "active"
+                self._notifications_registered = True
+            self.logger.info(
+                "event=session_monitor_started notifications_registered=true degraded_lock_monitoring=false hwnd_created=true lock_state=%s",
+                self._lock_state_label(),
+            )
+            if self._process_backlog_only_while_locked:
+                startup_reason = "blocked_lock_state_unknown"
+                startup_allowed = False
+            else:
+                startup_reason = "allowed_config_disabled"
+                startup_allowed = True
+            self._log_backlog_gate_state(
+                lock_state=self._lock_state_label(),
+                backlog_processing_allowed=startup_allowed,
+                reason=startup_reason,
+            )
             self._startup_event.set()
-            self.logger.info("event=session_monitor_started ok=true")
             if self._stop_requested.is_set():
                 if not user32.DestroyWindow(HWND(hwnd)):
                     self.logger.warning(
@@ -410,7 +509,12 @@ class SessionMonitor:
                 except Exception:
                     last_error = 0
             if not startup_complete:
-                self._record_start_failure(exc.__class__.__name__, str(exc), last_error)
+                self._record_start_failure(
+                    error_category="win32_startup_exception",
+                    error_type=exc.__class__.__name__,
+                    exception_message=str(exc),
+                    last_error=last_error,
+                )
                 return
             self._thread_exit_reason = "thread_exception"
             self._startup_event.set()
@@ -487,32 +591,64 @@ class SessionMonitor:
                 self._hwnd = None
                 self._thread_id = None
                 self._wnd_proc_ref = None
+                self._notifications_registered = False
 
             if not startup_complete:
                 self._startup_event.set()
 
             if self._thread_exit_reason == "unknown":
                 self._thread_exit_reason = message_loop_exit_reason if message_loop_started else "startup_failed"
+            with self._state_lock:
+                if self._monitor_state == "starting":
+                    self._monitor_state = "unavailable" if startup_complete else "degraded"
             self.logger.info("event=session_monitor_thread_exit reason=%s", self._thread_exit_reason)
 
-    def _record_start_failure(self, error_type: str, detail: str, last_error: int) -> None:
-        self._startup_error_type = error_type
-        self._startup_error = detail
-        self._startup_last_error = last_error
-        self._thread_exit_reason = "startup_failed"
-        self._startup_event.set()
+    def _record_start_failure(
+        self,
+        *,
+        error_category: str,
+        error_type: str,
+        exception_message: str,
+        last_error: int,
+    ) -> None:
+        with self._state_lock:
+            self._startup_error_category = error_category
+            self._startup_error_type = error_type
+            self._startup_error = exception_message
+            self._startup_last_error = last_error
+            self._thread_exit_reason = "startup_failed"
+            self._monitor_state = "degraded"
         self.logger.warning(
-            "event=session_monitor_start_failed error_type=%s detail=%s last_error=%s",
+            "event=session_monitor_start_failed error_type=%s detail=%s last_error=%s error_category=%s exception_type=%s exception_message=%s degraded_lock_monitoring=true",
             error_type,
-            detail,
+            exception_message,
             last_error,
+            error_category,
+            error_type,
+            exception_message,
         )
+        degraded_reason = "allowed_config_disabled" if not self._process_backlog_only_while_locked else "blocked_lock_monitor_degraded"
+        self._log_backlog_gate_state(
+            lock_state="degraded",
+            backlog_processing_allowed=not self._process_backlog_only_while_locked,
+            reason=degraded_reason,
+        )
+        self._startup_event.set()
 
     def _log_window_destroyed(self, hwnd: int) -> None:
         if self._window_destroyed_logged:
             return
         self._window_destroyed_logged = True
         self.logger.info("event=session_monitor_window_destroyed hwnd=%s", _format_handle(hwnd))
+
+    def _log_backlog_gate_state(self, *, lock_state: str, backlog_processing_allowed: bool, reason: str) -> None:
+        self.logger.info(
+            "event=summary_backlog_gate_state process_backlog_only_while_locked=%s lock_state=%s backlog_processing_allowed=%s reason=%s",
+            self._process_backlog_only_while_locked,
+            lock_state,
+            backlog_processing_allowed,
+            reason,
+        )
 
     def _safe_invoke(self, callback: Callable[[], None]) -> None:
         try:
@@ -522,8 +658,58 @@ class SessionMonitor:
 
     def _handle_session_change_code(self, code: int) -> None:
         if code == WTS_SESSION_LOCK:
-            self.logger.info("event=session_locked")
+            previous_state = self._lock_state_label()
+            with self._state_lock:
+                self._lock_state = "locked"
+            self.logger.info(
+                "event=session_locked source=wts_session_change previous_lock_state=%s new_lock_state=locked",
+                previous_state,
+            )
+            self._log_backlog_gate_state(
+                lock_state="locked",
+                backlog_processing_allowed=True,
+                reason="allowed_config_disabled" if not self._process_backlog_only_while_locked else "allowed_pc_locked",
+            )
             self._safe_invoke(self.on_locked)
         elif code == WTS_SESSION_UNLOCK:
-            self.logger.info("event=session_unlocked")
+            previous_state = self._lock_state_label()
+            with self._state_lock:
+                self._lock_state = "unlocked"
+            self.logger.info(
+                "event=session_unlocked source=wts_session_change previous_lock_state=%s new_lock_state=unlocked",
+                previous_state,
+            )
+            self._log_backlog_gate_state(
+                lock_state="unlocked",
+                backlog_processing_allowed=not self._process_backlog_only_while_locked,
+                reason="allowed_config_disabled" if not self._process_backlog_only_while_locked else "blocked_pc_unlocked",
+            )
             self._safe_invoke(self.on_unlocked)
+
+    def _lock_state_label(self) -> str:
+        with self._state_lock:
+            return self._lock_state
+
+    def get_status(self) -> dict[str, Any]:
+        with self._state_lock:
+            monitor_state = self._monitor_state
+            lock_state = self._lock_state
+            hwnd_created = self._hwnd is not None
+            notifications_registered = self._notifications_registered
+            startup_error = self._startup_error
+            startup_error_type = self._startup_error_type
+            startup_error_category = self._startup_error_category
+            startup_last_error = self._startup_last_error
+        if monitor_state == "starting":
+            monitor_state = "unknown"
+        return {
+            "monitor_status": monitor_state,
+            "lock_state": lock_state,
+            "hwnd_created": hwnd_created,
+            "notifications_registered": notifications_registered,
+            "degraded_lock_monitoring": monitor_state == "degraded",
+            "startup_error_category": startup_error_category,
+            "startup_error_type": startup_error_type,
+            "startup_error_message": startup_error,
+            "startup_last_error": startup_last_error,
+        }

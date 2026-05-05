@@ -44,11 +44,21 @@ class LMStudioPromptBuilder:
         prompt_text = self._render_prompt(
             title="Summarize the following WorkLog Diary activity batch.",
             instructions=(
-                "Return only strict JSON with top-level keys summary_text, primary_activity, programs_used, files, conversations, "
-                "task_candidates, outcomes, follow_ups, blocked_activity, unknowns, evidence_quality, metadata. "
+                "Return only strict JSON with top-level keys summary_text, task_candidates, files_and_documents, "
+                "conversations_or_references, programs_used, outcomes, follow_ups, jira_update_candidates, "
+                "unknowns_and_privacy_limits, blocked_observed_references, primary_activity, files, conversations, "
+                "blocked_activity, unknowns, evidence_quality, metadata. "
+                "Prioritize sections in this order: task_candidates, files_and_documents, conversations_or_references, "
+                "programs_used, outcomes, follow_ups, jira_update_candidates, unknowns_and_privacy_limits. "
+                "Do not lead with generic program prose unless no better evidence exists. "
                 "Use activity_entities and other observed evidence as the source of truth. Observed facts must stay separate from inference. "
-                "Do not invent file modifications or task names. "
-                "Blocked intervals may only be described as blocked or unknown. Preserve exact file paths and names. "
+                "Do not invent file modifications or task names. Preserve exact file paths and names. "
+                "For blocked apps, distinguish blocked content (screenshot/text unavailable) from observable metadata "
+                "(process_name, window_title, timestamps). Do not infer hidden blocked content. "
+                "Treat blocked intervals as blocked or unknown content, not visible content. "
+                "Use window-title metadata conservatively: preserve PDF/file/document titles as read_or_viewed references; "
+                "preserve Outlook/Webex/Teams subjects or titles as references with unknown content. "
+                "Never claim blocked items were modified, sent, or discussed unless explicit evidence supports it. "
                 "Use explicit confidence values in evidence_quality. Avoid generic filler unless evidence is genuinely weak."
             ),
             payload=payload,
@@ -61,11 +71,17 @@ class LMStudioPromptBuilder:
         prompt_text = self._render_prompt(
             title=f"Create a short daily recap for {day.isoformat()} from the following batch summaries.",
             instructions=(
-                "Return only strict JSON with top-level keys executive_summary, program_activity_breakdown, tasks_advanced, "
-                "files_observed, files_likely_modified, conversations_or_meetings, decisions, blockers, follow_ups, "
+                "Return only strict JSON with top-level keys executive_summary, workstreams_or_task_candidates, "
+                "files_and_documents, conversations_meetings_and_references, program_activity_breakdown, outcomes, "
+                "follow_ups_or_jira_candidates, evidence_limits_and_unknowns, tasks_advanced, files_observed, "
+                "files_likely_modified, conversations_or_meetings, decisions, blockers, follow_ups, "
                 "jira_update_candidates, open_questions, confidence_notes, metadata. "
+                "Daily recap sections must prioritize this order: Workstreams/task candidates, Files/documents, "
+                "Conversations/meetings/references, Program activity breakdown, Outcomes, Follow-ups/JIRA candidates, "
+                "Evidence limits and unknowns. "
                 "Base the recap on structured event outputs, extracted entities, and confidence notes. "
                 "Do not invent file modifications or task names. Do not hallucinate blocked content. "
+                "Include blocked-app metadata-derived references with caveats that content was not captured. "
                 "Keep the recap concise and fact-oriented. Use confidence_notes to explain low-confidence or ambiguous evidence."
             ),
             payload=payload,
@@ -189,12 +205,17 @@ class LMStudioPromptBuilder:
                     "primary_activity": structured.get("primary_activity", []),
                     "programs_used": structured.get("programs_used", []),
                     "files": structured.get("files", []),
+                    "files_and_documents": structured.get("files_and_documents", []),
                     "conversations": structured.get("conversations", []),
+                    "conversations_or_references": structured.get("conversations_or_references", []),
                     "task_candidates": structured.get("task_candidates", []),
                     "outcomes": structured.get("outcomes", []),
                     "follow_ups": structured.get("follow_ups", []),
+                    "jira_update_candidates": structured.get("jira_update_candidates", []),
                     "blocked_activity": structured.get("blocked_activity", []),
+                    "blocked_observed_references": structured.get("blocked_observed_references", []),
                     "unknowns": structured.get("unknowns", []),
+                    "unknowns_and_privacy_limits": structured.get("unknowns_and_privacy_limits", []),
                     "evidence_quality": evidence_quality,
                     "metadata": metadata,
                     "activity_entities": activity_entities,

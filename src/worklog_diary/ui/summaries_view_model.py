@@ -58,7 +58,7 @@ def build_day_summary_view(
         day=day,
         cards=cards,
         has_daily_recap=daily_summary is not None,
-        daily_recap_text=daily_summary.recap_text if daily_summary is not None else None,
+        daily_recap_text=_format_daily_recap_text(daily_summary) if daily_summary is not None else None,
         daily_recap_created_label=recap_created_label,
     )
 
@@ -71,12 +71,18 @@ def build_summary_card_view(
     end = datetime.fromtimestamp(summary.end_ts).strftime("%H:%M:%S")
 
     structured = summary.summary_json if isinstance(summary.summary_json, dict) else {}
+    structured_summary_text = _format_event_summary_text(structured)
+    formatted_summary = structured_summary_text or summary.summary_text.strip()
     major_activities = _extract_string_list(structured, keys=["major_activities", "key_points", "activities"])
     blocked_notes = _extract_string_list(structured, keys=["blocked_activity", "blocked_note", "privacy_notes"])
     uncertainty_notes = _extract_string_list(
         structured,
         keys=["uncertainty", "notes", "assumptions", "uncertainty_notes"],
     )
+    if structured_summary_text:
+        major_activities = []
+        blocked_notes = []
+        uncertainty_notes = []
 
     coalesced_count_raw = structured.get("coalesced_count")
     try:
@@ -87,7 +93,7 @@ def build_summary_card_view(
     return SummaryCardView(
         summary_id=summary.id,
         time_range=f"{start} - {end}",
-        summary_text=summary.summary_text.strip(),
+        summary_text=formatted_summary,
         major_activities=major_activities,
         blocked_notes=blocked_notes,
         uncertainty_notes=uncertainty_notes,
@@ -166,3 +172,66 @@ def format_summary_html(text: str, query: str | None) -> str:
     if cursor < len(text):
         chunks.append(escape(text[cursor:]))
     return "Summary: " + "".join(chunks)
+
+
+def _format_event_summary_text(payload: dict[str, Any]) -> str:
+    sections: list[tuple[str, list[str]]] = [
+        ("Task / Workstream", _flatten_string_values(payload.get("task_candidates"))),
+        ("Files", _flatten_string_values(payload.get("files_and_documents") or payload.get("files"))),
+        ("Programs", _flatten_string_values(payload.get("programs_used"))),
+        (
+            "Conversations / References",
+            _flatten_string_values(payload.get("conversations_or_references") or payload.get("conversations")),
+        ),
+        ("Outcome", _flatten_string_values(payload.get("outcomes"))),
+        ("JIRA candidate", _flatten_string_values(payload.get("jira_update_candidates"))),
+        (
+            "Evidence limits",
+            _flatten_string_values(payload.get("unknowns_and_privacy_limits") or payload.get("unknowns")),
+        ),
+    ]
+    rendered: list[str] = []
+    for label, values in sections:
+        if not values:
+            continue
+        rendered.append(f"{label}:")
+        rendered.extend(f"- {value}" for value in values[:4])
+    if rendered:
+        return "\n".join(rendered)
+    return ""
+
+
+def _format_daily_recap_text(daily_summary: DailySummaryRecord) -> str:
+    payload = daily_summary.recap_json if isinstance(daily_summary.recap_json, dict) else {}
+    sections: list[tuple[str, list[str]]] = [
+        (
+            "Workstreams / task candidates",
+            _flatten_string_values(payload.get("workstreams_or_task_candidates") or payload.get("tasks_advanced")),
+        ),
+        ("Files and documents", _flatten_string_values(payload.get("files_and_documents") or payload.get("files_observed"))),
+        (
+            "Conversations, meetings, and references",
+            _flatten_string_values(
+                payload.get("conversations_meetings_and_references") or payload.get("conversations_or_meetings")
+            ),
+        ),
+        ("Program activity breakdown", _flatten_string_values(payload.get("program_activity_breakdown"))),
+        ("Outcomes", _flatten_string_values(payload.get("outcomes") or payload.get("decisions"))),
+        (
+            "Follow-ups / JIRA candidates",
+            _flatten_string_values(payload.get("follow_ups_or_jira_candidates") or payload.get("jira_update_candidates") or payload.get("follow_ups")),
+        ),
+        (
+            "Evidence limits and unknowns",
+            _flatten_string_values(payload.get("evidence_limits_and_unknowns") or payload.get("open_questions") or payload.get("confidence_notes")),
+        ),
+    ]
+    rendered: list[str] = []
+    for label, values in sections:
+        if not values:
+            continue
+        rendered.append(f"{label}:")
+        rendered.extend(f"- {value}" for value in values[:6])
+    if rendered:
+        return "\n".join(rendered)
+    return daily_summary.recap_text

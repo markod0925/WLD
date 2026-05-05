@@ -29,13 +29,18 @@ from .lmstudio_logging import (
 
 EVENT_SUMMARY_SCHEMA_KEYS = (
     "summary_text",
-    "primary_activity",
-    "programs_used",
-    "files",
-    "conversations",
     "task_candidates",
+    "files_and_documents",
+    "conversations_or_references",
+    "programs_used",
     "outcomes",
     "follow_ups",
+    "jira_update_candidates",
+    "unknowns_and_privacy_limits",
+    "blocked_observed_references",
+    "primary_activity",
+    "files",
+    "conversations",
     "blocked_activity",
     "unknowns",
     "evidence_quality",
@@ -43,7 +48,13 @@ EVENT_SUMMARY_SCHEMA_KEYS = (
 )
 DAILY_RECAP_SCHEMA_KEYS = (
     "executive_summary",
+    "workstreams_or_task_candidates",
+    "files_and_documents",
+    "conversations_meetings_and_references",
     "program_activity_breakdown",
+    "outcomes",
+    "follow_ups_or_jira_candidates",
+    "evidence_limits_and_unknowns",
     "tasks_advanced",
     "files_observed",
     "files_likely_modified",
@@ -367,7 +378,13 @@ class LMStudioClient:
         self, items: list[LMStudioStructuredResponse]
     ) -> LMStudioStructuredResponse:
         summary_lines: list[str] = []
+        workstreams_or_task_candidates: list[Any] = []
+        files_and_documents: list[Any] = []
+        conversations_meetings_and_references: list[Any] = []
         program_activity_breakdown: list[Any] = []
+        outcomes: list[Any] = []
+        follow_ups_or_jira_candidates: list[Any] = []
+        evidence_limits_and_unknowns: list[Any] = []
         tasks_advanced: list[Any] = []
         files_observed: list[Any] = []
         files_likely_modified: list[Any] = []
@@ -383,7 +400,26 @@ class LMStudioClient:
             text = _coerce_text(payload.get("executive_summary") or payload.get("summary_text"))
             if text:
                 summary_lines.append(text)
+            workstreams_or_task_candidates.extend(
+                _coerce_json_list(payload.get("workstreams_or_task_candidates") or payload.get("tasks_advanced") or payload.get("task_candidates"))
+            )
+            files_and_documents.extend(_coerce_json_list(payload.get("files_and_documents") or payload.get("files_observed") or payload.get("files")))
+            conversations_meetings_and_references.extend(
+                _coerce_json_list(
+                    payload.get("conversations_meetings_and_references")
+                    or payload.get("conversations_or_meetings")
+                    or payload.get("conversations_or_references")
+                    or payload.get("conversations")
+                )
+            )
             program_activity_breakdown.extend(_coerce_json_list(payload.get("program_activity_breakdown")))
+            outcomes.extend(_coerce_json_list(payload.get("outcomes") or payload.get("decisions")))
+            follow_ups_or_jira_candidates.extend(
+                _coerce_json_list(payload.get("follow_ups_or_jira_candidates") or payload.get("follow_ups") or payload.get("jira_update_candidates"))
+            )
+            evidence_limits_and_unknowns.extend(
+                _coerce_json_list(payload.get("evidence_limits_and_unknowns") or payload.get("open_questions") or payload.get("unknowns"))
+            )
             tasks_advanced.extend(_coerce_json_list(payload.get("tasks_advanced") or payload.get("task_candidates")))
             files_observed.extend(_coerce_json_list(payload.get("files_observed") or payload.get("files")))
             files_likely_modified.extend(_coerce_json_list(payload.get("files_likely_modified")))
@@ -399,7 +435,13 @@ class LMStudioClient:
             payload={
                 "executive_summary": "\n".join(summary_lines),
                 "summary_text": "\n".join(summary_lines),
+                "workstreams_or_task_candidates": workstreams_or_task_candidates[:20],
+                "files_and_documents": files_and_documents[:20],
+                "conversations_meetings_and_references": conversations_meetings_and_references[:20],
                 "program_activity_breakdown": program_activity_breakdown[:20],
+                "outcomes": outcomes[:20],
+                "follow_ups_or_jira_candidates": follow_ups_or_jira_candidates[:20],
+                "evidence_limits_and_unknowns": evidence_limits_and_unknowns[:20],
                 "tasks_advanced": tasks_advanced[:20],
                 "files_observed": files_observed[:20],
                 "files_likely_modified": files_likely_modified[:20],
@@ -992,12 +1034,21 @@ def _normalize_event_summary_payload(
     )
     primary_activity = _coerce_json_list(parsed.get("primary_activity") or [])
     programs_used = _coerce_json_list(parsed.get("programs_used") or [])
+    files_and_documents = _coerce_json_list(parsed.get("files_and_documents") or parsed.get("files") or [])
     files = _coerce_json_list(parsed.get("files") or [])
+    conversations_or_references = _coerce_json_list(
+        parsed.get("conversations_or_references") or parsed.get("conversations") or []
+    )
     conversations = _coerce_json_list(parsed.get("conversations") or [])
     task_candidates = _coerce_json_list(parsed.get("task_candidates") or parsed.get("key_points") or [])
     outcomes = _coerce_json_list(parsed.get("outcomes") or parsed.get("key_points") or [])
     follow_ups = _coerce_json_list(parsed.get("follow_ups") or [])
+    jira_update_candidates = _coerce_json_list(parsed.get("jira_update_candidates") or [])
     blocked_activity = _coerce_json_list(parsed.get("blocked_activity") or [])
+    blocked_observed_references = _coerce_json_list(parsed.get("blocked_observed_references") or [])
+    unknowns_and_privacy_limits = _coerce_json_list(
+        parsed.get("unknowns_and_privacy_limits") or parsed.get("unknowns") or []
+    )
     unknowns = _coerce_json_list(parsed.get("unknowns") or [])
     evidence_quality = parsed.get("evidence_quality") if isinstance(parsed.get("evidence_quality"), dict) else {}
     evidence_quality = {
@@ -1012,12 +1063,17 @@ def _normalize_event_summary_payload(
         "summary_text": summary_text,
         "primary_activity": primary_activity,
         "programs_used": programs_used,
+        "files_and_documents": files_and_documents,
         "files": files,
+        "conversations_or_references": conversations_or_references,
         "conversations": conversations,
         "task_candidates": task_candidates,
         "outcomes": outcomes,
         "follow_ups": follow_ups,
+        "jira_update_candidates": jira_update_candidates,
         "blocked_activity": blocked_activity,
+        "blocked_observed_references": blocked_observed_references,
+        "unknowns_and_privacy_limits": unknowns_and_privacy_limits,
         "unknowns": unknowns,
         "evidence_quality": evidence_quality,
         "key_points": outcomes,
@@ -1038,25 +1094,53 @@ def _normalize_daily_recap_payload(
     executive_summary = _coerce_text(
         parsed.get("executive_summary") or parsed.get("summary_text") or parsed.get("summary") or raw_response
     )
+    workstreams_or_task_candidates = _coerce_json_list(
+        parsed.get("workstreams_or_task_candidates") or parsed.get("tasks_advanced") or []
+    )
+    files_and_documents = _coerce_json_list(
+        parsed.get("files_and_documents")
+        or parsed.get("files_observed")
+        or parsed.get("files_likely_modified")
+        or []
+    )
+    conversations_meetings_and_references = _coerce_json_list(
+        parsed.get("conversations_meetings_and_references") or parsed.get("conversations_or_meetings") or []
+    )
     program_activity_breakdown = _coerce_json_list(
         parsed.get("program_activity_breakdown") or parsed.get("key_points") or []
     )
-    tasks_advanced = _coerce_json_list(parsed.get("tasks_advanced") or [])
-    files_observed = _coerce_json_list(parsed.get("files_observed") or [])
+    outcomes = _coerce_json_list(parsed.get("outcomes") or parsed.get("decisions") or parsed.get("key_points") or [])
+    follow_ups_or_jira_candidates = _coerce_json_list(
+        parsed.get("follow_ups_or_jira_candidates") or parsed.get("follow_ups") or parsed.get("jira_update_candidates") or []
+    )
+    evidence_limits_and_unknowns = _coerce_json_list(
+        parsed.get("evidence_limits_and_unknowns") or parsed.get("open_questions") or parsed.get("confidence_notes") or []
+    )
+
+    tasks_advanced = _coerce_json_list(parsed.get("tasks_advanced") or workstreams_or_task_candidates)
+    files_observed = _coerce_json_list(parsed.get("files_observed") or files_and_documents)
     files_likely_modified = _coerce_json_list(parsed.get("files_likely_modified") or [])
-    conversations_or_meetings = _coerce_json_list(parsed.get("conversations_or_meetings") or [])
-    decisions = _coerce_json_list(parsed.get("decisions") or parsed.get("key_points") or [])
+    conversations_or_meetings = _coerce_json_list(
+        parsed.get("conversations_or_meetings") or conversations_meetings_and_references
+    )
+    decisions = _coerce_json_list(parsed.get("decisions") or outcomes)
     blockers = _coerce_json_list(parsed.get("blockers") or parsed.get("blocked_activity") or [])
-    follow_ups = _coerce_json_list(parsed.get("follow_ups") or [])
-    jira_update_candidates = _coerce_json_list(parsed.get("jira_update_candidates") or [])
-    open_questions = _coerce_json_list(parsed.get("open_questions") or [])
+    follow_ups = _coerce_json_list(parsed.get("follow_ups") or follow_ups_or_jira_candidates)
+    jira_update_candidates = _coerce_json_list(parsed.get("jira_update_candidates") or follow_ups_or_jira_candidates)
+    open_questions = _coerce_json_list(parsed.get("open_questions") or evidence_limits_and_unknowns)
     confidence_notes = _coerce_string_list(parsed.get("confidence_notes") or [])
     metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
     if not open_questions and not confidence_notes:
         confidence_notes = ["insufficient evidence"]
     return {
         "executive_summary": executive_summary,
+        "workstreams_or_task_candidates": workstreams_or_task_candidates,
+        "files_and_documents": files_and_documents,
+        "conversations_meetings_and_references": conversations_meetings_and_references,
         "program_activity_breakdown": program_activity_breakdown,
+        "outcomes": outcomes,
+        "follow_ups_or_jira_candidates": follow_ups_or_jira_candidates,
+        "evidence_limits_and_unknowns": evidence_limits_and_unknowns,
         "tasks_advanced": tasks_advanced,
         "files_observed": files_observed,
         "files_likely_modified": files_likely_modified,

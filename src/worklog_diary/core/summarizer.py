@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -1402,6 +1403,7 @@ class Summarizer:
         payload["source_batch"]["screenshot_count"] = len(batch.screenshots)
         payload["source_batch"]["activity_entity_count"] = len(batch.activity_entities)
         payload["source_batch"]["parser_coverage_count"] = len(batch.parser_coverage)
+        _augment_privacy_limited_event_evidence(payload, batch)
         return payload
 
     def _persist_activity_entities_for_batch(
@@ -1533,3 +1535,238 @@ def _estimate_token_count(chars: int) -> int | None:
     if chars <= 0:
         return None
     return max(1, (chars + 3) // 4)
+
+
+_BROWSER_SUFFIXES = (
+    " - Google Chrome",
+    " - Chromium",
+    " - Microsoft Edge",
+    " - Edge",
+)
+_MEETING_TOKENS = ("teams", "webex", "zoom", "meet", "slack")
+_FILE_LIKE_RE = re.compile(r"\b([A-Za-z0-9][A-Za-z0-9._-]{0,127}\.[A-Za-z0-9]{1,10})\b")
+_PDF_RE = re.compile(r"\.pdf$", flags=re.IGNORECASE)
+_DOC_EXT_RE = re.compile(r"\.(doc|docx|ppt|pptx|xls|xlsx|txt|md|rtf)$", flags=re.IGNORECASE)
+_PRIVACY_CAVEAT = "Interpretation uses blocked-app metadata (process/window title) only; text and screenshot content were not captured."
+
+
+def _augment_privacy_limited_event_evidence(payload: dict[str, object], batch: SummaryBatch) -> None:
+    existing_blocked_refs = _coerce_payload_list(payload.get("blocked_observed_references"))
+    inferred_blocked_refs = _infer_blocked_observed_references(batch)
+    blocked_observed_references = _merge_reference_lists(existing_blocked_refs, inferred_blocked_refs)
+    payload["blocked_observed_references"] = blocked_observed_references
+
+    files_and_documents = _coerce_payload_list(payload.get("files_and_documents") or payload.get("files"))
+    files_and_documents = _augment_files_and_documents_with_blocked_refs(files_and_documents, blocked_observed_references)
+    payload["files_and_documents"] = files_and_documents
+
+    conversations_or_references = _coerce_payload_list(
+        payload.get("conversations_or_references") or payload.get("conversations")
+    )
+    conversations_or_references = _augment_conversations_with_blocked_refs(
+        conversations_or_references,
+        blocked_observed_references,
+    )
+    payload["conversations_or_references"] = conversations_or_references
+
+    payload["jira_update_candidates"] = _coerce_payload_list(payload.get("jira_update_candidates"))
+    unknowns_and_privacy_limits = _coerce_payload_list(
+        payload.get("unknowns_and_privacy_limits") or payload.get("unknowns")
+    )
+    if blocked_observed_references and not any(
+        isinstance(item, str) and "blocked" in item.lower() for item in unknowns_and_privacy_limits
+    ):
+        unknowns_and_privacy_limits.append(_PRIVACY_CAVEAT)
+    payload["unknowns_and_privacy_limits"] = unknowns_and_privacy_limits
+
+
+def _infer_blocked_observed_references(batch: SummaryBatch) -> list[dict[str, object]]:
+    inferred: list[dict[str, object]] = []
+    for interval in batch.blocked_intervals:
+        process = str(interval.process_name or "").strip()
+        title = str(interval.window_title or "").strip()
+        if not process and not title:
+            continue
+
+        inferred_type = "unknown"
+        extracted_entities: list[str] = []
+        safe_interpretation = "Observed blocked application metadata only; content is unknown."
+        confidence = 0.45
+
+        normalized_process = process.lower()
+        normalized_title = title.lower()
+        browser_title = _strip_browser_suffix(title)
+        file_hint = _extract_file_hint(browser_title)
+
+        if file_hint and _PDF_RE.search(file_hint):
+            inferred_type = "pdf"
+            extracted_entities = [file_hint]
+            safe_interpretation = f"Viewed or referenced `{file_hint}` in a blocked browser window; content was not captured."
+            confidence = 0.9
+        elif file_hint and _DOC_EXT_RE.search(file_hint):
+            inferred_type = "document"
+            extracted_entities = [file_hint]
+            safe_interpretation = f"Viewed or referenced document `{file_hint}` in a blocked window; content was not captured."
+            confidence = 0.84
+        elif "outlook" in normalized_process or "outlook" in normalized_title:
+            inferred_type = "mail_subject"
+            extracted_entities = [title]
+            safe_interpretation = f"Observed mail subject/title `{title}` in blocked Outlook; message content was not captured."
+            confidence = 0.8
+        elif any(token in normalized_process or token in normalized_title for token in _MEETING_TOKENS):
+            inferred_type = "meeting_title"
+            extracted_entities = [title]
+            safe_interpretation = f"Observed meeting or chat title `{title}` in a blocked app; conversation content was not captured."
+            confidence = 0.78
+        elif _looks_like_browser_process_or_title(normalized_process, normalized_title) and browser_title:
+            inferred_type = "web_page"
+            extracted_entities = [browser_title]
+            safe_interpretation = f"Observed browser page title `{browser_title}` in blocked browsing activity; page content was not captured."
+            confidence = 0.72
+
+        inferred.append(
+            {
+                "process": process,
+                "window_title": title,
+                "inferred_reference_type": inferred_type,
+                "extracted_entities": extracted_entities,
+                "content_captured": False,
+                "metadata_used": True,
+                "safe_interpretation": safe_interpretation,
+                "confidence": confidence,
+                "caveat": _PRIVACY_CAVEAT,
+            }
+        )
+    return inferred
+
+
+def _augment_files_and_documents_with_blocked_refs(
+    current: list[object],
+    blocked_observed_references: list[object],
+) -> list[object]:
+    items = list(current)
+    seen = {
+        (_normalize_for_key(entry.get("path/name")), _normalize_for_key(entry.get("status")))
+        for entry in items
+        if isinstance(entry, dict)
+    }
+    for ref in blocked_observed_references:
+        if not isinstance(ref, dict):
+            continue
+        ref_type = str(ref.get("inferred_reference_type") or "").strip().lower()
+        if ref_type not in {"pdf", "document"}:
+            continue
+        extracted = ref.get("extracted_entities")
+        entity_name = ""
+        if isinstance(extracted, list):
+            for item in extracted:
+                text = str(item).strip()
+                if text:
+                    entity_name = text
+                    break
+        if not entity_name:
+            entity_name = str(ref.get("window_title") or "").strip()
+        key = (_normalize_for_key(entity_name), "read_or_viewed")
+        if not entity_name or key in seen:
+            continue
+        seen.add(key)
+        items.append(
+            {
+                "path/name": entity_name,
+                "status": "read_or_viewed",
+                "source": "blocked_window_title_metadata",
+                "privacy_limited": True,
+                "confidence": ref.get("confidence", 0.7),
+            }
+        )
+    return items
+
+
+def _augment_conversations_with_blocked_refs(
+    current: list[object],
+    blocked_observed_references: list[object],
+) -> list[object]:
+    items = list(current)
+    seen = {_normalize_for_key(entry.get("reference")) for entry in items if isinstance(entry, dict)}
+    for ref in blocked_observed_references:
+        if not isinstance(ref, dict):
+            continue
+        ref_type = str(ref.get("inferred_reference_type") or "").strip().lower()
+        if ref_type not in {"mail_subject", "meeting_title", "web_page"}:
+            continue
+        window_title = str(ref.get("window_title") or "").strip()
+        if not window_title:
+            continue
+        normalized = _normalize_for_key(window_title)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(
+            {
+                "reference": window_title,
+                "type": ref_type,
+                "privacy_limited": True,
+                "content_captured": False,
+                "confidence": ref.get("confidence", 0.65),
+                "caveat": _PRIVACY_CAVEAT,
+            }
+        )
+    return items
+
+
+def _merge_reference_lists(primary: list[object], secondary: list[object]) -> list[object]:
+    merged: list[object] = list(primary)
+    seen: set[tuple[str, str]] = set()
+    for item in merged:
+        if not isinstance(item, dict):
+            continue
+        seen.add(
+            (
+                _normalize_for_key(item.get("process")),
+                _normalize_for_key(item.get("window_title")),
+            )
+        )
+    for item in secondary:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            _normalize_for_key(item.get("process")),
+            _normalize_for_key(item.get("window_title")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
+
+
+def _coerce_payload_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return list(value)
+    if value is None:
+        return []
+    return [value]
+
+
+def _normalize_for_key(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _looks_like_browser_process_or_title(process_name: str, window_title: str) -> bool:
+    return any(token in process_name or token in window_title for token in ("chrome", "edge", "chromium", "browser"))
+
+
+def _strip_browser_suffix(title: str) -> str:
+    stripped = title.strip()
+    for suffix in _BROWSER_SUFFIXES:
+        if stripped.endswith(suffix):
+            return stripped[: -len(suffix)].strip()
+    return stripped
+
+
+def _extract_file_hint(text: str) -> str:
+    for match in _FILE_LIKE_RE.finditer(text):
+        value = str(match.group(1)).strip()
+        if value:
+            return value
+    return ""

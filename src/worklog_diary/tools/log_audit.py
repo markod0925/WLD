@@ -933,9 +933,13 @@ class LogAuditRunner:
             "faulthandler_enable",
             "previous_run_check",
             "session_heartbeat_started",
+            "session_monitor_starting",
             "session_monitor_start",
             "session_monitor_started",
             "session_monitor_start_failed",
+            "session_monitor_stopping",
+            "session_monitor_stopped",
+            "session_monitor_stop_failed",
             "monitoring_state_change",
             "summary_admission_config",
             "summary_admission_state",
@@ -956,6 +960,7 @@ class LogAuditRunner:
             "calendar_summary_load",
             "session_locked",
             "session_unlocked",
+            "summary_backlog_gate_state",
             "session_finalized",
             "crash_monitor_session_finalized",
             "crash_monitor_finalize_start",
@@ -1127,10 +1132,26 @@ class LogAuditRunner:
         capture = self._build_capture_audit()
         crash = self._build_crash_audit()
         lock_unlock = self._build_lock_unlock_audit()
+        session_monitor = self._build_session_monitor_audit()
+        backlog_gate = self._build_backlog_gate_audit()
         storage = self._build_storage_audit()
         config = self._build_config_audit()
         anomalies = self._build_anomalies()
-        report = self._build_report(event_counts, error_taxonomy, lifecycle, summary_queue, lmstudio, capture, crash, lock_unlock, storage, config, anomalies)
+        report = self._build_report(
+            event_counts,
+            error_taxonomy,
+            lifecycle,
+            summary_queue,
+            lmstudio,
+            capture,
+            crash,
+            lock_unlock,
+            session_monitor,
+            backlog_gate,
+            storage,
+            config,
+            anomalies,
+        )
 
         return {
             "event_counts": event_counts,
@@ -1141,6 +1162,8 @@ class LogAuditRunner:
             "capture": capture,
             "crash": crash,
             "lock_unlock": lock_unlock,
+            "session_monitor": session_monitor,
+            "backlog_gate": backlog_gate,
             "storage": storage,
             "config": config,
             "anomalies": anomalies,
@@ -1348,6 +1371,113 @@ class LogAuditRunner:
             "instrumentation_gap": not any(item["event"] in {"session_finalized", "crash_monitor_session_finalized"} for item in crash_events),
         }
 
+    def _build_session_monitor_audit(self) -> dict[str, Any]:
+        timeline = self.stats.major_timeline
+        monitor_events = [
+            item
+            for item in timeline
+            if item["event"] in {
+                "session_monitor_starting",
+                "session_monitor_started",
+                "session_monitor_start_failed",
+                "session_monitor_stopping",
+                "session_monitor_stopped",
+                "session_monitor_stop_failed",
+                "session_locked",
+                "session_unlocked",
+            }
+        ]
+        deduped_events: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str | None, str, str]] = set()
+        for item in monitor_events:
+            key = (item.get("timestamp"), item.get("event"), item.get("message"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped_events.append(item)
+        monitor_events = deduped_events
+
+        status = "unknown"
+        start_failure_count = 0
+        stop_failure_count = 0
+        lock_event_count = 0
+        unlock_event_count = 0
+        first_observed_lock_state: str | None = None
+        last_observed_lock_state: str | None = None
+
+        for item in monitor_events:
+            event = item["event"]
+            fields = parse_fields(str(item.get("message", "")))
+            if event == "session_monitor_start_failed":
+                start_failure_count += 1
+                status = "degraded"
+            elif event == "session_monitor_started":
+                status = "active"
+            elif event == "session_monitor_stop_failed":
+                stop_failure_count += 1
+                status = "degraded"
+            elif event == "session_monitor_stopped":
+                status = "unavailable"
+            elif event == "session_locked":
+                lock_event_count += 1
+                observed_state = _string_field(fields, "new_lock_state") or "locked"
+                first_observed_lock_state = first_observed_lock_state or observed_state
+                last_observed_lock_state = observed_state
+            elif event == "session_unlocked":
+                unlock_event_count += 1
+                observed_state = _string_field(fields, "new_lock_state") or "unlocked"
+                first_observed_lock_state = first_observed_lock_state or observed_state
+                last_observed_lock_state = observed_state
+
+        if not monitor_events:
+            status = "unknown"
+
+        return {
+            "monitor_status": status,
+            "start_failure_count": start_failure_count,
+            "stop_failure_count": stop_failure_count,
+            "lock_event_count": lock_event_count,
+            "unlock_event_count": unlock_event_count,
+            "first_observed_lock_state": first_observed_lock_state,
+            "last_observed_lock_state": last_observed_lock_state,
+            "started_count": sum(1 for item in monitor_events if item["event"] == "session_monitor_started"),
+            "stopped_count": sum(1 for item in monitor_events if item["event"] == "session_monitor_stopped"),
+            "events": monitor_events,
+        }
+
+    def _build_backlog_gate_audit(self) -> dict[str, Any]:
+        gate_events = [
+            item
+            for item in self.stats.major_timeline
+            if item["event"] == "summary_backlog_gate_state"
+        ]
+        allowed_count = 0
+        blocked_count = 0
+        blocked_by_reason: dict[str, int] = {}
+        unknown_or_degraded_count = 0
+
+        for item in gate_events:
+            fields = parse_fields(str(item.get("message", "")))
+            allowed = bool(_bool_value(fields.get("backlog_processing_allowed")))
+            lock_state = _string_field(fields, "lock_state") or "unknown"
+            reason = _string_field(fields, "reason") or "unknown"
+            if allowed:
+                allowed_count += 1
+            else:
+                blocked_count += 1
+                blocked_by_reason[reason] = blocked_by_reason.get(reason, 0) + 1
+            if (not allowed) and lock_state in {"unknown", "degraded"}:
+                unknown_or_degraded_count += 1
+
+        return {
+            "allowed_count": allowed_count,
+            "blocked_count": blocked_count,
+            "blocked_by_reason": dict(sorted(blocked_by_reason.items())),
+            "unknown_or_degraded_count": unknown_or_degraded_count,
+            "event_count": len(gate_events),
+            "events": gate_events,
+        }
+
     def _build_lock_unlock_audit(self) -> dict[str, Any]:
         lock = self.stats.lock_audit
         contradictions = list(lock["contradictions"])
@@ -1373,6 +1503,9 @@ class LogAuditRunner:
             "monitoring_state_changes": lock["monitoring_state_changes"],
             "contradictions": contradictions,
             "gate_observable": lock["session_locked"] > 0 or lock["session_unlocked"] > 0,
+            "session_monitor_status": self._build_session_monitor_audit()["monitor_status"],
+            "first_observed_lock_state": self._build_session_monitor_audit()["first_observed_lock_state"],
+            "last_observed_lock_state": self._build_session_monitor_audit()["last_observed_lock_state"],
         }
 
     def _build_storage_audit(self) -> dict[str, Any]:
@@ -1602,6 +1735,8 @@ class LogAuditRunner:
         capture: dict[str, Any],
         crash: dict[str, Any],
         lock_unlock: dict[str, Any],
+        session_monitor: dict[str, Any],
+        backlog_gate: dict[str, Any],
         storage: dict[str, Any],
         config: dict[str, Any],
         anomalies: list[dict[str, Any]],
@@ -1663,6 +1798,21 @@ class LogAuditRunner:
         lines.append("## Lock/Unlock Admission Audit")
         lines.append(f"- Lock events: {lock_unlock['session_locked']} locked, {lock_unlock['session_unlocked']} unlocked")
         lines.append(f"- Contradictions: {json.dumps(lock_unlock['contradictions'], ensure_ascii=False)}")
+        lines.append("")
+        lines.append("## Session Monitor Audit")
+        lines.append(f"- Monitor status: {session_monitor['monitor_status']}")
+        lines.append(f"- Start failure count: {session_monitor['start_failure_count']}")
+        lines.append(f"- Stop failure count: {session_monitor['stop_failure_count']}")
+        lines.append(f"- Lock event count: {session_monitor['lock_event_count']}")
+        lines.append(f"- Unlock event count: {session_monitor['unlock_event_count']}")
+        lines.append(f"- First observed lock state: {session_monitor['first_observed_lock_state']}")
+        lines.append(f"- Last observed lock state: {session_monitor['last_observed_lock_state']}")
+        lines.append("")
+        lines.append("## Backlog Lock Gate Audit")
+        lines.append(f"- Allowed count: {backlog_gate['allowed_count']}")
+        lines.append(f"- Blocked count: {backlog_gate['blocked_count']}")
+        lines.append(f"- Blocked by reason: {json.dumps(backlog_gate['blocked_by_reason'], ensure_ascii=False)}")
+        lines.append(f"- Decisions with lock state unknown/degraded: {backlog_gate['unknown_or_degraded_count']}")
         lines.append("")
         lines.append("## Crash Monitor Audit")
         lines.append(f"- Crash events observed: {len(crash['crash_events'])}")
