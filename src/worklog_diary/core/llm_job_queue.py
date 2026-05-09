@@ -56,6 +56,7 @@ class LLMJobQueue:
         self._sequence = 0
         self._next_job_number = 0
         self._active_jobs = 0
+        self._active_job_types: dict[str, int] = {}
         self._max_concurrent_jobs = max(1, int(max_concurrent_jobs))
         self._accepting_jobs = True
         self._closing = False
@@ -170,6 +171,10 @@ class LLMJobQueue:
             accepting_jobs = self._accepting_jobs
             closing = self._closing
             closed = self._closed
+            queued_by_type: dict[str, int] = {}
+            for _, _, queued_job in self._queue:
+                queued_by_type[queued_job.metadata.job_type] = queued_by_type.get(queued_job.metadata.job_type, 0) + 1
+            running_by_type = dict(self._active_job_types)
         return {
             "queued_jobs": queued_jobs,
             "running_jobs": running_jobs,
@@ -179,6 +184,8 @@ class LLMJobQueue:
             "closing": closing,
             "closed": closed,
             "stopped": closed or closing or not accepting_jobs,
+            "queued_by_type": queued_by_type,
+            "running_by_type": running_by_type,
         }
 
     def set_max_concurrent_jobs(self, max_concurrent_jobs: int) -> None:
@@ -289,6 +296,7 @@ class LLMJobQueue:
                     continue
                 _, _, job = heapq.heappop(self._queue)
                 self._active_jobs += 1
+                self._active_job_types[job.metadata.job_type] = self._active_job_types.get(job.metadata.job_type, 0) + 1
                 queue_size = len(self._queue)
 
             started_at = time.time()
@@ -369,5 +377,10 @@ class LLMJobQueue:
             finally:
                 with self._condition:
                     self._active_jobs -= 1
+                    current = self._active_job_types.get(job.metadata.job_type, 0)
+                    if current <= 1:
+                        self._active_job_types.pop(job.metadata.job_type, None)
+                    else:
+                        self._active_job_types[job.metadata.job_type] = current - 1
                     self._condition.notify_all()
                 job.done.set()

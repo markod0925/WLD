@@ -35,6 +35,18 @@ class _WorkerHandle:
 
 
 class Summarizer:
+    _EVENT_SUMMARY_PRIORITIES = {
+        "manual": 10,
+        "summary-window": 20,
+        "lock": 30,
+        "scheduled": 40,
+    }
+    _DAILY_RECAP_PRIORITIES = {
+        "manual": 80,
+        "startup_backfill": 220,
+        "auto_backfill": 220,
+    }
+
     def __init__(
         self,
         storage: SQLiteStorage,
@@ -72,6 +84,11 @@ class Summarizer:
         self._admission_paused = False
         self._accepting_new_jobs = True
         self._last_admission_state: str | None = None
+        self._daily_recap_waiting = 0
+        self._daily_recap_running = 0
+        self._lmstudio_state = "ok"
+        self._lmstudio_last_error_category: str | None = None
+        self._lmstudio_last_error_message: str | None = None
 
         self._ensure_worker_count_locked()
         self.logger.info(
@@ -225,6 +242,7 @@ class Summarizer:
 
                 input_chars = sum(len(segment.text) for segment in batch.text_segments)
                 timeout_s = self._lmstudio_timeout_seconds()
+                priority = self._event_summary_priority(reason)
                 job_id = self.storage.create_summary_job(
                     batch.start_ts,
                     batch.end_ts,
@@ -234,6 +252,7 @@ class Summarizer:
                     attempt=1,
                     input_chars=input_chars,
                     input_token_estimate=_estimate_token_count(input_chars),
+                    priority=priority,
                 )
                 self._queue.append(_QueuedSummaryJob(job_id=job_id, batch=batch, reason=reason))
                 self._reserved_ranges[job_id] = (batch.start_ts, batch.end_ts)
@@ -300,12 +319,23 @@ class Summarizer:
             unrecoverable_error = self._unrecoverable_error
             admission_paused = self._is_summary_admission_paused_locked()
             session_locked = self._session_locked
+            daily_recap_waiting = self._daily_recap_waiting
+            daily_recap_running = self._daily_recap_running
+            lmstudio_state = self._lmstudio_state
+            lmstudio_last_error_category = self._lmstudio_last_error_category
+            lmstudio_last_error_message = self._lmstudio_last_error_message
 
         try:
             persisted_counts = self.storage.get_summary_job_status_counts()
         except Exception:
             persisted_counts = {}
         llm_queue = self._get_lmstudio_queue_snapshot()
+        queued_by_type = llm_queue.get("queued_by_type", {})
+        running_by_type = llm_queue.get("running_by_type", {})
+        day_summary_queued = int(queued_by_type.get("day_summary", 0)) if isinstance(queued_by_type, dict) else 0
+        day_summary_running = int(running_by_type.get("day_summary", 0)) if isinstance(running_by_type, dict) else 0
+        event_summary_queued = int(queued_by_type.get("event_summary", 0)) if isinstance(queued_by_type, dict) else 0
+        event_summary_running = int(running_by_type.get("event_summary", 0)) if isinstance(running_by_type, dict) else 0
         return {
             "queued_jobs": queued_jobs,
             "running_jobs": running_jobs,
@@ -328,6 +358,16 @@ class Summarizer:
             "summary_admission_paused": admission_paused,
             "process_backlog_only_while_locked": self._process_backlog_only_while_locked,
             "session_locked": session_locked,
+            "daily_recap_waiting_jobs": daily_recap_waiting,
+            "daily_recap_running_jobs": daily_recap_running,
+            "daily_recap_inflight_jobs": daily_recap_waiting + daily_recap_running,
+            "llm_queue_queued_day_summary_jobs": day_summary_queued,
+            "llm_queue_running_day_summary_jobs": day_summary_running,
+            "llm_queue_queued_event_summary_jobs": event_summary_queued,
+            "llm_queue_running_event_summary_jobs": event_summary_running,
+            "lmstudio_state": lmstudio_state,
+            "lmstudio_last_error_category": lmstudio_last_error_category,
+            "lmstudio_last_error_message": lmstudio_last_error_message,
         }
 
     def flush_pending(self, reason: str = "manual", *, force_flush: bool = False) -> int | None:
@@ -351,6 +391,7 @@ class Summarizer:
 
         input_chars = sum(len(segment.text) for segment in batch.text_segments)
         timeout_s = self._lmstudio_timeout_seconds()
+        priority = self._event_summary_priority(reason)
         job_id = self.storage.create_summary_job(
             batch.start_ts,
             batch.end_ts,
@@ -360,6 +401,7 @@ class Summarizer:
             attempt=1,
             input_chars=input_chars,
             input_token_estimate=_estimate_token_count(input_chars),
+            priority=priority,
         )
         log_llm_stage(
             self.logger,
@@ -376,12 +418,13 @@ class Summarizer:
             input_chars=input_chars,
             input_token_estimate=_estimate_token_count(input_chars),
         )
-        return self._run_summary_job(job_id=job_id, batch=batch, reason=reason)
+        return self._run_summary_job(job_id=job_id, batch=batch, reason=reason, priority=priority)
 
     def generate_daily_recap_for_day(self, day: date, *, reason: str = "manual") -> tuple[int, bool]:
         if self._shutdown_event.is_set() or self._stop_event.is_set() or not self._accepting_new_jobs:
             raise LLMJobCancelledError("Daily summary generation skipped during shutdown")
         day_key = day.isoformat()
+        priority = self._daily_recap_priority(reason)
         with self._condition:
             while day_key in self._daily_recap_inflight:
                 self._condition.wait(timeout=0.5)
@@ -437,6 +480,7 @@ class Summarizer:
                 attempt=1,
                 input_chars=input_chars,
                 input_token_estimate=_estimate_token_count(input_chars),
+                priority=priority,
             )
             log_llm_stage(
                 self.logger,
@@ -451,9 +495,18 @@ class Summarizer:
                 input_chars=input_chars,
                 input_token_estimate=_estimate_token_count(input_chars),
                 reused=reused,
+                priority=priority,
             )
 
+            daily_started = False
+
             def _on_started(metadata: LLMJobMetadata) -> None:
+                nonlocal daily_started
+                daily_started = True
+                with self._lock:
+                    if self._daily_recap_waiting > 0:
+                        self._daily_recap_waiting -= 1
+                    self._daily_recap_running += 1
                 queue_wait_s = max(0.0, metadata.started_at - metadata.queued_at) if metadata.started_at is not None else 0.0
                 self.storage.update_summary_job(
                     job_id,
@@ -508,6 +561,8 @@ class Summarizer:
                 )
 
             try:
+                with self._lock:
+                    self._daily_recap_waiting += 1
                 with self._condition:
                     while not self._can_start_summary_job_now_locked(reason=reason):
                         if self._shutdown_event.is_set() or self._stop_event.is_set() or not self._accepting_new_jobs:
@@ -529,6 +584,7 @@ class Summarizer:
                         job_type="day_summary",
                         on_started=_on_started,
                         on_cancelled=_on_cancelled,
+                        priority=priority,
                     )
             except LLMJobCancelledError as exc:
                 self.storage.update_summary_job(
@@ -544,6 +600,7 @@ class Summarizer:
                 )
                 raise
             except LMStudioTimeoutError as exc:
+                self._set_lmstudio_state("degraded", "timeout", "LM Studio timed out while generating a daily recap.")
                 self._notify_lmstudio_error(
                     "lmstudio_timeout",
                     str(exc),
@@ -562,6 +619,7 @@ class Summarizer:
                 )
                 raise
             except LMStudioConnectionError as exc:
+                self._set_lmstudio_state("offline", "connection", "LM Studio is unreachable.")
                 self._notify_lmstudio_error("lmstudio_connection", str(exc), key=f"{self._lmstudio_identity()}|connection")
                 self.storage.update_summary_job(
                     job_id,
@@ -576,6 +634,7 @@ class Summarizer:
                 )
                 raise
             except LMStudioServiceUnavailableError as exc:
+                self._set_lmstudio_state("degraded", "service_unavailable", "LM Studio could not generate a daily recap.")
                 self._notify_lmstudio_error(
                     "lmstudio_service_unavailable",
                     str(exc),
@@ -593,8 +652,31 @@ class Summarizer:
                     input_token_estimate=_estimate_token_count(input_chars),
                 )
                 raise
+            except Exception as exc:
+                self._set_lmstudio_state("degraded", "unexpected_error", "LM Studio daily recap generation failed.")
+                self.storage.update_summary_job(
+                    job_id,
+                    status="failed",
+                    error=str(exc) or "Daily summary generation failed.",
+                    job_type="day_summary",
+                    finished_at=time.time(),
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                    priority=priority,
+                )
+                raise
             else:
+                self._clear_lmstudio_state()
                 self.error_notifier.resolve_many("lmstudio_connection", "lmstudio_service_unavailable", "lmstudio_timeout")
+            finally:
+                with self._lock:
+                    if daily_started:
+                        if self._daily_recap_running > 0:
+                            self._daily_recap_running -= 1
+                    elif self._daily_recap_waiting > 0:
+                        self._daily_recap_waiting -= 1
 
             source_reports = [
                 score_event_evidence_quality(
@@ -881,6 +963,14 @@ class Summarizer:
             if self._shutdown_event.is_set() or self._stop_event.is_set() or not self._accepting_new_jobs:
                 self.logger.info("event=daily_summary_backfill_noop reason=shutdown")
                 break
+            defer_reason = self._daily_recap_defer_reason(reason=reason)
+            if defer_reason is not None:
+                self.logger.info(
+                    "event=daily_summary_backfill_deferred reason=%s target_day=%s",
+                    defer_reason,
+                    day.isoformat(),
+                )
+                break
             if self.storage.get_daily_summary_for_day(day) is not None:
                 continue
             existing_job = self.storage.get_daily_summary_job_for_day(day)
@@ -928,10 +1018,12 @@ class Summarizer:
         *,
         job_type: str = "event_summary",
         timeout_s: int | None = None,
+        priority: int | None = None,
     ) -> int | None:
         started_at = time.perf_counter()
         input_chars = sum(len(segment.text) for segment in batch.text_segments)
         request_timeout_s = timeout_s if timeout_s is not None else self._lmstudio_timeout_seconds()
+        request_priority = priority if priority is not None else self._event_summary_priority(reason)
         log_llm_stage(
             self.logger,
             "submission_decision",
@@ -1017,7 +1109,9 @@ class Summarizer:
                     job_type=job_type,
                     on_started=_on_started,
                     on_cancelled=_on_cancelled,
+                    priority=request_priority,
                 )
+            self._clear_lmstudio_state()
             summary_payload = self._enrich_summary_payload(batch, summary_text, summary_json, reason=reason)
             recent_summaries = self.storage.list_summaries(limit=self.summary_deduplicator.recent_compare_count)
             dedup_decision = self.summary_deduplicator.evaluate(
@@ -1231,6 +1325,7 @@ class Summarizer:
                 input_token_estimate=_estimate_token_count(input_chars),
             )
             self._unrecoverable_error = "Timeout error: LM Studio request timed out."
+            self._set_lmstudio_state("degraded", "timeout", "LM Studio timed out while generating an event summary.")
             self._notify_lmstudio_error("lmstudio_timeout", str(exc), key=f"{self._lmstudio_identity()}|timeout")
             log_llm_stage(
                 self.logger,
@@ -1262,6 +1357,7 @@ class Summarizer:
                 input_token_estimate=_estimate_token_count(input_chars),
             )
             self._unrecoverable_error = "Connection error: Unable to reach LM Studio. Check that it is running."
+            self._set_lmstudio_state("offline", "connection", "LM Studio is unreachable.")
             self._notify_lmstudio_error(
                 "lmstudio_connection",
                 str(exc),
@@ -1297,6 +1393,7 @@ class Summarizer:
                 input_token_estimate=_estimate_token_count(input_chars),
             )
             self._unrecoverable_error = "Service unavailable: LM Studio could not generate a response."
+            self._set_lmstudio_state("degraded", "service_unavailable", "LM Studio returned an unavailable response.")
             self._notify_lmstudio_error(
                 "lmstudio_service_unavailable",
                 str(exc),
@@ -1333,6 +1430,7 @@ class Summarizer:
             )
             with self._lock:
                 self._unrecoverable_error = "Summary generation failed."
+            self._set_lmstudio_state("degraded", "unexpected_error", "LM Studio summary generation failed.")
             self.error_notifier.notify(
                 "summary_generation_failure",
                 "Summary generation failed. Check that LM Studio is running and the configured model is available.",
@@ -1484,6 +1582,57 @@ class Summarizer:
             self._unrecoverable_error = message
         self.error_notifier.notify(category, message, key=key)
 
+    def _event_summary_priority(self, reason: str) -> int:
+        return int(self._EVENT_SUMMARY_PRIORITIES.get(reason, 50))
+
+    def _daily_recap_priority(self, reason: str) -> int:
+        return int(self._DAILY_RECAP_PRIORITIES.get(reason, 180))
+
+    def _set_lmstudio_state(self, state: str, category: str, message: str) -> None:
+        with self._lock:
+            self._lmstudio_state = state
+            self._lmstudio_last_error_category = category
+            self._lmstudio_last_error_message = message
+
+    def _clear_lmstudio_state(self) -> None:
+        with self._lock:
+            self._lmstudio_state = "ok"
+            self._lmstudio_last_error_category = None
+            self._lmstudio_last_error_message = None
+
+    def _daily_recap_defer_reason(self, *, reason: str) -> str | None:
+        if reason == "manual":
+            return None
+        runtime = self.get_runtime_status()
+        if bool(runtime["has_unrecoverable_error"]):
+            return "summary_error"
+        lmstudio_state = str(runtime["lmstudio_state"])
+        if lmstudio_state != "ok":
+            return f"lmstudio_{lmstudio_state}"
+        if bool(runtime["process_backlog_only_while_locked"]) and runtime["session_locked"] is False:
+            return "pc_unlocked"
+        if int(runtime["queued_jobs"]) > 0 or int(runtime["running_jobs"]) > 0:
+            return "event_summary_inflight"
+        try:
+            pending = self.storage.get_pending_counts()
+        except Exception:
+            pending = {
+                "intervals": 0,
+                "key_events": 0,
+                "processed_key_events": 0,
+                "text_segments": 0,
+                "screenshots": 0,
+            }
+        if (
+            int(pending["intervals"]) > 0
+            or int(pending["key_events"]) > 0
+            or int(pending["processed_key_events"]) > 0
+            or int(pending["text_segments"]) > 0
+            or int(pending["screenshots"]) > 0
+        ):
+            return "event_backlog"
+        return None
+
     def _lmstudio_identity(self) -> str:
         base_url = getattr(self.lm_client, "base_url", "lmstudio")
         model = getattr(self.lm_client, "model", "unknown-model")
@@ -1528,6 +1677,8 @@ class Summarizer:
             "closing": closing,
             "closed": closing,
             "stopped": closing,
+            "queued_by_type": {},
+            "running_by_type": {},
         }
 
 

@@ -143,7 +143,7 @@ def _flatten_string_values(value: Any) -> list[str]:
         if "text" in value and isinstance(value["text"], str):
             cleaned = value["text"].strip()
             return [cleaned] if cleaned else []
-        compact = json.dumps(value, ensure_ascii=True, sort_keys=True)
+        compact = json.dumps(value, ensure_ascii=False, sort_keys=True)
         return [compact]
     compact = str(value).strip()
     return [compact] if compact else []

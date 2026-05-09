@@ -417,6 +417,12 @@ class FlushCoordinator:
         self._status_lock = threading.Lock()
         self._drain_active = False
         self._drain_reason: str | None = None
+        self._flush_state = "idle"
+        self._flush_blocker: str | None = None
+        self._flush_blocker_detail: str | None = None
+        self._last_request_reason: str | None = None
+        self._last_stop_reason: str | None = None
+        self._last_result: dict[str, int | str] | None = None
 
     def cancel_flush_drain(self) -> bool:
         if not self.is_drain_active:
@@ -436,20 +442,24 @@ class FlushCoordinator:
                 "drain_active": self._drain_active,
                 "drain_reason": self._drain_reason,
                 "cancel_requested": self._drain_cancel_event.is_set(),
+                "flush_state": self._flush_state,
+                "flush_blocker": self._flush_blocker,
+                "flush_blocker_detail": self._flush_blocker_detail,
+                "last_request_reason": self._last_request_reason,
+                "last_stop_reason": self._last_stop_reason,
+                "last_result": dict(self._last_result) if self._last_result is not None else None,
             }
 
     def flush_now(self, reason: str = "manual") -> FlushDrainResult | None:
         if self.services.shutdown_event.is_set():
+            self._set_flush_blocker("shutdown_in_progress", "Flush skipped because shutdown has started.", reason=reason)
             self.logger.info("event=summary_flush_skipped reason=shutdown_in_progress request_reason=%s", reason)
             return None
         if not self._flush_lock.acquire(blocking=False):
+            self._set_flush_blocker("already_running", "A flush drain is already running.", reason=reason)
             self.logger.info("event=summary_flush_skipped reason=already_running request_reason=%s", reason)
             return None
         try:
-            if self.lifecycle_manager.paused_by_lock:
-                self.logger.info("event=summary_flush_skipped reason=paused_by_lock request_reason=%s", reason)
-                return None
-
             flush_started_at = time.perf_counter()
             self._drain_cancel_event.clear()
             self.services.summarizer.clear_unrecoverable_error()
@@ -458,6 +468,10 @@ class FlushCoordinator:
             with self._status_lock:
                 self._drain_active = True
                 self._drain_reason = reason
+                self._flush_state = "running"
+                self._flush_blocker = None
+                self._flush_blocker_detail = None
+                self._last_request_reason = reason
 
             self.logger.info(
                 "event=summary_drain_started reason=%s max_concurrent_summary_llm_requests=%s",
@@ -487,6 +501,7 @@ class FlushCoordinator:
 
                     pending = self.services.storage.get_pending_counts()
                     runtime = self.services.summarizer.get_runtime_status()
+                    self._set_active_blocker_from_runtime(reason=reason, runtime=runtime)
 
                     self.logger.info(
                         (
@@ -553,6 +568,7 @@ class FlushCoordinator:
                     cancelled_jobs=max(0, end_counts.get("cancelled", 0) - start_counts.get("cancelled", 0)),
                     pending_summary_jobs=int(self.services.summarizer.get_runtime_status()["pending_summary_jobs"]),
                 )
+                self._record_last_result(reason=reason, result=result)
                 if result.stop_reason != "error":
                     self.services.error_notifier.resolve("flush_failure")
                 duration_ms = (time.perf_counter() - flush_started_at) * 1000.0
@@ -589,19 +605,80 @@ class FlushCoordinator:
                     reason,
                     duration_ms,
                 )
-                return FlushDrainResult(
+                result = FlushDrainResult(
                     stop_reason="error",
                     summaries_created=0,
                     failed_jobs=0,
                     cancelled_jobs=0,
                     pending_summary_jobs=int(self.services.summarizer.get_runtime_status()["pending_summary_jobs"]),
                 )
+                self._record_last_result(reason=reason, result=result)
+                return result
         finally:
             with self._status_lock:
                 self._drain_active = False
                 self._drain_reason = None
+                if self._flush_state == "running":
+                    self._flush_state = "idle"
+                    self._flush_blocker = None
+                    self._flush_blocker_detail = None
             self.lifecycle_manager.set_idle()
             self._flush_lock.release()
+
+    def _set_flush_blocker(self, blocker: str, detail: str, *, reason: str) -> None:
+        with self._status_lock:
+            self._flush_state = "blocked"
+            self._flush_blocker = blocker
+            self._flush_blocker_detail = detail
+            self._last_request_reason = reason
+
+    def _set_active_blocker_from_runtime(self, *, reason: str, runtime: dict[str, int | bool | str | None]) -> None:
+        blocker: str | None = None
+        detail: str | None = None
+        if bool(runtime["llm_queue_closed"]) or bool(runtime["llm_queue_closing"]) or not bool(runtime["llm_queue_accepting_jobs"]):
+            blocker = "queue_closed"
+            detail = "The LLM queue is closing and cannot start more work."
+        elif str(runtime.get("lmstudio_state", "ok")) != "ok" and int(runtime["pending_summary_jobs"]) > 0:
+            blocker = "lmstudio_error"
+            detail = str(runtime.get("lmstudio_last_error_message") or "LM Studio is degraded.")
+        elif int(runtime.get("daily_recap_running_jobs", 0)) > 0 and int(runtime["pending_summary_jobs"]) > 0:
+            blocker = "waiting_for_daily_recap"
+            detail = "Event summaries are waiting for a daily recap job to release LLM capacity."
+        elif (
+            reason == "scheduled"
+            and bool(runtime["summary_admission_paused"])
+            and int(runtime["running_jobs"]) == 0
+        ):
+            blocker = "waiting_for_pc_lock"
+            detail = "Scheduled drains are waiting for the PC to lock before admitting work."
+        elif (
+            int(runtime["llm_queue_running_jobs"]) >= int(runtime["llm_queue_max_concurrent_jobs"])
+            and int(runtime["pending_summary_jobs"]) > 0
+        ):
+            blocker = "waiting_for_llm"
+            detail = "LLM capacity is busy."
+
+        with self._status_lock:
+            if blocker is None:
+                self._flush_blocker = None
+                self._flush_blocker_detail = None
+                self._flush_state = "running" if self._drain_active else "idle"
+                return
+            self._flush_state = "running"
+            self._flush_blocker = blocker
+            self._flush_blocker_detail = detail
+
+    def _record_last_result(self, *, reason: str, result: FlushDrainResult) -> None:
+        with self._status_lock:
+            self._last_request_reason = reason
+            self._last_stop_reason = result.stop_reason
+            self._last_result = {
+                "stop_reason": result.stop_reason,
+                "summaries_created": result.summaries_created,
+                "failed_jobs": result.failed_jobs,
+                "cancelled_jobs": result.cancelled_jobs,
+                "pending_summary_jobs": result.pending_summary_jobs,
+            }
 
 
 class DiagnosticsService:
@@ -633,8 +710,11 @@ class DiagnosticsService:
             "summary_running": int(runtime["running_jobs"]) > 0,
             "llm_queue_running": int(runtime["llm_queue_running_jobs"]) > 0,
             "flush_drain_active": bool(drain["drain_active"]),
+            "flush_state": drain["flush_state"],
+            "flush_blocker": drain["flush_blocker"],
             "unrecoverable_summary_error": runtime["unrecoverable_error"],
             "summary_admission_paused": bool(runtime["summary_admission_paused"]),
+            "lmstudio_state": runtime["lmstudio_state"],
         }
 
     def get_diagnostics_snapshot(self) -> dict:
@@ -697,6 +777,11 @@ class DiagnosticsService:
                 "failed": int(summary_runtime["failed_jobs"]),
                 "cancelled": int(summary_runtime["cancelled_jobs"]),
             },
+            "daily_recap_jobs": {
+                "queued": int(summary_runtime["daily_recap_waiting_jobs"]),
+                "running": int(summary_runtime["daily_recap_running_jobs"]),
+                "inflight": int(summary_runtime["daily_recap_inflight_jobs"]),
+            },
             "llm_queue": {
                 "queued": int(summary_runtime["llm_queue_queued_jobs"]),
                 "running": int(summary_runtime["llm_queue_running_jobs"]),
@@ -709,11 +794,20 @@ class DiagnosticsService:
             "flush_drain_active": bool(drain["drain_active"]),
             "flush_drain_reason": drain["drain_reason"],
             "flush_drain_cancel_requested": bool(drain["cancel_requested"]),
+            "flush_state": drain["flush_state"],
+            "flush_blocker": drain["flush_blocker"],
+            "flush_blocker_detail": drain["flush_blocker_detail"],
+            "flush_last_request_reason": drain["last_request_reason"],
+            "flush_last_stop_reason": drain["last_stop_reason"],
+            "flush_last_result": drain["last_result"],
             "max_concurrent_summary_llm_requests": int(summary_runtime["max_concurrent_summary_llm_requests"]),
             "unrecoverable_summary_error": summary_runtime["unrecoverable_error"],
             "summary_admission_paused": bool(summary_runtime["summary_admission_paused"]),
             "process_backlog_only_while_locked": bool(summary_runtime["process_backlog_only_while_locked"]),
             "session_locked": summary_runtime["session_locked"],
+            "lmstudio_state": summary_runtime["lmstudio_state"],
+            "lmstudio_last_error_category": summary_runtime["lmstudio_last_error_category"],
+            "lmstudio_last_error_message": summary_runtime["lmstudio_last_error_message"],
             "shutdown_in_progress": bool(self.services.shutdown_event.is_set()),
         }
 

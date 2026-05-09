@@ -26,7 +26,22 @@ class _FakeSummarizer:
     def get_runtime_status(self) -> dict[str, int | bool]:
         idx = min(self._idx, len(self.running_values) - 1)
         pending_jobs = 0 if idx >= 3 else 1
-        return {"queued_jobs": 0, "running_jobs": self.running_values[idx], "pending_summary_jobs": pending_jobs, "has_unrecoverable_error": False, "summary_admission_paused": False, "max_concurrent_summary_llm_requests": 1}
+        return {
+            "queued_jobs": 0,
+            "running_jobs": self.running_values[idx],
+            "pending_summary_jobs": pending_jobs,
+            "has_unrecoverable_error": False,
+            "summary_admission_paused": False,
+            "max_concurrent_summary_llm_requests": 1,
+            "llm_queue_running_jobs": 0,
+            "llm_queue_max_concurrent_jobs": 1,
+            "llm_queue_accepting_jobs": True,
+            "llm_queue_closing": False,
+            "llm_queue_closed": False,
+            "daily_recap_running_jobs": 0,
+            "lmstudio_state": "ok",
+            "lmstudio_last_error_message": None,
+        }
     def wait_for_activity(self, timeout_seconds: float) -> None:
         self.wait_values.append(timeout_seconds)
         self._idx += 1
@@ -86,6 +101,9 @@ def test_flush_now_returns_none_when_drain_already_running(tmp_path: Path) -> No
     assert services.flush_coordinator._flush_lock.acquire(blocking=False)
     try:
         assert services.flush_now(reason="manual") is None
+        status = services.get_status()
+        assert status["flush_state"] == "blocked"
+        assert status["flush_blocker"] == "already_running"
     finally:
         services.flush_coordinator._flush_lock.release()
         services.shutdown()
@@ -204,14 +222,11 @@ def test_flush_now_runs_full_pipeline_on_real_sqlite(tmp_path: Path) -> None:
         services.shutdown()
 
 
-def test_flush_now_releases_lock_after_paused_by_lock_skip(tmp_path: Path) -> None:
+def test_manual_flush_runs_while_capture_is_paused_by_lock(tmp_path: Path) -> None:
     services = MonitoringServices(_config_for_tmp(tmp_path))
     services.summarizer.lm_client = SuccessfulClient()
     try:
-        services.handle_session_locked()
-        assert services.flush_now(reason="manual") is None
-
-        services.handle_session_unlocked()
+        services.lifecycle_manager.handle_session_locked()
         services.storage.insert_text_segments(
             [
                 TextSegment(
@@ -229,6 +244,7 @@ def test_flush_now_releases_lock_after_paused_by_lock_skip(tmp_path: Path) -> No
         result = services.flush_now(reason="manual")
         assert result is not None
         assert result.summaries_created == 1
+        assert services.get_status()["paused_by_lock"] is True
     finally:
         services.shutdown()
 
@@ -285,6 +301,85 @@ def test_scheduled_flush_stops_when_admission_paused(tmp_path: Path) -> None:
         assert services.storage.get_pending_counts()["text_segments"] == 1
     finally:
         services.shutdown()
+
+
+def test_scheduled_flush_runs_while_locked_when_gate_enabled(tmp_path: Path) -> None:
+    class _FakeStorage:
+        def __init__(self) -> None:
+            self.pending_calls = 0
+        def get_summary_job_status_counts(self): return {}
+        def count_unprocessed_key_events(self): return 0
+        def get_pending_counts(self):
+            self.pending_calls += 1
+            if self.pending_calls == 1:
+                return {"text_segments": 1, "screenshots": 0, "intervals": 0, "key_events": 0, "processed_key_events": 0}
+            return {"text_segments": 0, "screenshots": 0, "intervals": 0, "key_events": 0, "processed_key_events": 0}
+
+    class _FakeState:
+        def set_flush_times(self, **_kwargs): ...
+
+    class _FakeLifecycle:
+        paused_by_lock = True
+        def set_draining(self): ...
+        def set_idle(self): ...
+
+    class _FakeKeyboard:
+        def flush_pending_events(self, reason: str): ...
+
+    class _FakeTextService:
+        def process_once(self, force_flush: bool = False): ...
+
+    class _FakeNotifier:
+        def resolve(self, _key: str): ...
+        def notify(self, *_args, **_kwargs): ...
+
+    class _ScheduledSummarizer:
+        def __init__(self) -> None:
+            self.dispatched = 0
+        def clear_unrecoverable_error(self) -> None: ...
+        def cancel_queued_jobs(self, reason: str = "") -> int: return 0
+        def dispatch_pending_jobs(self, reason: str = "") -> int:
+            assert reason == "scheduled"
+            self.dispatched += 1
+            return 1
+        def wait_for_idle(self, timeout_seconds: float) -> None: ...
+        def wait_for_activity(self, timeout_seconds: float) -> None: ...
+        def get_runtime_status(self) -> dict[str, int | bool | str | None]:
+            pending_jobs = 1 if self.dispatched == 0 else 0
+            return {
+                "queued_jobs": 0,
+                "running_jobs": 0,
+                "pending_summary_jobs": pending_jobs,
+                "has_unrecoverable_error": False,
+                "summary_admission_paused": False,
+                "max_concurrent_summary_llm_requests": 1,
+                "llm_queue_running_jobs": 0,
+                "llm_queue_max_concurrent_jobs": 1,
+                "llm_queue_accepting_jobs": True,
+                "llm_queue_closing": False,
+                "llm_queue_closed": False,
+                "daily_recap_running_jobs": 0,
+                "lmstudio_state": "ok",
+                "lmstudio_last_error_message": None,
+            }
+
+    services = type(
+        "S",
+        (),
+        {
+            "shutdown_event": type("E", (), {"is_set": lambda self: False})(),
+            "summarizer": _ScheduledSummarizer(),
+            "storage": _FakeStorage(),
+            "state": _FakeState(),
+            "keyboard_capture": _FakeKeyboard(),
+            "text_service": _FakeTextService(),
+            "error_notifier": _FakeNotifier(),
+        },
+    )()
+    coordinator = FlushCoordinator(services, _FakeLifecycle(), 60, __import__("logging").getLogger(__name__))
+    result = coordinator.flush_now("scheduled")
+    assert result is not None
+    assert result.stop_reason == "empty"
 
 
 def test_flush_coordinator_adaptive_wait_increases_and_resets() -> None:

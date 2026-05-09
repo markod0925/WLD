@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date
 
 import pytest
@@ -294,11 +295,14 @@ def test_daily_recap_prompt_requests_short_highlight_list() -> None:
 
     result = builder.build_daily_recap_prompt(day=date(2026, 4, 14), summaries=summaries)
 
-    assert "structured event outputs" in result.prompt_text
+    assert "daily evidence aggregate" in result.prompt_text
+    assert "summary_index" in result.prompt_text
     assert "confidence_notes" in result.prompt_text
     assert "executive_summary" in result.prompt_text
     assert "workstreams_or_task_candidates" in result.prompt_text
     assert "files_and_documents" in result.prompt_text
+    assert "Do not use phrases like 'the user', 'interacting with', or 'activity log covers'." in result.prompt_text
+    assert "Never include raw Unix timestamps in generated prose" in result.prompt_text
 
 
 def test_summary_prompt_keeps_blocked_intervals_as_unknown_or_blocked() -> None:
@@ -350,6 +354,8 @@ def test_summary_prompt_prioritizes_task_and_file_sections_before_program_prose(
     assert "task_candidates, files_and_documents, conversations_or_references, programs_used" in result.prompt_text
     assert "Do not lead with generic program prose unless no better evidence exists." in result.prompt_text
     assert "blocked_observed_references" in result.prompt_text
+    assert "Do not use phrases like 'the user', 'interacting with', or 'activity log covers'." in result.prompt_text
+    assert "Never include raw Unix timestamps in generated prose" in result.prompt_text
 
 
 def test_lmstudio_client_degrades_generic_event_to_unknowns(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,6 +417,47 @@ def test_lmstudio_client_program_only_event_keeps_generic_summary_with_unknowns(
     assert parsed["unknowns"] == ["insufficient evidence"]
 
 
+def test_lmstudio_client_sanitizes_timestamp_and_template_phrasing(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    response = FakeResponse(
+        '{"summary_text":"activity log covers 1715606400.0 while interacting with MATLAB","task_candidates":[],"files":[],"conversations":[],"outcomes":[],"follow_ups":[],"unknowns":[],"blocked_activity":[],"evidence_quality":{"overall_confidence":0.6,"confidence_notes":[],"field_confidence":{}},"metadata":{}}'
+    )
+
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: response)
+
+    summary_text, parsed = client.summarize_batch(_summary_batch())
+
+    assert "1715606400.0" not in summary_text
+    assert "activity log covers" not in summary_text.lower()
+    assert "interacting with" not in summary_text.lower()
+    assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", summary_text)
+    assert parsed["summary_text"] == summary_text
+
+
+def test_lmstudio_client_sanitizes_nested_generated_prose_without_touching_file_identifiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    response = FakeResponse(
+        '{"summary_text":"ok",'
+        '"outcomes":[{"text":"activity log covers 1715606400 while interacting with parser"}],'
+        '"unknowns_and_privacy_limits":["activity log covers 1715606401"],'
+        '"files_and_documents":[{"path/name":"1715606400.log"}],'
+        '"task_candidates":[{"text":"SLG-487"}],'
+        '"blocked_activity":[],"follow_ups":[],"programs_used":[],"conversations":[],"unknowns":[],"metadata":{}}'
+    )
+
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: response)
+
+    _summary_text, parsed = client.summarize_batch(_summary_batch())
+
+    assert parsed["outcomes"][0]["text"].startswith("Observed activity covers ")
+    assert "interacting with" not in parsed["outcomes"][0]["text"].lower()
+    assert parsed["unknowns_and_privacy_limits"][0].startswith("Observed activity covers ")
+    assert parsed["files_and_documents"][0]["path/name"] == "1715606400.log"
+    assert parsed["task_candidates"][0]["text"] == "SLG-487"
+
+
 def test_prompt_builder_limits_daily_recap_prompt_budget() -> None:
     builder = LMStudioPromptBuilder(
         max_daily_summaries=20,
@@ -431,9 +478,87 @@ def test_prompt_builder_limits_daily_recap_prompt_budget() -> None:
     ]
 
     result = builder.build_daily_recap_prompt(day=date(2026, 4, 20), summaries=summaries)
+    naive_payload = {
+        "schema": "worklog.lmstudio.daily_recap.v1",
+        "day": date(2026, 4, 20).isoformat(),
+        "structured_event_outputs": [
+            {
+                "summary_id": item.id,
+                "summary_text": item.summary_text,
+                "task_candidates": [],
+                "files_and_documents": [],
+                "programs_used": [],
+                "activity_entities": [],
+                "parser_coverage": [],
+            }
+            for item in summaries
+        ],
+        "confidence_notes": [],
+    }
+    naive_prompt = builder._render_prompt(  # noqa: SLF001
+        title="Create a short daily recap for 2026-04-20 from the following batch summaries.",
+        instructions="Return only strict JSON.",
+        payload=naive_payload,
+        metadata={"response_kind": "daily_recap"},
+    )
 
-    assert len(result.prompt_text) > 2000
+    assert len(result.prompt_text) < len(naive_prompt)
     assert result.metadata["max_prompt_chars"] == 2000
+
+
+def test_daily_recap_prompt_aggregate_preserves_program_file_and_task_evidence() -> None:
+    builder = LMStudioPromptBuilder(max_daily_summaries=10, max_text_chars=500, max_prompt_chars=4000)
+    summaries = [
+        SummaryRecord(
+            id=1,
+            job_id=1,
+            start_ts=10.0,
+            end_ts=20.0,
+            summary_text="Worked on SLG-487 in MATLAB",
+            summary_json={
+                "summary_text": "Worked on SLG-487 in MATLAB",
+                "programs_used": [{"name": "matlab.exe"}],
+                "files_and_documents": [{"path/name": "buildImplicitHeliModel.m"}],
+                "task_candidates": [{"text": "SLG-487"}],
+                "source_context": {"window_title": "buildImplicitHeliModel.m - MATLAB"},
+                "activity_entities": [
+                    {"entity_type": "file_path", "entity_value": r"U:\\PROJ1\\buildImplicitHeliModel.m", "entity_normalized": "u:/proj1/buildimplicithelimodel.m"},
+                    {"entity_type": "task_candidate", "entity_value": "SLG-487", "entity_normalized": "slg-487"},
+                    {"entity_type": "program", "entity_value": "matlab.exe", "entity_normalized": "matlab.exe"},
+                ],
+            },
+            created_ts=30.0,
+        )
+    ]
+
+    result = builder.build_daily_recap_prompt(day=date(2026, 4, 20), summaries=summaries)
+
+    assert "matlab.exe" in result.prompt_text
+    assert "buildImplicitHeliModel.m" in result.prompt_text
+    assert "SLG-487" in result.prompt_text
+
+
+def test_daily_recap_prompt_preserves_meaningful_false_flags_in_summary_index() -> None:
+    builder = LMStudioPromptBuilder(max_daily_summaries=10, max_text_chars=500, max_prompt_chars=4000)
+    summaries = [
+        SummaryRecord(
+            id=1,
+            job_id=1,
+            start_ts=10.0,
+            end_ts=20.0,
+            summary_text="Worked on parser cleanup",
+            summary_json={
+                "summary_text": "Worked on parser cleanup",
+                "programs_used": [{"name": "code.exe"}],
+                "activity_entities": [],
+            },
+            created_ts=30.0,
+        )
+    ]
+
+    result = builder.build_daily_recap_prompt(day=date(2026, 4, 20), summaries=summaries)
+
+    assert '"blocked": false' in result.prompt_text
 
 
 def test_prompt_builder_derives_text_char_limit_from_text_segment_budget() -> None:
@@ -568,6 +693,19 @@ def test_lmstudio_client_logs_timeout_category(monkeypatch: pytest.MonkeyPatch, 
         client.summarize_batch(_summary_batch())
 
     assert any("event=lmstudio_request_timeout" in rec.message and "category=timeout" in rec.message for rec in caplog.records)
+
+
+def test_lmstudio_client_backs_off_between_malformed_response_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5)
+    responses = iter([FakeResponse("still bad"), FakeResponse("still bad again")])
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr("worklog_diary.core.lmstudio_client.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    client.summarize_batch(_summary_batch())
+
+    assert sleeps == [0.25]
 
 
 def test_lmstudio_request_id_correlates_start_and_success(monkeypatch: pytest.MonkeyPatch, caplog) -> None:

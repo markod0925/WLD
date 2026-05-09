@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from worklog_diary.core.config import AppConfig
+from worklog_diary.core.errors import LMStudioConnectionError
 from worklog_diary.core.keyboard_capture import KeyboardCaptureService
-from worklog_diary.core.models import ForegroundInfo
+from worklog_diary.core.models import ForegroundInfo, TextSegment
 from worklog_diary.core.privacy import PrivacyPolicyEngine
 from worklog_diary.core.services import MonitoringServices
+
+
+class SuccessfulClient:
+    def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+        return "ok", {"summary_text": "ok", "key_points": [], "blocked_activity": []}
 
 
 def _config_for_tmp(tmp_path: Path, **overrides: object) -> AppConfig:
@@ -193,3 +200,76 @@ def test_summary_admission_state_logs_transition_without_spam(tmp_path: Path, ca
         assert len([line for line in state_logs if "state=blocked" in line]) == 1
     finally:
         services.shutdown()
+
+
+def test_handle_session_locked_triggers_backlog_drain_while_capture_stays_paused(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path, process_backlog_only_while_locked=True))
+    services.summarizer.lm_client = SuccessfulClient()
+    try:
+        services.start_monitoring()
+        services.storage.insert_text_segments(
+            [
+                TextSegment(
+                    id=None,
+                    start_ts=1.0,
+                    end_ts=1.1,
+                    process_name="code.exe",
+                    window_title="Editor",
+                    text="locked-drain",
+                    hotkeys=[],
+                    raw_key_count=1,
+                )
+            ]
+        )
+        services.handle_session_locked()
+
+        status = services.get_status()
+        assert status["paused_by_lock"] is True
+        assert status["monitoring_active"] is False
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if services.storage.get_pending_counts()["text_segments"] == 0:
+                break
+            time.sleep(0.05)
+        assert services.storage.get_pending_counts()["text_segments"] == 0
+        assert services.storage.get_summary_job_status_counts()["succeeded"] == 1
+    finally:
+        services.shutdown()
+
+
+def test_startup_backfill_wrapper_catches_lmstudio_errors(tmp_path: Path, caplog) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+    try:
+        caplog.set_level("INFO")
+        services.summarizer.reconcile_missing_daily_summaries = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            LMStudioConnectionError("Connection error: Unable to reach LM Studio. Check that it is running.")
+        )
+        services._run_startup_daily_backfill()
+        assert any(
+            "event=daily_summary_backfill_thread_stopped reason=lmstudio_error" in rec.message
+            for rec in caplog.records
+        )
+    finally:
+        services.shutdown()
+
+
+def test_shutdown_joins_startup_backfill_thread(tmp_path: Path) -> None:
+    services = MonitoringServices(_config_for_tmp(tmp_path))
+
+    class _DummyThread:
+        def __init__(self) -> None:
+            self.join_calls: list[float] = []
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(0.0 if timeout is None else float(timeout))
+
+    try:
+        services._startup_backfill_thread.join(timeout=1.0)
+        dummy = _DummyThread()
+        services._startup_backfill_thread = dummy  # type: ignore[assignment]
+        services.shutdown()
+        assert dummy.join_calls == [2.0]
+    finally:
+        if not services._shutdown_completed:
+            services.shutdown()

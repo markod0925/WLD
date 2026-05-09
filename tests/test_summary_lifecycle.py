@@ -4,6 +4,8 @@ from datetime import date, datetime, time
 from pathlib import Path
 import time as time_module
 
+import pytest
+
 from worklog_diary.core.batching import BatchBuilder
 from worklog_diary.core.models import ForegroundInfo, KeyEvent, ScreenshotRecord, TextSegment
 from worklog_diary.core.llm_job_queue import LLMJobMetadata
@@ -475,6 +477,67 @@ def test_reconcile_queue_closing_stops_cleanly(tmp_path: Path, monkeypatch) -> N
         job = storage.get_daily_summary_job_for_day(day)
         assert job is not None
         assert job["status"] == "cancelled"
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_reconcile_defers_when_event_backlog_exists(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "worklog.db"
+    shot_path = tmp_path / "screens" / "shot.png"
+    storage = SQLiteStorage(str(db_path))
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
+        lm_client=SuccessfulClient(),
+    )
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 29, 12, 0, 0)
+
+    monkeypatch.setattr("worklog_diary.core.summarizer.datetime", _FixedDateTime)
+    day = date(2026, 4, 27)
+    start = datetime.combine(day, time.min).timestamp()
+    _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text="x")
+    _seed_raw_data(storage, shot_path)
+    try:
+        result = summarizer.reconcile_missing_daily_summaries(reason="startup_backfill")
+        assert result["enqueued"] == 0
+        assert storage.get_daily_summary_job_for_day(day) is None
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_daily_recap_marks_job_failed_on_unexpected_lm_error(tmp_path: Path) -> None:
+    db_path = tmp_path / "worklog.db"
+    storage = SQLiteStorage(str(db_path))
+
+    class _FailingClient:
+        def summarize_batch(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+            return "", {}
+
+        def summarize_daily_recap(self, *_args: object, **_kwargs: object) -> tuple[str, dict]:
+            raise RuntimeError("model crashed")
+
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
+        lm_client=_FailingClient(),
+    )
+
+    day = date(2026, 4, 27)
+    start = datetime.combine(day, time.min).timestamp()
+    _seed_daily_summary_source(storage, day_start_ts=start, day_end_ts=start + 60, text="x")
+    try:
+        with pytest.raises(RuntimeError, match="model crashed"):
+            summarizer.generate_daily_recap_for_day(day)
+        job = storage.get_daily_summary_job_for_day(day)
+        assert job is not None
+        assert job["status"] == "failed"
+        assert "model crashed" in str(job["error"])
     finally:
         summarizer.stop()
         storage.close()

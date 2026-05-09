@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from pathlib import Path
 
+from worklog_diary.core.models import SummaryRecord
 from worklog_diary.core.storage import SQLiteStorage
 from worklog_diary.core.summary_search import SummarySearchParams, SummarySearchScope, SummarySearchService
-from worklog_diary.ui.summaries_view_model import format_summary_html
+from worklog_diary.ui.summaries_view_model import build_summary_card_view, format_summary_html
 
 
 def _ts(day: date, hour: int, minute: int = 0) -> float:
@@ -70,6 +71,14 @@ def test_format_summary_html_highlights_case_insensitive_matches() -> None:
     assert rendered.count("background-color: #fff176") == 3
 
 
+def test_format_summary_html_escapes_html_while_highlighting_special_characters() -> None:
+    rendered = format_summary_html("Used <tag> and updated naïve café notes", "naïve café")
+    assert "&lt;tag&gt;" in rendered
+    assert "<tag>" not in rendered
+    assert "background-color: #fff176" in rendered
+    assert "naïve café" in rendered
+
+
 def test_summary_search_treats_like_wildcards_as_literal_text(tmp_path: Path) -> None:
     storage = SQLiteStorage(str(tmp_path / "worklog.db"))
     service = SummarySearchService(storage)
@@ -96,3 +105,24 @@ def test_summary_search_treats_like_wildcards_as_literal_text(tmp_path: Path) ->
         assert [item.text for item in underscore_results] == ["Reviewed _id mapping"]
     finally:
         storage.close()
+
+
+def test_build_summary_card_view_preserves_non_ascii_in_fallback_json_rendering() -> None:
+    summary = SummaryRecord(
+        id=1,
+        job_id=1,
+        start_ts=10.0,
+        end_ts=20.0,
+        summary_text="fallback",
+        summary_json={
+            "outcomes": [{"status": "résolu", "title": "Caffè Δ sync"}],
+            "programs_used": ["notepad++.exe"],
+        },
+        created_ts=30.0,
+    )
+
+    card = build_summary_card_view(summary)
+
+    assert '{"status": "résolu", "title": "Caffè Δ sync"}' in card.summary_text
+    assert "\\u00e9" not in card.summary_text
+    assert "\\u0394" not in card.summary_text

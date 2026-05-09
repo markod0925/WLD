@@ -27,6 +27,9 @@ class TrayStatusSnapshot:
     paused_by_lock: bool
     shutdown_in_progress: bool
     flush_drain_active: bool
+    flush_state: str
+    flush_blocker: str | None
+    lmstudio_state: str
 
 
 def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
@@ -36,11 +39,16 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
     paused_by_lock = bool(status.get("paused_by_lock"))
     shutdown_in_progress = bool(status.get("shutdown_in_progress"))
     flush_drain_active = bool(status.get("flush_drain_active"))
+    flush_state = str(status.get("flush_state") or ("running" if flush_drain_active else "idle"))
+    flush_blocker = status.get("flush_blocker")
+    if not isinstance(flush_blocker, str):
+        flush_blocker = None
     keyboard_hook_installed_raw = status.get("keyboard_hook_installed")
     keyboard_hook_unavailable = keyboard_hook_installed_raw is False
     blocked = bool(status.get("blocked"))
     summary_admission_paused = bool(status.get("summary_admission_paused"))
     process_backlog_only_while_locked = bool(status.get("process_backlog_only_while_locked"))
+    lmstudio_state = str(status.get("lmstudio_state") or "ok")
 
     pending_text_segments = _coerce_int(status.get("pending_text_segment_count"))
     pending_screenshots = _coerce_int(status.get("pending_screenshot_count"))
@@ -103,6 +111,10 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
     if keyboard_hook_unavailable and monitoring_requested and not shutdown_in_progress:
         detail_lines.append("Warn: kb hook unavailable")
 
+    flush_line = _format_flush_line(flush_state=flush_state, flush_blocker=flush_blocker)
+    if flush_line:
+        detail_lines.append(flush_line)
+
     detail_lines.append(_format_capture_line(pending_screenshots, pending_text_segments))
 
     if open_text_segment_active or pending_key_events > 0:
@@ -119,6 +131,7 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
         running_jobs=running_jobs,
         queued_jobs=queued_jobs,
         waiting_for_lock=waiting_for_lock,
+        lmstudio_state=lmstudio_state,
         unavailable=(shutdown_in_progress or unrecoverable_error or not llm_accepting_jobs or llm_closing or llm_closed),
     ))
 
@@ -136,6 +149,9 @@ def build_tray_status_snapshot(status: Mapping[str, Any]) -> TrayStatusSnapshot:
         paused_by_lock=paused_by_lock,
         shutdown_in_progress=shutdown_in_progress,
         flush_drain_active=flush_drain_active,
+        flush_state=flush_state,
+        flush_blocker=flush_blocker,
+        lmstudio_state=lmstudio_state,
     )
 
 
@@ -190,8 +206,22 @@ def _format_current_line(open_text_segment_chars: int, pending_key_events: int) 
     return f"Cur: {_format_compact_number(open_text_segment_chars)} ch, {_format_compact_number(pending_key_events)} key"
 
 
-def _format_lm_queue_line(running_jobs: int, queued_jobs: int, waiting_for_lock: bool, unavailable: bool) -> str:
-    if unavailable:
+def _format_lm_queue_line(
+    running_jobs: int,
+    queued_jobs: int,
+    waiting_for_lock: bool,
+    lmstudio_state: str,
+    unavailable: bool,
+) -> str:
+    if unavailable and lmstudio_state == "offline":
+        lm_status = "off"
+    elif unavailable and lmstudio_state != "ok":
+        lm_status = "deg"
+    elif lmstudio_state == "offline":
+        lm_status = "off"
+    elif lmstudio_state != "ok":
+        lm_status = "deg"
+    elif unavailable:
         lm_status = "unavail"
     elif running_jobs > 0:
         lm_status = f"{_format_compact_number(running_jobs)} run"
@@ -201,6 +231,26 @@ def _format_lm_queue_line(running_jobs: int, queued_jobs: int, waiting_for_lock:
     if waiting_for_lock:
         return f"LM: {lm_status}, wait lock"
     return f"LM: {lm_status}, Q {_format_compact_number(queued_jobs)}"
+
+
+def _format_flush_line(flush_state: str, flush_blocker: str | None) -> str:
+    if flush_state == "blocked":
+        blocker_labels = {
+            "already_running": "Flush: busy",
+            "shutdown_in_progress": "Flush: shutdown",
+            "queue_closed": "Flush: queue shut",
+        }
+        return blocker_labels.get(flush_blocker or "", "Flush: blocked")
+    if flush_state != "running" or flush_blocker is None:
+        return ""
+    blocker_labels = {
+        "waiting_for_daily_recap": "Flush: wait daily",
+        "waiting_for_llm": "Flush: wait LLM",
+        "waiting_for_pc_lock": "Flush: wait lock",
+        "lmstudio_error": "Flush: LM error",
+        "queue_closed": "Flush: queue shut",
+    }
+    return blocker_labels.get(flush_blocker, "")
 
 
 def _format_compact_number(value: int) -> str:

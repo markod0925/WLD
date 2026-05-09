@@ -20,6 +20,8 @@ def _base_status(**overrides: object) -> dict[str, object]:
         "paused_by_lock": False,
         "shutdown_in_progress": False,
         "flush_drain_active": False,
+        "flush_state": "idle",
+        "flush_blocker": None,
         "blocked": False,
         "pending_text_segment_count": 0,
         "pending_screenshot_count": 0,
@@ -28,6 +30,7 @@ def _base_status(**overrides: object) -> dict[str, object]:
         "llm_queue": {"accepting_jobs": True, "closing": False, "closed": False, "max_concurrent": 2},
         "summary_admission_paused": False,
         "process_backlog_only_while_locked": False,
+        "lmstudio_state": "ok",
         "unrecoverable_summary_error": None,
         "pending_key_event_buffer_count": 0,
         "open_text_segment_active": False,
@@ -85,6 +88,9 @@ def test_crowded_state_keeps_priority_lines_and_drops_cur_first() -> None:
         paused_by_lock=False,
         shutdown_in_progress=False,
         flush_drain_active=False,
+        flush_state="idle",
+        flush_blocker=None,
+        lmstudio_state="ok",
     )
     tooltip = format_tray_tooltip(snapshot)
     lines = tooltip.splitlines()
@@ -109,6 +115,9 @@ def test_tooltip_budget_counts_newlines_in_total_string() -> None:
         paused_by_lock=False,
         shutdown_in_progress=False,
         flush_drain_active=False,
+        flush_state="idle",
+        flush_blocker=None,
+        lmstudio_state="ok",
     )
     tooltip = format_tray_tooltip(snapshot)
     assert len(tooltip) <= MAX_TOOLTIP_TOTAL_CHARS
@@ -133,3 +142,19 @@ def test_keyboard_hook_unavailable_warning_is_present() -> None:
         )
     )
     assert "Warn: kb hook unavailable" in tooltip
+
+
+def test_flush_and_lm_degraded_states_are_exposed_compactly() -> None:
+    tooltip = format_tray_tooltip(
+        build_tray_status_snapshot(
+            _base_status(
+                flush_state="running",
+                flush_blocker="waiting_for_daily_recap",
+                lmstudio_state="offline",
+                summary_jobs={"queued": 2, "running": 1},
+                pending_screenshot_count=1,
+            )
+        )
+    )
+    assert "Flush: wait daily" in tooltip
+    assert "LM: off, Q 2" in tooltip

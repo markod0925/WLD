@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
@@ -67,6 +67,24 @@ DAILY_RECAP_SCHEMA_KEYS = (
     "confidence_notes",
     "metadata",
 )
+_UNIX_TIMESTAMP_RE = re.compile(r"\b\d{10}(?:\.\d+)?\b")
+_INTERACTING_WITH_RE = re.compile(r"\b(?:the user\s+(?:was|is)\s+)?interacting with\b", re.IGNORECASE)
+_ACTIVITY_LOG_COVERS_RE = re.compile(r"\bactivity log covers\b", re.IGNORECASE)
+_SANITIZE_SKIP_KEYS = {
+    "path",
+    "path/name",
+    "name",
+    "program",
+    "process",
+    "window_title",
+    "status",
+    "confidence",
+    "start_ts",
+    "end_ts",
+    "content_captured",
+    "metadata_used",
+    "inferred_reference_type",
+}
 
 
 class LMStudioStructuredResponse:
@@ -887,7 +905,9 @@ class LMStudioClient:
                     next_attempt=attempt + 1,
                     response_kind=response_kind,
                     error=last_error,
+                    backoff_s=_retry_backoff_seconds(attempt),
                 )
+                time.sleep(_retry_backoff_seconds(attempt))
                 current_payload = self._retry_payload(current_payload, response_kind=response_kind, error=last_error)
 
         degraded = _build_degraded_structured_response(
@@ -1023,37 +1043,45 @@ def _build_degraded_structured_response(
     return LMStudioStructuredResponse(payload=payload, primary_text=primary_text, raw_response=raw_response)
 
 
+def _retry_backoff_seconds(attempt: int) -> float:
+    return min(1.0, 0.25 * (2 ** max(0, attempt - 1)))
+
+
 def _normalize_event_summary_payload(
     parsed: dict[str, Any],
     *,
     raw_response: str,
     prompt_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    summary_text = _coerce_text(
-        parsed.get("summary_text") or parsed.get("summary") or parsed.get("recap_text") or raw_response
+    summary_text = _sanitize_generated_text(
+        _coerce_text(
+            parsed.get("summary_text") or parsed.get("summary") or parsed.get("recap_text") or raw_response
+        )
     )
-    primary_activity = _coerce_json_list(parsed.get("primary_activity") or [])
+    primary_activity = _sanitize_generated_structure(_coerce_json_list(parsed.get("primary_activity") or []))
     programs_used = _coerce_json_list(parsed.get("programs_used") or [])
     files_and_documents = _coerce_json_list(parsed.get("files_and_documents") or parsed.get("files") or [])
     files = _coerce_json_list(parsed.get("files") or [])
-    conversations_or_references = _coerce_json_list(
-        parsed.get("conversations_or_references") or parsed.get("conversations") or []
+    conversations_or_references = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("conversations_or_references") or parsed.get("conversations") or [])
     )
-    conversations = _coerce_json_list(parsed.get("conversations") or [])
-    task_candidates = _coerce_json_list(parsed.get("task_candidates") or parsed.get("key_points") or [])
-    outcomes = _coerce_json_list(parsed.get("outcomes") or parsed.get("key_points") or [])
-    follow_ups = _coerce_json_list(parsed.get("follow_ups") or [])
-    jira_update_candidates = _coerce_json_list(parsed.get("jira_update_candidates") or [])
-    blocked_activity = _coerce_json_list(parsed.get("blocked_activity") or [])
-    blocked_observed_references = _coerce_json_list(parsed.get("blocked_observed_references") or [])
-    unknowns_and_privacy_limits = _coerce_json_list(
-        parsed.get("unknowns_and_privacy_limits") or parsed.get("unknowns") or []
+    conversations = _sanitize_generated_structure(_coerce_json_list(parsed.get("conversations") or []))
+    task_candidates = _sanitize_generated_structure(_coerce_json_list(parsed.get("task_candidates") or parsed.get("key_points") or []))
+    outcomes = _sanitize_generated_structure(_coerce_json_list(parsed.get("outcomes") or parsed.get("key_points") or []))
+    follow_ups = _sanitize_generated_structure(_coerce_json_list(parsed.get("follow_ups") or []))
+    jira_update_candidates = _sanitize_generated_structure(_coerce_json_list(parsed.get("jira_update_candidates") or []))
+    blocked_activity = _sanitize_generated_structure(_coerce_json_list(parsed.get("blocked_activity") or []))
+    blocked_observed_references = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("blocked_observed_references") or [])
     )
-    unknowns = _coerce_json_list(parsed.get("unknowns") or [])
+    unknowns_and_privacy_limits = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("unknowns_and_privacy_limits") or parsed.get("unknowns") or [])
+    )
+    unknowns = _sanitize_generated_structure(_coerce_json_list(parsed.get("unknowns") or []))
     evidence_quality = parsed.get("evidence_quality") if isinstance(parsed.get("evidence_quality"), dict) else {}
     evidence_quality = {
         "overall_confidence": _coerce_confidence(evidence_quality.get("overall_confidence"), default=0.25 if raw_response else 0.0),
-        "confidence_notes": _coerce_string_list(evidence_quality.get("confidence_notes")),
+        "confidence_notes": [_sanitize_generated_text(item) for item in _coerce_string_list(evidence_quality.get("confidence_notes"))],
         "field_confidence": evidence_quality.get("field_confidence") if isinstance(evidence_quality.get("field_confidence"), dict) else {},
     }
     if not unknowns and evidence_quality["overall_confidence"] < 0.5:
@@ -1091,11 +1119,13 @@ def _normalize_daily_recap_payload(
     raw_response: str,
     prompt_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    executive_summary = _coerce_text(
-        parsed.get("executive_summary") or parsed.get("summary_text") or parsed.get("summary") or raw_response
+    executive_summary = _sanitize_generated_text(
+        _coerce_text(
+            parsed.get("executive_summary") or parsed.get("summary_text") or parsed.get("summary") or raw_response
+        )
     )
-    workstreams_or_task_candidates = _coerce_json_list(
-        parsed.get("workstreams_or_task_candidates") or parsed.get("tasks_advanced") or []
+    workstreams_or_task_candidates = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("workstreams_or_task_candidates") or parsed.get("tasks_advanced") or [])
     )
     files_and_documents = _coerce_json_list(
         parsed.get("files_and_documents")
@@ -1103,32 +1133,34 @@ def _normalize_daily_recap_payload(
         or parsed.get("files_likely_modified")
         or []
     )
-    conversations_meetings_and_references = _coerce_json_list(
-        parsed.get("conversations_meetings_and_references") or parsed.get("conversations_or_meetings") or []
+    conversations_meetings_and_references = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("conversations_meetings_and_references") or parsed.get("conversations_or_meetings") or [])
     )
-    program_activity_breakdown = _coerce_json_list(
-        parsed.get("program_activity_breakdown") or parsed.get("key_points") or []
+    program_activity_breakdown = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("program_activity_breakdown") or parsed.get("key_points") or [])
     )
-    outcomes = _coerce_json_list(parsed.get("outcomes") or parsed.get("decisions") or parsed.get("key_points") or [])
-    follow_ups_or_jira_candidates = _coerce_json_list(
-        parsed.get("follow_ups_or_jira_candidates") or parsed.get("follow_ups") or parsed.get("jira_update_candidates") or []
+    outcomes = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("outcomes") or parsed.get("decisions") or parsed.get("key_points") or [])
     )
-    evidence_limits_and_unknowns = _coerce_json_list(
-        parsed.get("evidence_limits_and_unknowns") or parsed.get("open_questions") or parsed.get("confidence_notes") or []
+    follow_ups_or_jira_candidates = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("follow_ups_or_jira_candidates") or parsed.get("follow_ups") or parsed.get("jira_update_candidates") or [])
+    )
+    evidence_limits_and_unknowns = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("evidence_limits_and_unknowns") or parsed.get("open_questions") or parsed.get("confidence_notes") or [])
     )
 
-    tasks_advanced = _coerce_json_list(parsed.get("tasks_advanced") or workstreams_or_task_candidates)
+    tasks_advanced = _sanitize_generated_structure(_coerce_json_list(parsed.get("tasks_advanced") or workstreams_or_task_candidates))
     files_observed = _coerce_json_list(parsed.get("files_observed") or files_and_documents)
     files_likely_modified = _coerce_json_list(parsed.get("files_likely_modified") or [])
-    conversations_or_meetings = _coerce_json_list(
-        parsed.get("conversations_or_meetings") or conversations_meetings_and_references
+    conversations_or_meetings = _sanitize_generated_structure(
+        _coerce_json_list(parsed.get("conversations_or_meetings") or conversations_meetings_and_references)
     )
-    decisions = _coerce_json_list(parsed.get("decisions") or outcomes)
-    blockers = _coerce_json_list(parsed.get("blockers") or parsed.get("blocked_activity") or [])
-    follow_ups = _coerce_json_list(parsed.get("follow_ups") or follow_ups_or_jira_candidates)
-    jira_update_candidates = _coerce_json_list(parsed.get("jira_update_candidates") or follow_ups_or_jira_candidates)
-    open_questions = _coerce_json_list(parsed.get("open_questions") or evidence_limits_and_unknowns)
-    confidence_notes = _coerce_string_list(parsed.get("confidence_notes") or [])
+    decisions = _sanitize_generated_structure(_coerce_json_list(parsed.get("decisions") or outcomes))
+    blockers = _sanitize_generated_structure(_coerce_json_list(parsed.get("blockers") or parsed.get("blocked_activity") or []))
+    follow_ups = _sanitize_generated_structure(_coerce_json_list(parsed.get("follow_ups") or follow_ups_or_jira_candidates))
+    jira_update_candidates = _sanitize_generated_structure(_coerce_json_list(parsed.get("jira_update_candidates") or follow_ups_or_jira_candidates))
+    open_questions = _sanitize_generated_structure(_coerce_json_list(parsed.get("open_questions") or evidence_limits_and_unknowns))
+    confidence_notes = [_sanitize_generated_text(item) for item in _coerce_string_list(parsed.get("confidence_notes") or [])]
     metadata = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
     if not open_questions and not confidence_notes:
         confidence_notes = ["insufficient evidence"]
@@ -1167,6 +1199,46 @@ def _coerce_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _sanitize_generated_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    text = _UNIX_TIMESTAMP_RE.sub(_replace_unix_timestamp, text)
+    text = _INTERACTING_WITH_RE.sub("using", text)
+    text = _ACTIVITY_LOG_COVERS_RE.sub("Observed activity covers", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _replace_unix_timestamp(match: re.Match[str]) -> str:
+    raw_value = match.group(0)
+    try:
+        ts = float(raw_value)
+    except ValueError:
+        return raw_value
+    if ts < 1_500_000_000 or ts > 4_102_444_800:
+        return raw_value
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _sanitize_generated_structure(value: Any, *, _parent_key: str | None = None) -> Any:
+    if isinstance(value, str):
+        if _parent_key in _SANITIZE_SKIP_KEYS:
+            return value
+        return _sanitize_generated_text(value)
+    if isinstance(value, list):
+        return [_sanitize_generated_structure(item, _parent_key=_parent_key) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: (
+                item
+                if key in _SANITIZE_SKIP_KEYS
+                else _sanitize_generated_structure(item, _parent_key=key)
+            )
+            for key, item in value.items()
+        }
+    return value
 
 
 def _coerce_string_list(value: Any) -> list[str]:

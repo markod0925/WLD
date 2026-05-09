@@ -83,6 +83,83 @@ def test_ticket_label_extraction() -> None:
     assert tickets == ["ABC-1234", "DEF-4321"]
 
 
+def test_matlab_editor_title_marks_specialized_parser_and_file_signal() -> None:
+    drafts, coverage = extract_activity_entities_with_coverage(
+        start_ts=1.0,
+        end_ts=2.0,
+        process_name="matlab.exe",
+        window_title="Editor - buildImplicitHeliModel.m - MATLAB R2024b",
+    )
+    grouped = _by_type(drafts)
+
+    assert grouped["file_name"][0].entity_value == "buildImplicitHeliModel.m"
+    assert coverage["used_specialized_parser"] is True
+    assert "matlab_title" in coverage["matched_parser_names"]
+
+
+def test_explorer_title_promotes_observed_workstream() -> None:
+    drafts, coverage = extract_activity_entities_with_coverage(
+        start_ts=1.0,
+        end_ts=2.0,
+        process_name="explorer.exe",
+        window_title="SLG-487 - File Explorer",
+    )
+    grouped = _by_type(drafts)
+
+    assert grouped["project_candidate"][0].entity_value == "SLG-487"
+    assert grouped["project_candidate"][0].attributes["observed_title_only"] is True
+    assert coverage["used_specialized_parser"] is True
+    assert "explorer_title" in coverage["matched_parser_names"]
+
+
+def test_word_title_extracts_document_name() -> None:
+    drafts, coverage = extract_activity_entities_with_coverage(
+        start_ts=1.0,
+        end_ts=2.0,
+        process_name="winword.exe",
+        window_title="Audit notes.docx - Word",
+    )
+    grouped = _by_type(drafts)
+
+    assert grouped["file_name"][0].entity_value == "Audit notes.docx"
+    assert coverage["used_specialized_parser"] is True
+    assert "word_title" in coverage["matched_parser_names"]
+
+
+def test_notepadplusplus_title_extracts_document_name() -> None:
+    drafts, coverage = extract_activity_entities_with_coverage(
+        start_ts=1.0,
+        end_ts=2.0,
+        process_name="notepad++.exe",
+        window_title="todo.txt - Notepad++",
+    )
+    grouped = _by_type(drafts)
+
+    assert grouped["file_name"][0].entity_value == "todo.txt"
+    assert coverage["used_specialized_parser"] is True
+    assert "notepadpp_title" in coverage["matched_parser_names"]
+
+
+def test_lm_studio_and_wld_titles_are_not_counted_as_unknown_apps() -> None:
+    _drafts_a, lm_coverage = extract_activity_entities_with_coverage(
+        start_ts=1.0,
+        end_ts=2.0,
+        process_name="lm studio.exe",
+        window_title="Local Server - LM Studio",
+    )
+    _drafts_b, wld_coverage = extract_activity_entities_with_coverage(
+        start_ts=3.0,
+        end_ts=4.0,
+        process_name="wld.exe",
+        window_title="Summaries - WorkLog Diary",
+    )
+
+    assert lm_coverage["unknown_app"] is False
+    assert wld_coverage["unknown_app"] is False
+    assert "lm_studio_title" in lm_coverage["matched_parser_names"]
+    assert "wld_title" in wld_coverage["matched_parser_names"]
+
+
 def test_unknown_app_title_preserves_raw_evidence_and_generic_tokens() -> None:
     drafts, coverage = extract_activity_entities_with_coverage(
         start_ts=1.0,

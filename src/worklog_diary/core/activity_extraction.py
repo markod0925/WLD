@@ -278,9 +278,21 @@ def _extract_title_entities(
     )
     coverage["matched_parser_names"].update(generic_parser_names)
 
+    specialized_parser_names.update(
+        _extract_app_specific_title_entities(
+            drafts,
+            window_title=window_title,
+            process_name=process_name,
+            source_ref=source_ref,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+    )
+    coverage["matched_parser_names"].update(specialized_parser_names)
+
     if _is_browser_title(lower_process, lower_title):
         page_title = _strip_browser_suffix(window_title)
-        if page_title and page_title != window_title:
+        if page_title:
             _merge_draft(
                 drafts,
                 ActivityEntityDraft(
@@ -292,8 +304,8 @@ def _extract_title_entities(
                     evidence_kind="observed",
                     confidence=0.93,
                     attributes={"start_ts": start_ts, "end_ts": end_ts, "browser_process": process_name},
-            ),
-        )
+                ),
+            )
             specialized_parser_names.add("browser_title")
             coverage["matched_parser_names"].add("browser_title")
 
@@ -352,6 +364,208 @@ def _extract_title_entities(
         coverage["matched_parser_names"].add("ticket_label")
 
     return specialized_parser_names
+
+
+def _extract_app_specific_title_entities(
+    drafts: dict[tuple[str, str], ActivityEntityDraft],
+    *,
+    window_title: str,
+    process_name: str,
+    source_ref: str,
+    start_ts: float,
+    end_ts: float,
+) -> set[str]:
+    lower_process = process_name.lower().strip()
+    parser_names: set[str] = set()
+
+    if lower_process == "matlab.exe":
+        parser_names.update(
+            _extract_specialized_title_tokens(
+                drafts,
+                title=_strip_matlab_title(window_title),
+                parser_name="matlab_title",
+                source_ref=source_ref,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                fallback_project=True,
+            )
+        )
+        if _normalize_text(window_title).startswith("matlab r"):
+            parser_names.add("matlab_main_window")
+
+    elif lower_process == "explorer.exe":
+        parser_names.update(
+            _extract_specialized_title_tokens(
+                drafts,
+                title=_strip_explorer_title(window_title),
+                parser_name="explorer_title",
+                source_ref=source_ref,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                fallback_project=True,
+            )
+        )
+
+    elif lower_process == "winword.exe":
+        parser_names.update(
+            _extract_specialized_title_tokens(
+                drafts,
+                title=_strip_known_suffixes(window_title, (" - Word", " - Microsoft Word", " - Compatibility Mode - Word")),
+                parser_name="word_title",
+                source_ref=source_ref,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                fallback_file_name=True,
+            )
+        )
+
+    elif lower_process == "notepad++.exe":
+        parser_names.update(
+            _extract_specialized_title_tokens(
+                drafts,
+                title=_strip_known_suffixes(window_title, (" - Notepad++",)),
+                parser_name="notepadpp_title",
+                source_ref=source_ref,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                fallback_file_name=True,
+            )
+        )
+
+    elif lower_process == "lm studio.exe":
+        parser_names.update(
+            _extract_specialized_title_tokens(
+                drafts,
+                title=_strip_known_suffixes(window_title, (" - LM Studio",)),
+                parser_name="lm_studio_title",
+                source_ref=source_ref,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                fallback_project=True,
+            )
+        )
+
+    elif lower_process == "wld.exe":
+        parser_names.update(
+            _extract_specialized_title_tokens(
+                drafts,
+                title=_strip_known_suffixes(window_title, (" - WorkLog Diary", " - WLD")),
+                parser_name="wld_title",
+                source_ref=source_ref,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                fallback_project=True,
+            )
+        )
+
+    return parser_names
+
+
+def _extract_specialized_title_tokens(
+    drafts: dict[tuple[str, str], ActivityEntityDraft],
+    *,
+    title: str,
+    parser_name: str,
+    source_ref: str,
+    start_ts: float,
+    end_ts: float,
+    fallback_file_name: bool = False,
+    fallback_project: bool = False,
+) -> set[str]:
+    cleaned = title.strip()
+    if not cleaned:
+        return set()
+
+    matched = _extract_generic_entities(
+        drafts,
+        text=cleaned,
+        source_kind="window_title",
+        source_ref=source_ref,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        dirty_marker=bool(_TRAILING_DIRTY_MARKER_RE.search(title)),
+    )
+    parser_names = {parser_name}
+    parser_names.update(f"{parser_name}:{item}" for item in sorted(matched))
+
+    if fallback_file_name:
+        _add_title_only_file_name(
+            drafts,
+            title=cleaned,
+            source_ref=source_ref,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+    if fallback_project and not any(item.entity_type == "project_candidate" for item in drafts.values()):
+        token = cleaned.strip().strip("-").strip()
+        normalized = _normalize_text(token)
+        if token and normalized not in _GENERIC_PROJECT_SEGMENTS:
+            _merge_draft(
+                drafts,
+                ActivityEntityDraft(
+                    entity_type="project_candidate",
+                    entity_value=token,
+                    entity_normalized=normalized,
+                    source_kind="window_title",
+                    source_ref=source_ref,
+                    evidence_kind="observed",
+                    confidence=0.68,
+                    attributes={"start_ts": start_ts, "end_ts": end_ts, "observed_title_only": True},
+                ),
+            )
+    return parser_names
+
+
+def _add_title_only_file_name(
+    drafts: dict[tuple[str, str], ActivityEntityDraft],
+    *,
+    title: str,
+    source_ref: str,
+    start_ts: float,
+    end_ts: float,
+) -> None:
+    candidate = title.strip()
+    if not candidate or _looks_like_windows_path(candidate):
+        return
+    candidate = candidate.split(" - ", 1)[0].strip()
+    if not candidate:
+        return
+    _merge_draft(
+        drafts,
+        ActivityEntityDraft(
+            entity_type="file_name",
+            entity_value=candidate,
+            entity_normalized=candidate.lower(),
+            source_kind="window_title",
+            source_ref=source_ref,
+            evidence_kind="observed",
+            confidence=0.72,
+            attributes={"start_ts": start_ts, "end_ts": end_ts, "observed_title_only": True},
+        ),
+    )
+
+
+def _strip_known_suffixes(title: str, suffixes: tuple[str, ...]) -> str:
+    stripped = title.strip()
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)].strip()
+                changed = True
+    return stripped
+
+
+def _strip_matlab_title(title: str) -> str:
+    stripped = _strip_known_suffixes(title, (" - MATLAB", " - Simulink"))
+    stripped = re.sub(r"\s+-\s+MATLAB R\d{4}[ab]\s*$", "", stripped, flags=re.IGNORECASE).strip()
+    stripped = re.sub(r"^(Editor|Live Editor)\s+-\s+", "", stripped, flags=re.IGNORECASE).strip()
+    return stripped
+
+
+def _strip_explorer_title(title: str) -> str:
+    return _strip_known_suffixes(title, (" - File Explorer", " - Windows Explorer"))
 
 
 def _extract_text_entities(

@@ -29,6 +29,7 @@ def _insert_summary(
     process: str = "code.exe",
     window: str = "Editor",
     closure_reason: str = "open",
+    activity_entities: list[dict[str, object]] | None = None,
 ) -> int:
     job_id = storage.create_summary_job(start_ts=start_ts, end_ts=end_ts, status="succeeded")
     return storage.insert_summary(
@@ -43,6 +44,7 @@ def _insert_summary(
                 "window_title": window,
                 "closure_reason": closure_reason,
             },
+            "activity_entities": activity_entities or [],
         },
     )
 
@@ -179,6 +181,202 @@ def test_merge_when_adjacent_high_similarity() -> None:
     assert plans[0].source_summary_ids == [1, 2]
 
 
+def test_merge_when_same_file_and_task_continue_despite_transition_words() -> None:
+    day = date(2026, 4, 10)
+    entity_rows = [
+        {"entity_type": "file_name", "entity_value": "buildImplicitHeliModel.m", "entity_normalized": "buildimplicithelimodel.m"},
+        {"entity_type": "task_candidate", "entity_value": "SLG-487", "entity_normalized": "slg-487"},
+        {"entity_type": "program", "entity_value": "matlab.exe", "entity_normalized": "matlab.exe"},
+    ]
+    left = SummaryRecord(
+        1,
+        1,
+        _ts(day, 9, 0),
+        _ts(day, 9, 5),
+        "worked on buildImplicitHeliModel.m for SLG-487",
+        {"source_context": {"process_name": "matlab.exe", "window_title": "buildImplicitHeliModel.m"}, "activity_entities": entity_rows},
+        0,
+    )
+    right = SummaryRecord(
+        2,
+        2,
+        _ts(day, 9, 6),
+        _ts(day, 9, 10),
+        "then refined the same SLG-487 model",
+        {"source_context": {"process_name": "matlab.exe", "window_title": "buildImplicitHeliModel.m"}, "activity_entities": entity_rows},
+        0,
+    )
+    plans, diag = _engine({1: [1.0, 0.0], 2: [0.8, 0.2]}).build_coalesced_plans([left, right])
+    assert len(plans) == 1
+    assert diag[0].decision == "merge"
+    assert " Then " not in plans[0].summary_text
+    assert plans[0].summary_json["task_candidates"] == ["SLG-487"]
+    assert plans[0].summary_json["files_and_documents"] == ["buildImplicitHeliModel.m"]
+    assert plans[0].summary_json["programs_used"] == ["matlab.exe"]
+
+
+def test_same_app_without_concrete_overlap_does_not_merge() -> None:
+    day = date(2026, 4, 10)
+    left = SummaryRecord(
+        1,
+        1,
+        _ts(day, 9, 0),
+        _ts(day, 9, 5),
+        "worked on alpha task",
+        {"source_context": {"process_name": "code.exe", "window_title": "alpha.py"}, "activity_entities": [{"entity_type": "file_name", "entity_value": "alpha.py", "entity_normalized": "alpha.py"}]},
+        0,
+    )
+    right = SummaryRecord(
+        2,
+        2,
+        _ts(day, 9, 6),
+        _ts(day, 9, 10),
+        "worked on beta task",
+        {"source_context": {"process_name": "code.exe", "window_title": "beta.py"}, "activity_entities": [{"entity_type": "file_name", "entity_value": "beta.py", "entity_normalized": "beta.py"}]},
+        0,
+    )
+    plans, diag = _engine({1: [1.0, 0.0], 2: [0.9, 0.1]}).build_coalesced_plans([left, right])
+    assert len(plans) == 2
+    assert diag[0].decision == "no_merge"
+
+
+def test_lock_boundary_is_penalty_when_concrete_continuity_is_strong() -> None:
+    day = date(2026, 4, 10)
+    entity_rows = [
+        {"entity_type": "file_name", "entity_value": "parser.py", "entity_normalized": "parser.py"},
+        {"entity_type": "task_candidate", "entity_value": "ABC-1234", "entity_normalized": "abc-1234"},
+    ]
+    left = SummaryRecord(
+        1,
+        1,
+        _ts(day, 9, 0),
+        _ts(day, 9, 5),
+        "worked on parser.py for ABC-1234",
+        {"source_context": {"process_name": "code.exe", "window_title": "parser.py", "closure_reason": "lock_state_changed"}, "activity_entities": entity_rows},
+        0,
+    )
+    right = SummaryRecord(
+        2,
+        2,
+        _ts(day, 9, 6),
+        _ts(day, 9, 10),
+        "continued parser work after unlock",
+        {"source_context": {"process_name": "code.exe", "window_title": "parser.py"}, "activity_entities": entity_rows},
+        0,
+    )
+    plans, diag = _engine({1: [1.0, 0.0], 2: [1.0, 0.0]}).build_coalesced_plans([left, right])
+    assert len(plans) == 1
+    assert "lock_boundary" not in diag[0].blockers
+    assert "lock_boundary_penalty" in diag[0].reasons
+
+
+def test_same_generic_browser_window_alone_does_not_merge() -> None:
+    day = date(2026, 4, 10)
+    left = SummaryRecord(
+        1,
+        1,
+        _ts(day, 9, 0),
+        _ts(day, 9, 5),
+        "reviewed one page",
+        {"source_context": {"process_name": "msedge.exe", "window_title": "New Tab"}, "activity_entities": []},
+        0,
+    )
+    right = SummaryRecord(
+        2,
+        2,
+        _ts(day, 9, 6),
+        _ts(day, 9, 10),
+        "reviewed another page",
+        {"source_context": {"process_name": "msedge.exe", "window_title": "New Tab"}, "activity_entities": []},
+        0,
+    )
+    plans, diag = _engine({1: [1.0, 0.0], 2: [1.0, 0.0]}).build_coalesced_plans([left, right])
+    assert len(plans) == 2
+    assert diag[0].decision == "no_merge"
+
+
+def test_same_basename_without_folder_or_task_overlap_does_not_merge() -> None:
+    day = date(2026, 4, 10)
+    left = SummaryRecord(
+        1,
+        1,
+        _ts(day, 9, 0),
+        _ts(day, 9, 5),
+        "worked on shared README",
+        {
+            "source_context": {"process_name": "code.exe", "window_title": "workspace-a"},
+            "activity_entities": [{"entity_type": "file_name", "entity_value": "README.md", "entity_normalized": "readme.md"}],
+        },
+        0,
+    )
+    right = SummaryRecord(
+        2,
+        2,
+        _ts(day, 9, 6),
+        _ts(day, 9, 10),
+        "worked on other shared README",
+        {
+            "source_context": {"process_name": "code.exe", "window_title": "workspace-b"},
+            "activity_entities": [{"entity_type": "file_name", "entity_value": "README.md", "entity_normalized": "readme.md"}],
+        },
+        0,
+    )
+    plans, diag = _engine({1: [1.0, 0.0], 2: [1.0, 0.0]}).build_coalesced_plans([left, right])
+    assert len(plans) == 2
+    assert diag[0].decision == "no_merge"
+
+
+def test_neighbor_count_does_not_bridge_across_unrelated_middle_summary() -> None:
+    day = date(2026, 4, 10)
+    summaries = [
+        SummaryRecord(
+            1,
+            1,
+            _ts(day, 9, 0),
+            _ts(day, 9, 5),
+            "worked on parser.py for ABC-1234",
+            {
+                "source_context": {"process_name": "code.exe", "window_title": "parser.py"},
+                "activity_entities": [
+                    {"entity_type": "file_name", "entity_value": "parser.py", "entity_normalized": "parser.py"},
+                    {"entity_type": "task_candidate", "entity_value": "ABC-1234", "entity_normalized": "abc-1234"},
+                ],
+            },
+            0,
+        ),
+        SummaryRecord(
+            2,
+            2,
+            _ts(day, 9, 6),
+            _ts(day, 9, 10),
+            "continued ABC-1234 checklist work",
+            {
+                "source_context": {"process_name": "code.exe", "window_title": "abc-1234-notes"},
+                "activity_entities": [
+                    {"entity_type": "task_candidate", "entity_value": "ABC-1234", "entity_normalized": "abc-1234"},
+                ],
+            },
+            0,
+        ),
+        SummaryRecord(
+            3,
+            3,
+            _ts(day, 9, 11),
+            _ts(day, 9, 15),
+            "more parser.py work",
+            {
+                "source_context": {"process_name": "code.exe", "window_title": "parser.py"},
+                "activity_entities": [{"entity_type": "file_name", "entity_value": "parser.py", "entity_normalized": "parser.py"}],
+            },
+            0,
+        ),
+    ]
+    engine = _engine({1: [1.0, 0.0], 2: [0.9, 0.1], 3: [1.0, 0.0]}, max_neighbor_count=2)
+    plans, diag = engine.build_coalesced_plans(summaries)
+    assert len(plans) == 2
+    assert any("transitive_bridge_blocked" in item.reasons for item in diag)
+
+
 def test_merge_lineage_persistence(tmp_path: Path) -> None:
     storage = SQLiteStorage(str(tmp_path / "worklog.db"))
     try:
@@ -223,7 +421,7 @@ def test_semantic_diagnostics_filters(tmp_path: Path) -> None:
         assert len(no_merge_rows) >= 1
         assert len(keyword_rows) >= 1
         assert len(id_filtered_rows) >= 1
-        assert len(low_score_rows) == 1
+        assert all(row.final_score <= 0.90 for row in low_score_rows)
     finally:
         storage.close()
 

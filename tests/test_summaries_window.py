@@ -6,6 +6,8 @@ from datetime import date
 from types import SimpleNamespace
 
 import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLabel
 
 from qt_test_utils import require_qt
 from worklog_diary.core.models import DailySummaryRecord, SummaryRecord
@@ -174,3 +176,41 @@ def test_summaries_window_auto_refreshes_when_storage_changes() -> None:
         window.close()
         window.deleteLater()
         app.processEvents()
+
+
+def test_summary_card_body_is_selectable_and_uses_explicit_text_formats() -> None:
+    from worklog_diary.ui.summaries_view_model import SummaryCardView
+    from worklog_diary.ui.summaries_window import _build_summary_card_widget
+
+    card = SummaryCardView(
+        summary_id=1,
+        time_range="10:00:00 - 10:15:00",
+        summary_text="Investigated <parser> issue and fixed naïve matching.",
+        major_activities=["Opened Caffè plan.md"],
+        blocked_notes=[],
+        uncertainty_notes=[],
+    )
+
+    widget = _build_summary_card_widget(card, "naïve")
+    labels = widget.findChildren(QLabel)
+    assert len(labels) >= 3
+
+    header_label = labels[0]
+    summary_label = labels[1]
+    details_label = labels[2]
+    selectable_flags = (
+        Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+    )
+
+    try:
+        assert header_label.textFormat() == Qt.TextFormat.PlainText
+        assert summary_label.textFormat() == Qt.TextFormat.RichText
+        assert summary_label.textInteractionFlags() == selectable_flags
+        assert "background-color: #fff176" in summary_label.text()
+        assert "&lt;parser&gt;" in summary_label.text()
+        assert "<parser>" not in summary_label.text()
+        assert details_label.textFormat() == Qt.TextFormat.PlainText
+        assert details_label.textInteractionFlags() == selectable_flags
+        assert "Caffè" in details_label.text()
+    finally:
+        widget.deleteLater()

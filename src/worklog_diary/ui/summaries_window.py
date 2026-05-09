@@ -5,7 +5,7 @@ import threading
 from collections.abc import Callable
 from datetime import date
 
-from PySide6.QtCore import QDate, QTimer, Signal
+from PySide6.QtCore import QDate, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (
     QCalendarWidget,
@@ -610,22 +610,43 @@ def _build_summary_card_widget(
         count = max(card.coalesced_member_count, 2)
         confidence = f" | {card.confidence_bucket}" if card.confidence_bucket else ""
         header_text = f"{header_text}   [Coalesced ×{count}{confidence}]"
-    layout.addWidget(QLabel(header_text))
+    header_label = QLabel(header_text)
+    header_label.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(header_label)
     if card.is_coalesced and card.coalesced_source_ids and on_inspect is not None:
         inspect_button = QPushButton("Inspect merge diagnostics")
         inspect_button.clicked.connect(lambda *_: on_inspect(card.coalesced_source_ids or []))
         layout.addWidget(inspect_button)
     summary_label = QLabel()
     summary_label.setWordWrap(True)
+    summary_label.setTextFormat(Qt.TextFormat.RichText)
+    summary_label.setTextInteractionFlags(
+        Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+    )
     summary_label.setText(format_summary_html(card.summary_text or "(empty)", highlight_query))
     layout.addWidget(summary_label)
 
     if card.major_activities:
-        layout.addWidget(QLabel(_format_list_block("Major activities", card.major_activities)))
+        activities_label = QLabel(_format_list_block("Major activities", card.major_activities))
+        activities_label.setTextFormat(Qt.TextFormat.PlainText)
+        activities_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        layout.addWidget(activities_label)
     if card.blocked_notes:
-        layout.addWidget(QLabel(_format_list_block("Blocked/unanalyzed notes", card.blocked_notes)))
+        blocked_label = QLabel(_format_list_block("Blocked/unanalyzed notes", card.blocked_notes))
+        blocked_label.setTextFormat(Qt.TextFormat.PlainText)
+        blocked_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        layout.addWidget(blocked_label)
     if card.uncertainty_notes:
-        layout.addWidget(QLabel(_format_list_block("Uncertainty/notes", card.uncertainty_notes)))
+        uncertainty_label = QLabel(_format_list_block("Uncertainty/notes", card.uncertainty_notes))
+        uncertainty_label.setTextFormat(Qt.TextFormat.PlainText)
+        uncertainty_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        layout.addWidget(uncertainty_label)
 
     for index in range(layout.count()):
         item = layout.itemAt(index)

@@ -99,8 +99,8 @@ class MonitoringServices:
         self.lifecycle_manager.attach_scheduler(self.scheduler)
 
         self.session_monitor = self.registry.build_session_monitor(
-            on_locked=self.lifecycle_manager.handle_session_locked,
-            on_unlocked=self.lifecycle_manager.handle_session_unlocked,
+            on_locked=self.handle_session_locked,
+            on_unlocked=self.handle_session_unlocked,
         )
         self._services.session_monitor = self.session_monitor
         self.lifecycle_manager.attach_session_monitor(self.session_monitor)
@@ -111,14 +111,10 @@ class MonitoringServices:
             self.flush_coordinator,
             self.logger,
         )
+        self._lock_drain_thread: threading.Thread | None = None
+        self._lock_drain_thread_lock = threading.Lock()
         self._startup_backfill_thread = threading.Thread(
-            target=self.summarizer.reconcile_missing_daily_summaries,
-            kwargs={
-                "reason": "startup_backfill",
-                "min_age_hours": self.config.daily_summary_auto_backfill_min_age_hours,
-                "max_days": self.config.daily_summary_auto_backfill_max_days,
-                "enabled": self.config.daily_summary_auto_backfill_enabled,
-            },
+            target=self._run_startup_daily_backfill,
             name="startup-daily-summary-backfill",
             daemon=True,
         )
@@ -142,6 +138,7 @@ class MonitoringServices:
 
     def handle_session_locked(self) -> None:
         self.lifecycle_manager.handle_session_locked()
+        self._trigger_lock_drain()
 
     def handle_session_unlocked(self) -> None:
         self.lifecycle_manager.handle_session_unlocked()
@@ -327,6 +324,8 @@ class MonitoringServices:
             ("scheduler_stop", lambda: self.scheduler.stop()),
             ("scheduler_stop_log", lambda: self.logger.info("event=summary_scheduler_stopped")),
             ("summary_drain_cancel", lambda: self.cancel_flush_drain()),
+            ("lock_drain_join", lambda: self._join_lock_drain_thread(timeout_seconds=2.0)),
+            ("startup_backfill_join", lambda: self._join_startup_backfill_thread(timeout_seconds=2.0)),
             ("summary_workers_stop", lambda: self.logger.info("event=summary_workers_draining_or_cancelled")),
             ("summary_workers_join", lambda: self.summarizer.stop()),
             ("summary_queue_state", lambda: self.logger.info("event=summary_queue_final_state %s", _format_kv(self.summarizer.get_runtime_status()))),
@@ -358,6 +357,56 @@ class MonitoringServices:
     def _close_storage_with_log(self) -> None:
         self.storage.close()
         self.logger.info("event=storage_closed")
+
+    def _trigger_lock_drain(self) -> None:
+        if self._services.shutdown_event.is_set():
+            return
+        if not bool(self.config.process_backlog_only_while_locked):
+            return
+        with self._lock_drain_thread_lock:
+            if self._lock_drain_thread is not None and self._lock_drain_thread.is_alive():
+                return
+            self._lock_drain_thread = threading.Thread(
+                target=self.flush_coordinator.flush_now,
+                kwargs={"reason": "lock"},
+                name="lock-triggered-summary-drain",
+                daemon=True,
+            )
+            self._lock_drain_thread.start()
+
+    def _join_lock_drain_thread(self, timeout_seconds: float) -> None:
+        with self._lock_drain_thread_lock:
+            thread = self._lock_drain_thread
+        if thread is None:
+            return
+        thread.join(timeout=max(0.0, timeout_seconds))
+
+    def _join_startup_backfill_thread(self, timeout_seconds: float) -> None:
+        thread = self._startup_backfill_thread
+        if thread is None:
+            return
+        thread.join(timeout=max(0.0, timeout_seconds))
+
+    def _run_startup_daily_backfill(self) -> None:
+        try:
+            self.summarizer.reconcile_missing_daily_summaries(
+                reason="startup_backfill",
+                min_age_hours=self.config.daily_summary_auto_backfill_min_age_hours,
+                max_days=self.config.daily_summary_auto_backfill_max_days,
+                enabled=self.config.daily_summary_auto_backfill_enabled,
+            )
+        except (LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError) as exc:
+            self.logger.warning(
+                "event=daily_summary_backfill_thread_stopped reason=lmstudio_error error_type=%s error=%s",
+                exc.__class__.__name__,
+                exc,
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "event=daily_summary_backfill_thread_failed error_type=%s error=%s",
+                exc.__class__.__name__,
+                exc,
+            )
 
 
 def _format_kv(data: dict[str, object]) -> str:
