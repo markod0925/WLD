@@ -16,6 +16,7 @@ from .evidence_quality import score_daily_evidence_quality, score_event_evidence
 from .lmstudio_client import LMStudioClient
 from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, safe_error
 from .llm_job_queue import LLMJobCancelledError, LLMJobMetadata
+from .internal_artifacts import is_internal_artifact_path
 from .storage import SQLiteStorage
 from .summary_dedup import SummaryDeduplicator
 from .semantic_coalescing import SemanticCoalescer
