@@ -7,6 +7,7 @@ from typing import Any
 
 from .batching import SummaryBatch
 from .models import SummaryRecord
+from .internal_artifacts import is_internal_artifact_path
 
 TEXT_CHARS_PER_SUMMARY_SEGMENT = 5
 
@@ -365,6 +366,8 @@ def _flatten_prompt_values(value: Any) -> list[str]:
         return []
     if isinstance(value, str):
         cleaned = value.strip()
+        if cleaned and is_internal_artifact_path(cleaned):
+            return []
         return [cleaned] if cleaned else []
     if isinstance(value, list):
         flattened: list[str] = []
@@ -408,10 +411,13 @@ def _collect_entity_values(activity_entities: list[dict[str, Any]], entity_types
     for item in activity_entities:
         if not isinstance(item, dict):
             continue
-        if str(item.get("entity_type") or "") not in entity_types:
+        entity_type = str(item.get("entity_type") or "").strip().lower()
+        if entity_type not in entity_types:
             continue
         value = str(item.get("entity_value") or "").strip()
         if not value:
+            continue
+        if entity_type in {"file_path", "file_name", "folder_path", "project_candidate"} and is_internal_artifact_path(value):
             continue
         normalized = str(item.get("entity_normalized") or value).strip().lower()
         if normalized in seen:

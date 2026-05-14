@@ -7,6 +7,8 @@ from datetime import date, datetime
 from html import escape
 from typing import Any
 
+from ..core.internal_artifacts import is_internal_artifact_path
+
 from ..core.models import DailySummaryRecord, SummaryRecord
 from .semantic_diagnostics_view_model import CoalescedTraceabilityInfo
 
@@ -72,7 +74,7 @@ def build_summary_card_view(
 
     structured = summary.summary_json if isinstance(summary.summary_json, dict) else {}
     structured_summary_text = _format_event_summary_text(structured)
-    formatted_summary = structured_summary_text or summary.summary_text.strip()
+    formatted_summary = structured_summary_text or _normalize_legacy_summary_text(summary.summary_text.strip())
     major_activities = _extract_string_list(structured, keys=["major_activities", "key_points", "activities"])
     blocked_notes = _extract_string_list(structured, keys=["blocked_activity", "blocked_note", "privacy_notes"])
     uncertainty_notes = _extract_string_list(
@@ -151,14 +153,14 @@ def _flatten_string_values(value: Any) -> list[str]:
 
 def format_summary_html(text: str, query: str | None) -> str:
     if not query:
-        return f"Summary: {escape(text)}"
+        return escape(text).replace("\n", "<br>")
     cleaned_query = query.strip()
     if not cleaned_query:
-        return f"Summary: {escape(text)}"
+        return escape(text).replace("\n", "<br>")
     pattern = re.compile(re.escape(cleaned_query), re.IGNORECASE)
     matches = list(pattern.finditer(text))
     if not matches:
-        return f"Summary: {escape(text)}"
+        return escape(text).replace("\n", "<br>")
 
     chunks: list[str] = []
     cursor = 0
@@ -171,7 +173,7 @@ def format_summary_html(text: str, query: str | None) -> str:
         cursor = end
     if cursor < len(text):
         chunks.append(escape(text[cursor:]))
-    return "Summary: " + "".join(chunks)
+    return "".join(chunks).replace("\n", "<br>")
 
 
 def _format_event_summary_text(payload: dict[str, Any]) -> str:
@@ -194,10 +196,12 @@ def _format_event_summary_text(payload: dict[str, Any]) -> str:
     for label, values in sections:
         if not values:
             continue
-        rendered.append(f"{label}:")
+        rendered.append(f"{label}")
+        rendered.append("")
         rendered.extend(f"- {value}" for value in values[:4])
+        rendered.append("")
     if rendered:
-        return "\n".join(rendered)
+        return "\n".join(item for item in rendered).strip()
     return ""
 
 
@@ -230,8 +234,36 @@ def _format_daily_recap_text(daily_summary: DailySummaryRecord) -> str:
     for label, values in sections:
         if not values:
             continue
-        rendered.append(f"{label}:")
+        rendered.append(f"{label}")
+        rendered.append("")
         rendered.extend(f"- {value}" for value in values[:6])
+        rendered.append("")
     if rendered:
-        return "\n".join(rendered)
+        return "\n".join(item for item in rendered).strip()
     return daily_summary.recap_text
+
+
+def _normalize_legacy_summary_text(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+    if "Summary:" in cleaned and "Task / Workstream:" in cleaned and "Files:" in cleaned:
+        for label in ["Task / Workstream:", "Files:", "Programs:", "Conversations / References:", "Outcome:", "JIRA candidate:", "Evidence limits:"]:
+            cleaned = cleaned.replace(label, f"\n{label}\n")
+        cleaned = cleaned.replace("Summary:", "").strip()
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        normalized: list[str] = []
+        for line in lines:
+            if line.endswith(":"):
+                normalized.append(line[:-1])
+                normalized.append("")
+                continue
+            parts = [segment.strip() for segment in line.split(" - ") if segment.strip()]
+            for segment in parts:
+                item = segment if segment.startswith("-") else f"- {segment}"
+                candidate = item[2:].strip() if item.startswith("- ") else item
+                if candidate and is_internal_artifact_path(candidate):
+                    continue
+                normalized.append(item)
+        return "\n".join(normalized).strip()
+    return cleaned

@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 from typing import Any, Protocol
 
 from .models import SummaryRecord
+from .internal_artifacts import is_internal_artifact_path
 
 _TOKEN_RE = re.compile(r"\w+")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -371,6 +372,8 @@ def _collect_cluster_values(cluster: list[SummaryRecord], keys: list[str], *, li
         for key in keys:
             for value in _flatten_cluster_value(record.summary_json.get(key)):
                 normalized = value.lower()
+                if is_internal_artifact_path(value):
+                    continue
                 if normalized in seen:
                     continue
                 seen.add(normalized)
@@ -395,6 +398,8 @@ def _collect_cluster_activity_entities(cluster: list[SummaryRecord], *, limit: i
             entity_type = str(item.get("entity_type") or "").strip().lower()
             entity_normalized = str(item.get("entity_normalized") or item.get("entity_value") or "").strip().lower()
             if not entity_type or not entity_normalized:
+                continue
+            if entity_type in {"file_path", "file_name", "folder_path", "project_candidate"} and is_internal_artifact_path(str(item.get("entity_value") or entity_normalized)):
                 continue
             marker = (entity_type, entity_normalized)
             if marker in seen:
@@ -423,6 +428,8 @@ def _collect_cluster_entity_values(cluster: list[SummaryRecord], entity_types: s
                 continue
             value = str(item.get("entity_value") or "").strip()
             if not value:
+                continue
+            if entity_type in {"file_path", "file_name", "folder_path", "project_candidate"} and is_internal_artifact_path(value):
                 continue
             normalized = str(item.get("entity_normalized") or value).strip().lower()
             if normalized in seen:
@@ -577,6 +584,8 @@ def _record_signature(record: SummaryRecord) -> dict[str, set[str]]:
             entity_type = str(item.get("entity_type") or "").strip().lower()
             normalized = str(item.get("entity_normalized") or item.get("entity_value") or "").strip().lower()
             if not normalized:
+                continue
+            if entity_type in {"file_path", "file_name", "folder_path", "project_candidate"} and is_internal_artifact_path(str(item.get("entity_value") or normalized)):
                 continue
             if entity_type == "file_path":
                 signature["file_paths"].add(normalized)

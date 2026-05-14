@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
 from typing import Any, Iterable
 
+from .internal_artifacts import is_internal_artifact_path
+
 
 _WINDOWS_PATH_RE = re.compile(
     r"""
@@ -711,6 +713,8 @@ def _add_path_entities(
 ) -> None:
     normalized_path = _normalize_path(path)
     if not normalized_path:
+        return
+    if is_internal_artifact_path(path):
         return
 
     path = _trim_path(path)
