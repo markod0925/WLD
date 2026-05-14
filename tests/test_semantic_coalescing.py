@@ -522,3 +522,27 @@ def test_coalescer_logs_no_merge_summary(tmp_path: Path, caplog) -> None:
         assert "event=semantic_coalescing_no_merge" in caplog.text
     finally:
         storage.close()
+
+
+def test_coalescing_ignores_internal_artifact_paths_in_evidence() -> None:
+    day = date(2026, 4, 10)
+    internal_path = r"C:\\Users\\11261\\Desktop\\WLD\\data\\screenshots\\x.png"
+    left = SummaryRecord(
+        1, 1, _ts(day, 9, 0), _ts(day, 9, 5), "analysis",
+        {"source_context": {"process_name": "matlab.exe", "window_title": "ga"}, "activity_entities": [
+            {"entity_type": "file_path", "entity_value": internal_path, "entity_normalized": internal_path.lower()},
+            {"entity_type": "program", "entity_value": "matlab.exe", "entity_normalized": "matlab.exe"},
+        ], "files_and_documents": [internal_path]},
+        0,
+    )
+    right = SummaryRecord(
+        2, 2, _ts(day, 9, 6), _ts(day, 9, 10), "analysis",
+        {"source_context": {"process_name": "matlab.exe", "window_title": "ga"}, "activity_entities": [
+            {"entity_type": "file_path", "entity_value": internal_path, "entity_normalized": internal_path.lower()},
+            {"entity_type": "program", "entity_value": "matlab.exe", "entity_normalized": "matlab.exe"},
+        ], "files_and_documents": [internal_path]},
+        0,
+    )
+    plans, _ = _engine({1: [1.0, 0.0], 2: [1.0, 0.0]}).build_coalesced_plans([left, right])
+    assert len(plans) == 1
+    assert internal_path not in plans[0].summary_json.get("files_and_documents", [])

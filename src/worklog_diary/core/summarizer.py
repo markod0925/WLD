@@ -1502,6 +1502,7 @@ class Summarizer:
         payload["source_batch"]["activity_entity_count"] = len(batch.activity_entities)
         payload["source_batch"]["parser_coverage_count"] = len(batch.parser_coverage)
         _augment_privacy_limited_event_evidence(payload, batch)
+        _filter_internal_artifacts_from_summary_payload(payload, app_data_dir=self.config.app_data_dir)
         return payload
 
     def _persist_activity_entities_for_batch(
@@ -1729,6 +1730,24 @@ def _augment_privacy_limited_event_evidence(payload: dict[str, object], batch: S
     ):
         unknowns_and_privacy_limits.append(_PRIVACY_CAVEAT)
     payload["unknowns_and_privacy_limits"] = unknowns_and_privacy_limits
+
+
+def _filter_internal_artifacts_from_summary_payload(payload: dict[str, object], *, app_data_dir: str | None) -> int:
+    filtered = 0
+    for key in ("files_and_documents", "files", "task_candidates", "outcomes", "jira_update_candidates", "conversations_or_references", "conversations"):
+        values = _coerce_payload_list(payload.get(key))
+        kept: list[str] = []
+        for item in values:
+            if is_internal_artifact_path(str(item), app_data_dir=app_data_dir):
+                filtered += 1
+                continue
+            kept.append(item)
+        payload[key] = kept
+    if filtered:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        metadata["internal_artifacts_filtered"] = int(metadata.get("internal_artifacts_filtered", 0)) + filtered
+        payload["metadata"] = metadata
+    return filtered
 
 
 def _infer_blocked_observed_references(batch: SummaryBatch) -> list[dict[str, object]]:

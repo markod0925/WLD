@@ -144,13 +144,15 @@ def test_build_summary_card_view_formats_task_first_sections() -> None:
 
     card = build_summary_card_view(record)
 
-    assert card.summary_text.startswith("Task / Workstream:")
-    assert "Files:" in card.summary_text
-    assert "Programs:" in card.summary_text
-    assert "Conversations / References:" in card.summary_text
-    assert "Outcome:" in card.summary_text
-    assert "JIRA candidate:" in card.summary_text
-    assert "Evidence limits:" in card.summary_text
+    assert card.summary_text.startswith("Task / Workstream")
+    assert "Files" in card.summary_text
+
+    assert "\n\nFiles\n\n-" in card.summary_text
+    assert "Programs" in card.summary_text
+    assert "Conversations / References" in card.summary_text
+    assert "Outcome" in card.summary_text
+    assert "JIRA candidate" in card.summary_text
+    assert "Evidence limits" in card.summary_text
     assert card.major_activities == []
     assert card.blocked_notes == []
     assert card.uncertainty_notes == []
@@ -177,7 +179,26 @@ def test_build_day_summary_view_formats_daily_recap_task_file_first() -> None:
     view = build_day_summary_view(day=target_day, summaries=[], daily_summary=daily)
 
     assert view.daily_recap_text is not None
-    assert view.daily_recap_text.startswith("Workstreams / task candidates:")
-    assert "Files and documents:" in view.daily_recap_text
-    assert "Program activity breakdown:" in view.daily_recap_text
-    assert "Evidence limits and unknowns:" in view.daily_recap_text
+    assert view.daily_recap_text.startswith("Workstreams / task candidates")
+    assert "Files and documents" in view.daily_recap_text
+    assert "Program activity breakdown" in view.daily_recap_text
+    assert "Evidence limits and unknowns" in view.daily_recap_text
+
+
+def test_legacy_one_line_summary_is_normalized_and_internal_path_removed() -> None:
+    bad = (
+        "Summary: Task / Workstream: - Work on Genetic Algorithm "
+        "Files: - C:\\Users\\11261\\Desktop\\WLD\\data\\screenshots\\20260513_221341_834990.png "
+        "Programs: - matlab.exe - lm studio.exe "
+        "Conversations / References: - Genetic Algorithm "
+        "Outcome: - Execution of Genetic Algorithm in MATLAB. "
+        "JIRA candidate: - None "
+        "Evidence limits: - Content within LM Studio was blocked"
+    )
+    record = SummaryRecord(id=77, job_id=1, start_ts=1.0, end_ts=2.0, summary_text=bad, summary_json={}, created_ts=3.0)
+    card = build_summary_card_view(record)
+    assert "\n" in card.summary_text
+    assert "screenshots\\20260513_221341_834990.png" not in card.summary_text
+    assert "matlab.exe" in card.summary_text
+    assert "lm studio.exe" in card.summary_text
+    assert "Content within LM Studio was blocked" in card.summary_text
