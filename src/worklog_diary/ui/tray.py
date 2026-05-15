@@ -109,6 +109,8 @@ class TrayController:
             "lmstudio_connection": "Connection error",
             "lmstudio_service_unavailable": "Service unavailable",
             "summary_generation_failure": "Summary generation failed",
+            "summary_postprocess_error": "Summary post-processing failed",
+            "summary_store_error": "Summary store failed",
             "flush_failure": "Flush failed",
         }
         title = titles.get(category, "WorkLog Diary")

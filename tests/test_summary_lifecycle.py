@@ -208,6 +208,7 @@ def test_successful_summary_purges_db_rows_and_screenshot_files(tmp_path: Path) 
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
     )
     summary_id = summarizer.flush_pending(reason="test")
 
@@ -232,6 +233,7 @@ def test_successful_summary_records_worker_timestamps(tmp_path: Path) -> None:
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
     )
     try:
         assert summarizer.flush_pending(reason="test") is not None
@@ -254,6 +256,7 @@ def test_successful_summary_persists_structured_payload(tmp_path: Path) -> None:
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=StructuredClient(),
+        app_data_dir=str(tmp_path),
     )
     try:
         summary_id = summarizer.flush_pending(reason="test")
@@ -274,6 +277,46 @@ def test_successful_summary_persists_structured_payload(tmp_path: Path) -> None:
         storage.close()
 
 
+def test_enrich_summary_payload_uses_injected_app_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    shot_path = tmp_path / "screens" / "shot.png"
+    _seed_raw_data(storage, shot_path)
+
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
+        lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
+    )
+    seen: dict[str, str | None] = {}
+
+    def _capture_filter(payload: dict[str, object], *, app_data_dir: str | None) -> int:
+        seen["app_data_dir"] = app_data_dir
+        payload["metadata"] = {"internal_artifacts_filtered": 1}
+        return 1
+
+    monkeypatch.setattr(
+        "worklog_diary.core.summarizer._filter_internal_artifacts_from_summary_payload",
+        _capture_filter,
+    )
+
+    try:
+        batch = summarizer.batch_builder.build_pending_batch(force_flush=True)
+        assert batch is not None
+        payload = summarizer._enrich_summary_payload(
+            batch,
+            "done",
+            {"files": [str(shot_path)]},
+            reason="test",
+        )
+        assert seen["app_data_dir"] == str(tmp_path)
+        assert payload["summary_text"] == "done"
+        assert payload["metadata"] == {"internal_artifacts_filtered": 1}
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
 def test_failed_summary_keeps_raw_data_retryable(tmp_path: Path) -> None:
     db_path = tmp_path / "worklog.db"
     shot_path = tmp_path / "screens" / "shot.png"
@@ -284,6 +327,7 @@ def test_failed_summary_keeps_raw_data_retryable(tmp_path: Path) -> None:
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=FailingClient(),
+        app_data_dir=str(tmp_path),
     )
     summary_id = summarizer.flush_pending(reason="test")
 
@@ -308,6 +352,7 @@ def test_failed_summary_marks_terminal_state_and_finished_at(tmp_path: Path) -> 
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=FailingClient(),
+        app_data_dir=str(tmp_path),
     )
     try:
         assert summarizer.flush_pending(reason="test") is None
@@ -361,6 +406,7 @@ def test_daily_summary_is_idempotent_per_day(tmp_path: Path) -> None:
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
     )
     try:
         first_id, first_replaced = summarizer.generate_daily_recap_for_day(day)
@@ -386,7 +432,12 @@ def test_daily_summary_is_idempotent_per_day(tmp_path: Path) -> None:
 def test_reconcile_missing_daily_summaries_enqueues_oldest_first(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "worklog.db"
     storage = SQLiteStorage(str(db_path))
-    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient())
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage),
+        lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
+    )
     class _FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -408,7 +459,12 @@ def test_reconcile_missing_daily_summaries_enqueues_oldest_first(tmp_path: Path,
 def test_reconcile_excludes_today_and_recent_day(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "worklog.db"
     storage = SQLiteStorage(str(db_path))
-    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient())
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage),
+        lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
+    )
     class _FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -428,7 +484,12 @@ def test_reconcile_excludes_today_and_recent_day(tmp_path: Path, monkeypatch) ->
 def test_reconcile_is_idempotent_with_existing_active_job(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "worklog.db"
     storage = SQLiteStorage(str(db_path))
-    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient())
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage),
+        lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
+    )
     class _FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -451,7 +512,13 @@ def test_reconcile_skips_when_shutdown_already_started(tmp_path: Path) -> None:
     evt = threading.Event()
     evt.set()
     storage = SQLiteStorage(str(tmp_path / "worklog.db"))
-    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=SuccessfulClient(), shutdown_event=evt)
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage),
+        lm_client=SuccessfulClient(),
+        shutdown_event=evt,
+        app_data_dir=str(tmp_path),
+    )
     try:
         result = summarizer.reconcile_missing_daily_summaries()
         assert result["enqueued"] == 0
@@ -462,7 +529,12 @@ def test_reconcile_skips_when_shutdown_already_started(tmp_path: Path) -> None:
 
 def test_reconcile_queue_closing_stops_cleanly(tmp_path: Path, monkeypatch) -> None:
     storage = SQLiteStorage(str(tmp_path / "worklog.db"))
-    summarizer = Summarizer(storage=storage, batch_builder=BatchBuilder(storage=storage), lm_client=QueueClosingClient())
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage),
+        lm_client=QueueClosingClient(),
+        app_data_dir=str(tmp_path),
+    )
     class _FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -490,6 +562,7 @@ def test_reconcile_defers_when_event_backlog_exists(tmp_path: Path, monkeypatch)
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=SuccessfulClient(),
+        app_data_dir=str(tmp_path),
     )
 
     class _FixedDateTime(datetime):
@@ -526,6 +599,7 @@ def test_daily_recap_marks_job_failed_on_unexpected_lm_error(tmp_path: Path) -> 
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=_FailingClient(),
+        app_data_dir=str(tmp_path),
     )
 
     day = date(2026, 4, 27)
@@ -554,6 +628,7 @@ def test_daily_recap_marks_job_cancelled_when_shutdown_hits_while_admission_bloc
         lm_client=SuccessfulClient(),
         shutdown_event=evt,
         process_backlog_only_while_locked=True,
+        app_data_dir=str(tmp_path),
     )
     day = date(2026, 4, 27)
     start = datetime.combine(day, time.min).timestamp()

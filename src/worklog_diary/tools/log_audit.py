@@ -396,29 +396,37 @@ class JobLifecycle:
                 self.store_started_at = self.store_started_at or event.timestamp
             elif status == "ok":
                 self.store_finished_at = self.store_finished_at or event.timestamp
+            elif status == "error":
+                self.store_finished_at = self.store_finished_at or event.timestamp
+                self.errors.append(_string_field(event.fields, "error") or event.message)
         elif event_name in {"job_completed", "summary_job_completed", "daily_summary_job_completed"}:
             self.completed_at = self.completed_at or event.timestamp
-            self.terminal_status = self.terminal_status or "completed"
+            if self.terminal_status not in {"failed", "cancelled", "abandoned"}:
+                self.terminal_status = "completed"
         elif event_name in {"job_failed", "summary_job_failed"}:
             self.failed_at = self.failed_at or event.timestamp
-            self.terminal_status = self.terminal_status or "failed"
+            self.terminal_status = "failed"
             self.errors.append(_string_field(event.fields, "error") or event.message)
         elif event_name in {"job_cancelled", "summary_job_cancelled", "daily_summary_job_cancelled"}:
             self.cancelled_at = self.cancelled_at or event.timestamp
-            self.terminal_status = self.terminal_status or "cancelled"
+            if self.terminal_status != "abandoned":
+                self.terminal_status = "cancelled"
         elif event_name == "daily_summary_job_reconciled":
             self.completed_at = self.completed_at or event.timestamp
-            self.terminal_status = self.terminal_status or "completed"
+            if self.terminal_status not in {"failed", "cancelled", "abandoned"}:
+                self.terminal_status = "completed"
         elif event_name == "daily_summary_job_reused":
-            self.terminal_status = self.terminal_status or "reused"
+            if self.terminal_status not in {"failed", "cancelled", "abandoned", "completed"}:
+                self.terminal_status = "reused"
         elif event_name == "startup_recovery_job":
             status = _string_field(event.fields, "status")
             if status == "abandoned":
                 self.abandoned_at = self.abandoned_at or event.timestamp
-                self.terminal_status = self.terminal_status or "abandoned"
+                self.terminal_status = "abandoned"
             elif status == "cancelled":
                 self.cancelled_at = self.cancelled_at or event.timestamp
-                self.terminal_status = self.terminal_status or "cancelled"
+                if self.terminal_status != "abandoned":
+                    self.terminal_status = "cancelled"
 
     def _update_request(self, event: ParsedEvent, *, outcome: str | None) -> None:
         if not self.requests:
@@ -2006,6 +2014,32 @@ class LogAuditRunner:
                 }
             )
             root_causes.append("session monitor startup failure")
+
+        summary_store_error = next(
+            (
+                item
+                for item in error_taxonomy
+                if item.get("subsystem") == "summarizer"
+                and "failed_stage=summary_store" in str(item.get("signature", ""))
+            ),
+            None,
+        )
+        if summary_store_error:
+            findings.append(
+                {
+                    "title": "Event summaries fail after LM Studio returns a valid response",
+                    "severity": "Critical",
+                    "confidence": "High",
+                    "subsystem": "summarizer",
+                    "first_occurrence": summary_store_error["first_seen"],
+                    "last_occurrence": summary_store_error["last_seen"],
+                    "evidence": summary_store_error["examples"][0],
+                    "interpretation": "The LLM transport and response parse complete, but local post-processing or summary persistence fails afterward.",
+                    "recommended_fix": "Inject the required runtime dependency into the summarizer and keep summary post-processing/store failures distinct from LM transport failures.",
+                    "suggested_logging": "Emit explicit `summary_postprocess`/`summary_store` error stages plus a failure category field on `summary_job_failed`.",
+                }
+            )
+            root_causes.append("local summary post-processing/store failure")
 
         shutdown_failure = next((item for item in anomalies if item.get("type") == "shutdown_flush_failure"), None)
         if shutdown_failure:

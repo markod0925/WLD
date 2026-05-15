@@ -79,6 +79,7 @@ def test_summary_dispatch_respects_max_parallel_jobs(tmp_path: Path) -> None:
         batch_builder=BatchBuilder(storage=storage, max_text_segments=1, max_screenshots=1),
         lm_client=client,
         max_parallel_jobs=2,
+        app_data_dir=str(tmp_path),
     )
 
     try:
@@ -114,6 +115,7 @@ def test_summary_worker_pool_shrinks_and_stops_cleanly(tmp_path: Path) -> None:
         batch_builder=BatchBuilder(storage=storage, max_text_segments=1, max_screenshots=1),
         lm_client=client,
         max_parallel_jobs=2,
+        app_data_dir=str(tmp_path),
     )
 
     try:
@@ -146,6 +148,7 @@ def test_summary_jobs_wait_while_unlocked_when_gate_enabled(tmp_path: Path) -> N
         lm_client=client,
         max_parallel_jobs=1,
         process_backlog_only_while_locked=True,
+        app_data_dir=str(tmp_path),
     )
     try:
         summarizer.handle_session_lock_state_change(False)
@@ -171,6 +174,7 @@ def test_unlock_does_not_cancel_running_jobs_and_blocks_next_starts(tmp_path: Pa
         lm_client=client,
         max_parallel_jobs=2,
         process_backlog_only_while_locked=True,
+        app_data_dir=str(tmp_path),
     )
     try:
         summarizer.handle_session_lock_state_change(True)
@@ -199,6 +203,7 @@ def test_manual_jobs_bypass_lock_gate_and_unknown_state_fail_open(tmp_path: Path
         lm_client=client,
         max_parallel_jobs=1,
         process_backlog_only_while_locked=True,
+        app_data_dir=str(tmp_path),
     )
     try:
         # Fail-open when no lock state has been observed yet.
@@ -233,6 +238,7 @@ def test_disabled_lock_gate_preserves_old_behavior(tmp_path: Path) -> None:
         lm_client=client,
         max_parallel_jobs=1,
         process_backlog_only_while_locked=False,
+        app_data_dir=str(tmp_path),
     )
     try:
         summarizer.handle_session_lock_state_change(False)

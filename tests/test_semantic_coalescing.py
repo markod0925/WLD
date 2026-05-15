@@ -463,7 +463,13 @@ def test_daily_summary_uses_coalesced_when_enabled(tmp_path: Path) -> None:
         coalescer = SemanticCoalescer(storage=storage, engine=_engine({sid1: [1.0], sid2: [1.0]}), diagnostics_enabled=True)
         coalescer.refresh_day(day)
 
-        summarizer = Summarizer(storage=storage, batch_builder=None, lm_client=_Client(), semantic_coalescer=coalescer)  # type: ignore[arg-type]
+        summarizer = Summarizer(
+            storage=storage,
+            batch_builder=None,
+            lm_client=_Client(),
+            semantic_coalescer=coalescer,
+            app_data_dir=str(tmp_path),
+        )  # type: ignore[arg-type]
         _, _ = summarizer.generate_daily_recap_for_day(day)
         saved = storage.get_daily_summary_for_day(day)
         assert saved is not None

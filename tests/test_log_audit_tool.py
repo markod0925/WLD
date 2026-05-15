@@ -78,6 +78,36 @@ def test_job_lifecycle_and_lmstudio_audit(tmp_path: Path) -> None:
     assert lmstudio["latency"]["max"] == 1.25
 
 
+def test_log_audit_treats_summary_store_failure_as_failed_summary(tmp_path: Path) -> None:
+    log_path = _write_log(
+        tmp_path,
+        "summary_store_failed.log",
+        [
+            "2026-05-15 09:00:00 [INFO] worklog_diary.core.summarizer: [LLM] stage=job_created status=ok job_id=summary-7 job_type=event_summary target_day=2026-05-15",
+            "2026-05-15 09:00:01 [INFO] worklog_diary.core.llm_job_queue: [LLM] stage=job_completed status=ok job_id=summary-7 job_type=event_summary",
+            "2026-05-15 09:00:02 [INFO] worklog_diary.core.summarizer: [LLM] stage=request_success status=ok job_id=summary-7 endpoint=http://127.0.0.1:1234/v1/chat/completions model=llama elapsed_s=0.700 http_status=200",
+            "2026-05-15 09:00:03 [INFO] worklog_diary.core.summarizer: [LLM] stage=response_parse status=ok job_id=summary-7",
+            "2026-05-15 09:00:04 [ERROR] worklog_diary.core.summarizer: [LLM] stage=summary_store status=error job_id=summary-7 error=AttributeError",
+            "2026-05-15 09:00:05 [ERROR] worklog_diary.core.summarizer: [LLM] stage=summary_job_failed status=error job_id=summary-7 failed_stage=summary_store error_category=summary_store_error error=AttributeError",
+        ],
+    )
+
+    outputs = LogAuditRunner([log_path], tmp_path / "out").run()
+
+    summary_queue = outputs["summary_queue"]
+    lmstudio = outputs["lmstudio"]
+    report = (tmp_path / "out" / "audit_report.md").read_text(encoding="utf-8")
+    assert summary_queue["job_count"] == 1
+    assert summary_queue["terminal_jobs"] == 1
+    assert summary_queue["incomplete_jobs"] == []
+    assert summary_queue["jobs"][0]["terminal_status"] == "failed"
+    assert summary_queue["jobs"][0]["errors"]
+    assert summary_queue["jobs"][0]["store_finished_at"] == "2026-05-15 09:00:04"
+    assert lmstudio["success_count"] == 1
+    assert lmstudio["failure_count"] == 0
+    assert "Event summaries fail after LM Studio returns a valid response" in report
+
+
 def test_normalize_signature_masks_volatile_values() -> None:
     event = ParsedEvent(
         source_file="/tmp/worklog.log",

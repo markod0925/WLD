@@ -14,7 +14,7 @@ from .error_notifications import ErrorNotificationManager
 from .errors import LMStudioConnectionError, LMStudioServiceUnavailableError, LMStudioTimeoutError
 from .evidence_quality import score_daily_evidence_quality, score_event_evidence_quality
 from .lmstudio_client import LMStudioClient
-from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, safe_error
+from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, safe_error, set_failed_stage
 from .llm_job_queue import LLMJobCancelledError, LLMJobMetadata
 from .internal_artifacts import is_internal_artifact_path
 from .storage import SQLiteStorage
@@ -59,10 +59,12 @@ class Summarizer:
         summary_deduplicator: SummaryDeduplicator | None = None,
         semantic_coalescer: SemanticCoalescer | None = None,
         process_backlog_only_while_locked: bool = True,
+        app_data_dir: str | None = None,
     ) -> None:
         self.storage = storage
         self.batch_builder = batch_builder
         self.lm_client = lm_client
+        self.app_data_dir = app_data_dir
         self.logger = logging.getLogger(__name__)
         self.error_notifier = error_notifier or ErrorNotificationManager()
         self.summary_deduplicator = summary_deduplicator or SummaryDeduplicator()
@@ -1113,59 +1115,138 @@ class Summarizer:
                     priority=request_priority,
                 )
             self._clear_lmstudio_state()
-            summary_payload = self._enrich_summary_payload(batch, summary_text, summary_json, reason=reason)
-            recent_summaries = self.storage.list_summaries(limit=self.summary_deduplicator.recent_compare_count)
-            dedup_decision = self.summary_deduplicator.evaluate(
-                batch=batch,
-                summary_text=summary_text,
-                summary_json=summary_payload,
-                recent_summaries=recent_summaries,
+            log_llm_stage(
+                self.logger,
+                "summary_postprocess",
+                "start",
+                job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
+            )
+            try:
+                summary_payload = self._enrich_summary_payload(batch, summary_text, summary_json, reason=reason)
+                recent_summaries = self.storage.list_summaries(limit=self.summary_deduplicator.recent_compare_count)
+                dedup_decision = self.summary_deduplicator.evaluate(
+                    batch=batch,
+                    summary_text=summary_text,
+                    summary_json=summary_payload,
+                    recent_summaries=recent_summaries,
+                )
+            except Exception as exc:
+                log_llm_stage(
+                    self.logger,
+                    "summary_postprocess",
+                    "error",
+                    level=logging.ERROR,
+                    job_id=job_id,
+                    job_type=job_type,
+                    timeout_s=request_timeout_s,
+                    attempt=1,
+                    error_type=exc.__class__.__name__,
+                    error=safe_error(exc),
+                    exc_info=True,
+                )
+                raise set_failed_stage(exc, "summary_postprocess")
+            log_llm_stage(
+                self.logger,
+                "summary_postprocess",
+                "ok",
+                job_id=job_id,
+                job_type=job_type,
+                timeout_s=request_timeout_s,
+                attempt=1,
+                dedup_action=dedup_decision.action,
             )
 
             summary_id: int | None = None
             persisted_summary_payload: dict[str, object] | None = None
-            if dedup_decision.action == "merge_previous" and dedup_decision.matched_summary_id is not None:
-                merged_record = next(
-                    (item for item in recent_summaries if item.id == dedup_decision.matched_summary_id),
-                    None,
-                )
-                if merged_record is not None:
-                    merged_payload = self._merge_summary_payload(
-                        merged_record.summary_json,
-                        batch=batch,
-                        new_summary_text=summary_text,
-                        new_summary_payload=summary_payload,
-                        reason=reason,
-                        similarity=dedup_decision.similarity,
+            try:
+                if dedup_decision.action == "merge_previous" and dedup_decision.matched_summary_id is not None:
+                    merged_record = next(
+                        (item for item in recent_summaries if item.id == dedup_decision.matched_summary_id),
+                        None,
                     )
+                    if merged_record is not None:
+                        merged_payload = self._merge_summary_payload(
+                            merged_record.summary_json,
+                            batch=batch,
+                            new_summary_text=summary_text,
+                            new_summary_payload=summary_payload,
+                            reason=reason,
+                            similarity=dedup_decision.similarity,
+                        )
+                        log_llm_stage(
+                            self.logger,
+                            "summary_store",
+                            "start",
+                            job_id=job_id,
+                            job_type=job_type,
+                            timeout_s=request_timeout_s,
+                            attempt=1,
+                            action="merge_previous",
+                            summary_id=merged_record.id,
+                        )
+                        self.storage.update_summary_record(
+                            merged_record.id or 0,
+                            end_ts=max(merged_record.end_ts, batch.end_ts),
+                            summary_json=merged_payload,
+                        )
+                        summary_id = merged_record.id
+                        persisted_summary_payload = merged_payload
+                        log_llm_stage(
+                            self.logger,
+                            "summary_store",
+                            "ok",
+                            job_id=job_id,
+                            job_type=job_type,
+                            timeout_s=request_timeout_s,
+                            attempt=1,
+                            action="merge_previous",
+                            summary_id=summary_id,
+                            matched_summary_id=dedup_decision.matched_summary_id,
+                            similarity=dedup_decision.similarity,
+                        )
+                    else:
+                        log_llm_stage(
+                            self.logger,
+                            "summary_store",
+                            "start",
+                            job_id=job_id,
+                            job_type=job_type,
+                            timeout_s=request_timeout_s,
+                            attempt=1,
+                            action="insert",
+                        )
+                        summary_id = self.storage.insert_summary(
+                            job_id=job_id,
+                            start_ts=batch.start_ts,
+                            end_ts=batch.end_ts,
+                            summary_text=summary_text,
+                            summary_json=summary_payload,
+                        )
+                        persisted_summary_payload = summary_payload
+                        log_llm_stage(
+                            self.logger,
+                            "summary_store",
+                            "ok",
+                            job_id=job_id,
+                            job_type=job_type,
+                            timeout_s=request_timeout_s,
+                            attempt=1,
+                            action="insert",
+                            summary_id=summary_id,
+                        )
+                elif dedup_decision.action == "suppress":
                     log_llm_stage(
                         self.logger,
                         "summary_store",
-                        "start",
+                        "skip",
                         job_id=job_id,
                         job_type=job_type,
                         timeout_s=request_timeout_s,
                         attempt=1,
-                        action="merge_previous",
-                        summary_id=merged_record.id,
-                    )
-                    self.storage.update_summary_record(
-                        merged_record.id or 0,
-                        end_ts=max(merged_record.end_ts, batch.end_ts),
-                        summary_json=merged_payload,
-                    )
-                    summary_id = merged_record.id
-                    persisted_summary_payload = merged_payload
-                    log_llm_stage(
-                        self.logger,
-                        "summary_store",
-                        "ok",
-                        job_id=job_id,
-                        job_type=job_type,
-                        timeout_s=request_timeout_s,
-                        attempt=1,
-                        action="merge_previous",
-                        summary_id=summary_id,
+                        reason=dedup_decision.reason,
                         matched_summary_id=dedup_decision.matched_summary_id,
                         similarity=dedup_decision.similarity,
                     )
@@ -1199,94 +1280,67 @@ class Summarizer:
                         action="insert",
                         summary_id=summary_id,
                     )
-            elif dedup_decision.action == "suppress":
+
+                activity_entity_count = self._persist_activity_entities_for_batch(batch, summary_id=summary_id)
+                if activity_entity_count:
+                    self.logger.info(
+                        "event=activity_entities_persisted day=%s summary_id=%s entity_count=%s",
+                        date.fromtimestamp(batch.start_ts).isoformat(),
+                        "none" if summary_id is None else int(summary_id),
+                        activity_entity_count,
+                    )
+
+                if summary_id is not None and persisted_summary_payload is not None:
+                    persisted_entities = [
+                        asdict(item)
+                        for item in self.storage.list_activity_entities_for_summary(summary_id)
+                    ]
+                    if not persisted_entities:
+                        persisted_entities = [asdict(item) for item in batch.activity_entities]
+                    quality_report = score_event_evidence_quality(
+                        summary_id=summary_id,
+                        day=date.fromtimestamp(batch.start_ts),
+                        start_ts=batch.start_ts,
+                        end_ts=batch.end_ts,
+                        summary_json=persisted_summary_payload,
+                        activity_entities=persisted_entities,
+                        parser_coverage=batch.parser_coverage,
+                        source_batch=persisted_summary_payload.get("source_batch") if isinstance(persisted_summary_payload.get("source_batch"), dict) else None,
+                        source_context=persisted_summary_payload.get("source_context") if isinstance(persisted_summary_payload.get("source_context"), dict) else None,
+                    )
+                    quality_payload = dict(persisted_summary_payload)
+                    quality_payload["evidence_quality_report"] = quality_report.to_dict()
+                    self.storage.update_summary_record(summary_id, summary_json=quality_payload)
+                    persisted_summary_payload = quality_payload
+
+                self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
+                self.storage.purge_raw_data(batch.start_ts, batch.end_ts)
+                self.storage.update_summary_job(
+                    job_id,
+                    status="completed",
+                    job_type=job_type,
+                    finished_at=time.time(),
+                    timeout_s=request_timeout_s,
+                    attempt=1,
+                    input_chars=input_chars,
+                    input_token_estimate=_estimate_token_count(input_chars),
+                )
+            except Exception as exc:
                 log_llm_stage(
                     self.logger,
                     "summary_store",
-                    "skip",
+                    "error",
+                    level=logging.ERROR,
                     job_id=job_id,
                     job_type=job_type,
                     timeout_s=request_timeout_s,
                     attempt=1,
-                    reason=dedup_decision.reason,
-                    matched_summary_id=dedup_decision.matched_summary_id,
-                    similarity=dedup_decision.similarity,
-                )
-            else:
-                log_llm_stage(
-                    self.logger,
-                    "summary_store",
-                    "start",
-                    job_id=job_id,
-                    job_type=job_type,
-                    timeout_s=request_timeout_s,
-                    attempt=1,
-                    action="insert",
-                )
-                summary_id = self.storage.insert_summary(
-                    job_id=job_id,
-                    start_ts=batch.start_ts,
-                    end_ts=batch.end_ts,
-                    summary_text=summary_text,
-                    summary_json=summary_payload,
-                )
-                persisted_summary_payload = summary_payload
-                log_llm_stage(
-                    self.logger,
-                    "summary_store",
-                    "ok",
-                    job_id=job_id,
-                    job_type=job_type,
-                    timeout_s=request_timeout_s,
-                    attempt=1,
-                    action="insert",
                     summary_id=summary_id,
+                    error_type=exc.__class__.__name__,
+                    error=safe_error(exc),
+                    exc_info=True,
                 )
-
-            activity_entity_count = self._persist_activity_entities_for_batch(batch, summary_id=summary_id)
-            if activity_entity_count:
-                self.logger.info(
-                    "event=activity_entities_persisted day=%s summary_id=%s entity_count=%s",
-                    date.fromtimestamp(batch.start_ts).isoformat(),
-                    "none" if summary_id is None else int(summary_id),
-                    activity_entity_count,
-                )
-
-            if summary_id is not None and persisted_summary_payload is not None:
-                persisted_entities = [
-                    asdict(item)
-                    for item in self.storage.list_activity_entities_for_summary(summary_id)
-                ]
-                if not persisted_entities:
-                    persisted_entities = [asdict(item) for item in batch.activity_entities]
-                quality_report = score_event_evidence_quality(
-                    summary_id=summary_id,
-                    day=date.fromtimestamp(batch.start_ts),
-                    start_ts=batch.start_ts,
-                    end_ts=batch.end_ts,
-                    summary_json=persisted_summary_payload,
-                    activity_entities=persisted_entities,
-                    parser_coverage=batch.parser_coverage,
-                    source_batch=persisted_summary_payload.get("source_batch") if isinstance(persisted_summary_payload.get("source_batch"), dict) else None,
-                    source_context=persisted_summary_payload.get("source_context") if isinstance(persisted_summary_payload.get("source_context"), dict) else None,
-                )
-                quality_payload = dict(persisted_summary_payload)
-                quality_payload["evidence_quality_report"] = quality_report.to_dict()
-                self.storage.update_summary_record(summary_id, summary_json=quality_payload)
-                persisted_summary_payload = quality_payload
-
-            self.storage.mark_intervals_summarized(batch.start_ts, batch.end_ts)
-            self.storage.purge_raw_data(batch.start_ts, batch.end_ts)
-            self.storage.update_summary_job(
-                job_id,
-                status="completed",
-                job_type=job_type,
-                finished_at=time.time(),
-                timeout_s=request_timeout_s,
-                attempt=1,
-                input_chars=input_chars,
-                input_token_estimate=_estimate_token_count(input_chars),
-            )
+                raise set_failed_stage(exc, "summary_store")
             if self.semantic_coalescer is not None and self.semantic_coalescer.enabled:
                 try:
                     day = date.fromtimestamp(batch.start_ts)
@@ -1295,6 +1349,8 @@ class Summarizer:
                     self.logger.exception("event=semantic_coalescing_failed day=%s", date.fromtimestamp(batch.start_ts).isoformat())
             self.error_notifier.resolve_many(
                 "summary_generation_failure",
+                "summary_postprocess_error",
+                "summary_store_error",
                 "lmstudio_connection",
                 "lmstudio_service_unavailable",
                 "lmstudio_timeout",
@@ -1326,7 +1382,7 @@ class Summarizer:
                 input_token_estimate=_estimate_token_count(input_chars),
             )
             self._unrecoverable_error = "Timeout error: LM Studio request timed out."
-            self._set_lmstudio_state("degraded", "timeout", "LM Studio timed out while generating an event summary.")
+            self._set_lmstudio_state("degraded", "llm_timeout", "LM Studio timed out while generating an event summary.")
             self._notify_lmstudio_error("lmstudio_timeout", str(exc), key=f"{self._lmstudio_identity()}|timeout")
             log_llm_stage(
                 self.logger,
@@ -1340,6 +1396,7 @@ class Summarizer:
                 input_chars=input_chars,
                 input_token_estimate=_estimate_token_count(input_chars),
                 failed_stage=get_failed_stage(exc, default="http_response"),
+                error_category="llm_timeout",
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
                 exc_info=True,
@@ -1358,7 +1415,7 @@ class Summarizer:
                 input_token_estimate=_estimate_token_count(input_chars),
             )
             self._unrecoverable_error = "Connection error: Unable to reach LM Studio. Check that it is running."
-            self._set_lmstudio_state("offline", "connection", "LM Studio is unreachable.")
+            self._set_lmstudio_state("offline", "llm_transport_error", "LM Studio is unreachable.")
             self._notify_lmstudio_error(
                 "lmstudio_connection",
                 str(exc),
@@ -1376,6 +1433,7 @@ class Summarizer:
                 input_chars=input_chars,
                 input_token_estimate=_estimate_token_count(input_chars),
                 failed_stage=get_failed_stage(exc, default="http_response"),
+                error_category="llm_transport_error",
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
                 exc_info=True,
@@ -1394,7 +1452,15 @@ class Summarizer:
                 input_token_estimate=_estimate_token_count(input_chars),
             )
             self._unrecoverable_error = "Service unavailable: LM Studio could not generate a response."
-            self._set_lmstudio_state("degraded", "service_unavailable", "LM Studio returned an unavailable response.")
+            self._set_lmstudio_state(
+                "degraded",
+                (
+                    "llm_response_parse_error"
+                    if get_failed_stage(exc, default="response_parse") == "response_parse"
+                    else "llm_transport_error"
+                ),
+                "LM Studio returned an unavailable response.",
+            )
             self._notify_lmstudio_error(
                 "lmstudio_service_unavailable",
                 str(exc),
@@ -1412,16 +1478,38 @@ class Summarizer:
                 input_chars=input_chars,
                 input_token_estimate=_estimate_token_count(input_chars),
                 failed_stage=get_failed_stage(exc, default="response_parse"),
+                error_category=(
+                    "llm_response_parse_error"
+                    if get_failed_stage(exc, default="response_parse") == "response_parse"
+                    else "llm_transport_error"
+                ),
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
                 exc_info=True,
             )
             return None
         except Exception as exc:
+            failed_stage = get_failed_stage(exc, default="summary_store")
+            error_category = "summary_store_error"
+            failure_message = "Summary store failed."
+            notification_category = "summary_store_error"
+            notification_message = "Summary store failed after a valid LM Studio response."
+            if failed_stage == "summary_postprocess":
+                error_category = "summary_postprocess_error"
+                failure_message = "Summary post-processing failed."
+                notification_category = "summary_postprocess_error"
+                notification_message = "Summary post-processing failed after a valid LM Studio response."
+            elif failed_stage not in {"summary_postprocess", "summary_store"}:
+                error_category = "summary_store_error"
+                failure_message = "Summary generation failed."
+                notification_category = "summary_generation_failure"
+                notification_message = (
+                    "Summary generation failed after the LM Studio response. Check local post-processing and storage logs."
+                )
             self.storage.update_summary_job(
                 job_id,
                 status="failed",
-                error="Summary generation failed.",
+                error=failure_message,
                 job_type=job_type,
                 finished_at=time.time(),
                 timeout_s=request_timeout_s,
@@ -1430,11 +1518,11 @@ class Summarizer:
                 input_token_estimate=_estimate_token_count(input_chars),
             )
             with self._lock:
-                self._unrecoverable_error = "Summary generation failed."
-            self._set_lmstudio_state("degraded", "unexpected_error", "LM Studio summary generation failed.")
+                self._unrecoverable_error = failure_message
+            self._set_lmstudio_state("degraded", error_category, failure_message)
             self.error_notifier.notify(
-                "summary_generation_failure",
-                "Summary generation failed. Check that LM Studio is running and the configured model is available.",
+                notification_category,
+                notification_message,
                 key=f"{self._lmstudio_identity()}|{exc.__class__.__name__}",
             )
             log_llm_stage(
@@ -1448,7 +1536,8 @@ class Summarizer:
                 attempt=1,
                 input_chars=input_chars,
                 input_token_estimate=_estimate_token_count(input_chars),
-                failed_stage=get_failed_stage(exc, default="summary_store"),
+                failed_stage=failed_stage,
+                error_category=error_category,
                 error_type=exc.__class__.__name__,
                 error=safe_error(exc),
                 exc_info=True,
@@ -1503,7 +1592,7 @@ class Summarizer:
         payload["source_batch"]["activity_entity_count"] = len(batch.activity_entities)
         payload["source_batch"]["parser_coverage_count"] = len(batch.parser_coverage)
         _augment_privacy_limited_event_evidence(payload, batch)
-        _filter_internal_artifacts_from_summary_payload(payload, app_data_dir=self.config.app_data_dir)
+        _filter_internal_artifacts_from_summary_payload(payload, app_data_dir=self.app_data_dir)
         return payload
 
     def _persist_activity_entities_for_batch(

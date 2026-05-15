@@ -96,6 +96,7 @@ def test_summarizer_reports_lmstudio_connection_error_once(tmp_path: Path) -> No
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=FailingConnectionClient(),
         error_notifier=notifier,
+        app_data_dir=str(tmp_path),
     )
 
     try:

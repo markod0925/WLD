@@ -120,6 +120,7 @@ def _build_summarizer(tmp_path: Path, *, with_screenshot: bool = False) -> tuple
         storage=storage,
         batch_builder=BatchBuilder(storage=storage, max_text_segments=200, max_screenshots=3),
         lm_client=LMStudioClient(base_url="http://localhost:1234/v1", model="test-model", timeout_seconds=5),
+        app_data_dir=str(tmp_path),
     )
     return summarizer, storage
 
@@ -158,6 +159,8 @@ def test_llm_trace_success(tmp_path: Path, caplog: pytest.LogCaptureFixture, mon
         assert "stage=request_success status=ok" in output
         assert "stage=response_parse status=start" in output
         assert "stage=response_parse status=ok" in output
+        assert "stage=summary_postprocess status=start" in output
+        assert "stage=summary_postprocess status=ok" in output
         assert "stage=summary_store status=start" in output
         assert "stage=summary_store status=ok" in output
         assert "stage=summary_job_started status=ok" in output
@@ -234,6 +237,50 @@ def test_llm_trace_parse_failure(tmp_path: Path, caplog: pytest.LogCaptureFixtur
         assert "stage=response_parse status=error" in output
         assert "stage=response_parse status=degraded" in output
         assert "stage=summary_job_completed status=ok" in output
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_llm_trace_postprocess_failure_is_not_classified_as_transport_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summarizer, storage = _build_summarizer(tmp_path)
+    caplog.set_level(logging.INFO)
+
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda *_args, **_kwargs: FakeResponse(
+            '{"summary_text":"done","key_points":["a"],"blocked_activity":[],"metadata":{}}'
+        ),
+    )
+    monkeypatch.setattr(summarizer.batch_builder, "build_pending_batch", lambda **_kwargs: _summary_batch())
+
+    def _raise_postprocess(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("postprocess exploded")
+
+    monkeypatch.setattr(
+        "worklog_diary.core.summarizer._filter_internal_artifacts_from_summary_payload",
+        _raise_postprocess,
+    )
+
+    try:
+        assert summarizer.flush_pending(reason="test") is None
+        assert summarizer.storage.get_summary_job_status_counts()["failed"] == 1
+        runtime = summarizer.get_runtime_status()
+        assert runtime["lmstudio_last_error_category"] == "summary_postprocess_error"
+        assert runtime["lmstudio_last_error_message"] == "Summary post-processing failed."
+        output = _stage_lines(caplog)
+        assert "stage=request_success status=ok" in output
+        assert "stage=response_parse status=ok" in output
+        assert "stage=summary_postprocess status=error" in output
+        assert "stage=summary_job_failed status=error" in output
+        assert "failed_stage=summary_postprocess" in output
+        assert "error_category=summary_postprocess_error" in output
+        assert "error_category=llm_transport_error" not in output
     finally:
         summarizer.stop()
         storage.close()

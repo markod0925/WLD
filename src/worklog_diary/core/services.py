@@ -279,6 +279,8 @@ class MonitoringServices:
                 self.logger.info("event=daily_recap_replaced day=%s", day_key)
             self.error_notifier.resolve_many(
                 "summary_generation_failure",
+                "summary_postprocess_error",
+                "summary_store_error",
                 "lmstudio_connection",
                 "lmstudio_service_unavailable",
             )

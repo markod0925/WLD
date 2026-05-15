@@ -185,6 +185,7 @@ class ServiceRegistry:
             shutdown_event=shutdown_event,
             summary_deduplicator=summary_deduplicator,
             semantic_coalescer=semantic_coalescer,
+            app_data_dir=self.config.app_data_dir,
         )
 
         return MonitoringServiceBundle(
