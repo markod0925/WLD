@@ -5,7 +5,13 @@ from pathlib import Path
 
 from worklog_diary.core.models import SummaryRecord
 from worklog_diary.core.storage import SQLiteStorage
-from worklog_diary.core.summary_search import SummarySearchParams, SummarySearchScope, SummarySearchService
+from worklog_diary.core.summary_search import (
+    SummarySearchParams,
+    SummarySearchScope,
+    SummarySearchService,
+    _resolve_bounds,
+    coerce_search_scope,
+)
 from worklog_diary.ui.summaries_view_model import build_summary_card_view, format_summary_html
 
 
@@ -126,3 +132,82 @@ def test_build_summary_card_view_preserves_non_ascii_in_fallback_json_rendering(
     assert '{"status": "résolu", "title": "Caffè Δ sync"}' in card.summary_text
     assert "\\u00e9" not in card.summary_text
     assert "\\u0394" not in card.summary_text
+
+
+def test_summary_search_matches_terms_adjacent_to_punctuation_and_paths(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    service = SummarySearchService(storage)
+    try:
+        target_day = date(2026, 4, 10)
+        texts = [
+            "alpha target beta",
+            "target,",
+            "(target",
+            r"C:\work\target\file.m",
+            "target.m",
+            "module.target",
+            "target: value",
+            "foo/target/bar",
+            r"foo\target\bar",
+            "[target]",
+            "target_file",
+            "target-file",
+        ]
+        for idx, text in enumerate(texts):
+            start = _ts(target_day, 9 + idx // 2, idx % 2 * 10)
+            _insert_event_summary(storage, start_ts=start, end_ts=start + 60, text=text)
+
+        _insert_event_summary(
+            storage,
+            start_ts=_ts(target_day, 20),
+            end_ts=_ts(target_day, 20, 10),
+            text="pretargetpost",
+        )
+
+        results = service.search(
+            SummarySearchParams(query="target", scope=SummarySearchScope.ALL, anchor_day=target_day)
+        )
+        matched_texts = {item.text for item in results}
+
+        for expected in texts:
+            assert expected in matched_texts
+        assert "pretargetpost" in matched_texts
+    finally:
+        storage.close()
+
+
+def test_coerce_search_scope_handles_enum_and_supported_strings() -> None:
+    assert coerce_search_scope(SummarySearchScope.DAY) == SummarySearchScope.DAY
+    assert coerce_search_scope("day") == SummarySearchScope.DAY
+    assert coerce_search_scope("month") == SummarySearchScope.MONTH
+    assert coerce_search_scope("year") == SummarySearchScope.YEAR
+    assert coerce_search_scope("all") == SummarySearchScope.ALL
+
+
+def test_coerce_search_scope_falls_back_to_day_for_invalid_values() -> None:
+    assert coerce_search_scope("MONTH") == SummarySearchScope.DAY
+    assert coerce_search_scope("invalid") == SummarySearchScope.DAY
+    assert coerce_search_scope(None) == SummarySearchScope.DAY
+
+
+def test_resolve_bounds_month_and_year_use_half_open_anchor_ranges() -> None:
+    anchor_day = date(2026, 4, 10)
+
+    month_bounds = _resolve_bounds(scope=SummarySearchScope.MONTH, anchor_day=anchor_day)
+    assert month_bounds.day_start == date(2026, 4, 1)
+    assert month_bounds.day_end_exclusive == date(2026, 5, 1)
+
+    year_bounds = _resolve_bounds(scope=SummarySearchScope.YEAR, anchor_day=anchor_day)
+    assert year_bounds.day_start == date(2026, 1, 1)
+    assert year_bounds.day_end_exclusive == date(2027, 1, 1)
+
+
+def test_resolve_bounds_year_does_not_reuse_month_window() -> None:
+    anchor_day = date(2026, 12, 15)
+    month_bounds = _resolve_bounds(scope=SummarySearchScope.MONTH, anchor_day=anchor_day)
+    year_bounds = _resolve_bounds(scope=SummarySearchScope.YEAR, anchor_day=anchor_day)
+
+    assert month_bounds.day_end_exclusive == date(2027, 1, 1)
+    assert year_bounds.day_end_exclusive == date(2027, 1, 1)
+    assert month_bounds.day_start == date(2026, 12, 1)
+    assert year_bounds.day_start == date(2026, 1, 1)
