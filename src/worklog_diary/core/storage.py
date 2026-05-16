@@ -365,6 +365,29 @@ class SQLiteStorage(ActivityRepository):
             summary_json=summary_json,
         )
 
+    def update_event_summary_structured_fields(
+        self,
+        summary_id: int,
+        *,
+        structured_payload_json: dict | None,
+        primary_task_label: str | None,
+        primary_activity_type: str | None,
+        is_blocked: bool,
+        is_low_value: bool,
+        noise_reason: str | None,
+        confidence: float | None,
+    ) -> None:
+        self.summary_repository.update_event_summary_structured_fields(
+            summary_id,
+            structured_payload_json=structured_payload_json,
+            primary_task_label=primary_task_label,
+            primary_activity_type=primary_activity_type,
+            is_blocked=is_blocked,
+            is_low_value=is_low_value,
+            noise_reason=noise_reason,
+            confidence=confidence,
+        )
+
     def list_summaries(self, limit: int = 100) -> list[SummaryRecord]:
         return self.summary_repository.list_summaries(limit)
 
@@ -407,14 +430,39 @@ class SQLiteStorage(ActivityRepository):
             limit=limit,
         )
 
+    def search_task_clusters(
+        self,
+        *,
+        query: str,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, object]]:
+        return self.summary_repository.search_task_clusters(
+            query=query,
+            start_day=start_day,
+            end_day_exclusive=end_day_exclusive,
+            limit=limit,
+        )
+
     def create_daily_summary(
         self,
         day: Day,
         recap_text: str,
         recap_json: dict | None,
         source_batch_count: int,
+        *,
+        structured_payload_json: dict | None = None,
+        generated_from_task_clusters: bool = True,
     ) -> tuple[DailySummaryRecord, bool]:
-        return self.summary_repository.create_daily_summary(day, recap_text, recap_json, source_batch_count)
+        return self.summary_repository.create_daily_summary(
+            day,
+            recap_text,
+            recap_json,
+            source_batch_count,
+            structured_payload_json=structured_payload_json,
+            generated_from_task_clusters=generated_from_task_clusters,
+        )
 
     def update_daily_summary_record(
         self,
@@ -500,6 +548,27 @@ class SQLiteStorage(ActivityRepository):
             start_day=start_day,
             end_day_exclusive=end_day_exclusive,
         )
+    def list_audit_task_clusters(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        return self.summary_repository.list_audit_task_clusters(
+            start_day=start_day,
+            end_day_exclusive=end_day_exclusive,
+        )
+
+    def list_audit_summary_task_links(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        return self.summary_repository.list_audit_summary_task_links(
+            start_day=start_day,
+            end_day_exclusive=end_day_exclusive,
+        )
 
     def list_audit_coalesced_summaries(
         self,
@@ -546,11 +615,46 @@ class SQLiteStorage(ActivityRepository):
             self._record_db_write()
         return inserted_ids
 
+    def replace_activity_entities_for_summary(
+        self,
+        *,
+        day: Day | str,
+        start_ts: float,
+        end_ts: float,
+        summary_id: int,
+        entities: list[ActivityEntityDraft],
+    ) -> list[int]:
+        return self.summary_repository.replace_activity_entities_for_summary(
+            day=day,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            summary_id=summary_id,
+            entities=entities,
+        )
+
     def list_activity_entities_for_day(self, day: Day) -> list[ActivityEntityRecord]:
         return self.summary_repository.list_activity_entities_for_day(day)
 
     def list_activity_entities_for_summary(self, summary_id: int) -> list[ActivityEntityRecord]:
         return self.summary_repository.list_activity_entities_for_summary(summary_id)
+
+    def replace_task_clusters_for_day(
+        self,
+        *,
+        day: Day,
+        clusters: list[dict[str, object]],
+        links: list[dict[str, object]],
+    ) -> tuple[int, int]:
+        return self.summary_repository.replace_task_clusters_for_day(day=day, clusters=clusters, links=links)
+
+    def list_task_clusters_for_day(self, day: Day) -> list[dict[str, object]]:
+        return self.summary_repository.list_task_clusters_for_day(day)
+
+    def list_summary_task_links_for_day(self, day: Day) -> list[dict[str, object]]:
+        return self.summary_repository.list_summary_task_links_for_day(day)
+
+    def count_low_value_noise_reasons_for_day(self, day: Day) -> list[dict[str, object]]:
+        return self.summary_repository.count_low_value_noise_reasons_for_day(day)
 
     def search_activity_entities(
         self,

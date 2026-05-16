@@ -15,6 +15,7 @@ class SummarySearchScope(str, Enum):
 class SummarySearchType(str, Enum):
     EVENT = "event"
     DAY = "day"
+    TASK = "task"
 
 
 @dataclass(slots=True)
@@ -74,6 +75,12 @@ class SummarySearchService:
             end_day_exclusive=bounds.day_end_exclusive,
             limit=2000,
         )
+        task_clusters = self.storage.search_task_clusters(
+            query=query,
+            start_day=bounds.day_start,
+            end_day_exclusive=bounds.day_end_exclusive,
+            limit=500,
+        )
 
         results: list[SummarySearchResult] = []
         for item in events:
@@ -96,8 +103,33 @@ class SummarySearchService:
                     text=item.recap_text.strip(),
                 )
             )
+        for item in task_clusters:
+            timestamp = float(item.get("start_ts") or 0.0)
+            day = datetime.strptime(str(item["day"]), "%Y-%m-%d").date()
+            results.append(
+                SummarySearchResult(
+                    summary_type=SummarySearchType.TASK,
+                    source_id=int(item.get("id") or 0),
+                    timestamp=timestamp,
+                    day=day,
+                    text=f"{item.get('title', '')}: {item.get('summary_text', '')}".strip(),
+                )
+            )
 
-        return sorted(results, key=lambda item: item.timestamp, reverse=True)
+        return sorted(results, key=lambda item: (_rank(item, query), item.timestamp), reverse=True)
+
+
+def _rank(item: SummarySearchResult, query: str) -> int:
+    q = query.strip().lower()
+    text = item.text.lower()
+    base = 10 if item.summary_type == SummarySearchType.TASK else 5 if item.summary_type == SummarySearchType.DAY else 1
+    if text.startswith(q):
+        base += 8
+    elif q in text:
+        base += 4
+    if item.summary_type == SummarySearchType.TASK and (".m" in q or ".txt" in q or ".xlsx" in q):
+        base += 3
+    return base
 
 
 def _resolve_bounds(scope: SummarySearchScope, anchor_day: date) -> _SearchBounds:

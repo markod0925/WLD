@@ -18,8 +18,12 @@ from .lmstudio_logging import get_failed_stage, llm_job_context, log_llm_stage, 
 from .llm_job_queue import LLMJobCancelledError, LLMJobMetadata
 from .internal_artifacts import is_internal_artifact_path
 from .storage import SQLiteStorage
+from .task_evidence_extraction import extract_task_evidence
+from .task_clustering import cluster_tasks_for_day
+from .task_daily_summary import build_daily_summary_from_task_clusters
 from .summary_dedup import SummaryDeduplicator
 from .semantic_coalescing import SemanticCoalescer
+from .models import SummaryRecord
 
 
 @dataclass(slots=True)
@@ -580,15 +584,36 @@ class Summarizer:
                     input_chars=input_chars,
                     input_token_estimate=_estimate_token_count(input_chars),
                 ):
-                    recap_text, recap_json = self.lm_client.summarize_daily_recap(
-                        day=day,
-                        summaries=summaries,
-                        job_id=job_id,
-                        job_type="day_summary",
-                        on_started=_on_started,
-                        on_cancelled=_on_cancelled,
-                        priority=priority,
+                    _on_started(
+                        LLMJobMetadata(
+                            job_id=job_id,
+                            job_type="day_summary",
+                            attempt=1,
+                            queued_at=time.time(),
+                            started_at=time.time(),
+                            finished_at=None,
+                            timeout_s=timeout_s,
+                            input_chars=input_chars,
+                            input_token_estimate=_estimate_token_count(input_chars),
+                            priority=priority,
+                        )
                     )
+                    cluster_tasks_for_day(day, storage=self.storage)
+                    clusters = self.storage.list_task_clusters_for_day(day)
+                    ignored_noise = self.storage.count_low_value_noise_reasons_for_day(day)
+                    daily = build_daily_summary_from_task_clusters(day, clusters, summaries, ignored_noise=ignored_noise)
+                    self.logger.info(
+                        "event=task_daily_generation day=%s source_summary_count=%s low_value_summary_count=%s task_cluster_count=%s task_titles=%s ignored_noise=%s generated_from_task_clusters=%s fallback_reason=%s",
+                        day.isoformat(),
+                        len(summaries),
+                        sum(int(item.get("count", 0)) for item in ignored_noise),
+                        len(clusters),
+                        [str(c.get("title")) for c in clusters],
+                        {str(item.get("reason")): int(item.get("count", 0)) for item in ignored_noise},
+                        bool(daily.generated_from_task_clusters),
+                        daily.payload.get("fallback_reason") if isinstance(daily.payload, dict) else None,
+                    )
+                    recap_text, recap_json = daily.summary_text, daily.payload
             except LLMJobCancelledError as exc:
                 self.storage.update_summary_job(
                     job_id,
@@ -712,6 +737,8 @@ class Summarizer:
                     recap_text=recap_text,
                     recap_json=recap_json if isinstance(recap_json, dict) else None,
                     source_batch_count=len(summaries),
+                    structured_payload_json=recap_json if isinstance(recap_json, dict) else None,
+                    generated_from_task_clusters=bool(isinstance(recap_json, dict) and recap_json.get("generated_from_task_clusters", False)),
                 )
             except Exception as exc:
                 self.storage.update_summary_job(
@@ -1291,6 +1318,14 @@ class Summarizer:
                     )
 
                 if summary_id is not None and persisted_summary_payload is not None:
+                    self._persist_structured_task_evidence(
+                        summary_id=summary_id,
+                        start_ts=batch.start_ts,
+                        end_ts=batch.end_ts,
+                        summary_text=summary_text,
+                        summary_json=persisted_summary_payload,
+                        job_id=job_id,
+                    )
                     persisted_entities = [
                         asdict(item)
                         for item in self.storage.list_activity_entities_for_summary(summary_id)
@@ -1613,6 +1648,44 @@ class Summarizer:
             entities=batch.activity_entities,
         )
         return len(inserted_ids)
+
+    def _persist_structured_task_evidence(
+        self,
+        *,
+        summary_id: int,
+        start_ts: float,
+        end_ts: float,
+        summary_text: str,
+        summary_json: dict[str, object],
+        job_id: int,
+    ) -> None:
+        record = SummaryRecord(
+            id=summary_id,
+            job_id=job_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            summary_text=summary_text,
+            summary_json=summary_json,
+            created_ts=time.time(),
+        )
+        evidence = extract_task_evidence(record)
+        self.storage.update_event_summary_structured_fields(
+            summary_id,
+            structured_payload_json=evidence.payload,
+            primary_task_label=evidence.primary_task_label,
+            primary_activity_type=evidence.primary_activity_type,
+            is_blocked=evidence.is_blocked,
+            is_low_value=evidence.is_low_value,
+            noise_reason=evidence.noise_reason,
+            confidence=evidence.confidence,
+        )
+        self.storage.replace_activity_entities_for_summary(
+            day=date.fromtimestamp(start_ts),
+            start_ts=start_ts,
+            end_ts=end_ts,
+            summary_id=summary_id,
+            entities=evidence.entities,
+        )
 
     def _merge_summary_payload(
         self,
