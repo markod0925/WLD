@@ -441,7 +441,7 @@ class SummaryRepository:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, job_id, start_ts, end_ts, summary_text, summary_json, created_ts
+                SELECT id, job_id, start_ts, end_ts, summary_text, summary_json, created_ts, primary_task_label, primary_activity_type
                 FROM summaries
                 ORDER BY created_ts DESC
                 LIMIT ?
@@ -478,7 +478,7 @@ class SummaryRepository:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, job_id, start_ts, end_ts, summary_text, summary_json, created_ts
+                SELECT id, job_id, start_ts, end_ts, summary_text, summary_json, created_ts, primary_task_label, primary_activity_type
                 FROM summaries
                 WHERE start_ts >= ? AND start_ts < ?
                 ORDER BY start_ts ASC, id ASC
@@ -1529,6 +1529,7 @@ class SummaryRepository:
 
 
 def _row_to_summary_record(row: sqlite3.Row, *, job_id: int | None = None) -> SummaryRecord:
+    column_names = set(row.keys())
     return SummaryRecord(
         id=int(row["id"]),
         job_id=int(row["job_id"]) if job_id is None else job_id,
@@ -1537,6 +1538,8 @@ def _row_to_summary_record(row: sqlite3.Row, *, job_id: int | None = None) -> Su
         summary_text=str(row["summary_text"]),
         summary_json=json.loads(str(row["summary_json"])),
         created_ts=float(row["created_ts"]),
+        primary_task_label=str(row["primary_task_label"]) if "primary_task_label" in column_names and row["primary_task_label"] is not None else None,
+        primary_activity_type=str(row["primary_activity_type"]) if "primary_activity_type" in column_names and row["primary_activity_type"] is not None else None,
     )
 
 

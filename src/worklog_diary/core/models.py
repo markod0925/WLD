@@ -105,6 +105,8 @@ class SummaryRecord:
     summary_text: str
     summary_json: dict[str, Any]
     created_ts: float
+    primary_task_label: str | None = None
+    primary_activity_type: str | None = None
 
 
 @dataclass(slots=True)

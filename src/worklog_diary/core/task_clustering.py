@@ -94,7 +94,7 @@ def build_task_clusters_for_day(
 def _score_summary_tasks(summary: SummaryRecord, entities: list[ActivityEntityRecord]) -> dict[str, float]:
     raw = summary.summary_json if isinstance(summary.summary_json, dict) else {}
     text = (summary.summary_text + " " + json.dumps(raw)).lower()
-    label = str(raw.get("primary_task_label") or "").strip()
+    label = str(getattr(summary, "primary_task_label", None) or raw.get("primary_task_label") or "").strip()
     if not label:
         label = ""
     scores = {TASK_MATLAB: 0.0, TASK_WLD: 0.0, TASK_EMAIL: 0.0}
@@ -158,7 +158,7 @@ def _add_to_cluster(cluster: dict[str, Any], s: SummaryRecord, entities: list[Ac
         elif e.entity_type == "concept":
             ev["concepts"].append(e.entity_value)
     raw = s.summary_json if isinstance(s.summary_json, dict) else {}
-    activity = raw.get("primary_activity_type")
+    activity = getattr(s, "primary_activity_type", None) or raw.get("primary_activity_type")
     if isinstance(activity, str) and activity:
         ev["activity_types"].append(activity)
     ev["time_range"]["start_ts"] = cluster["start_ts"]
