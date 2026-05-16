@@ -112,6 +112,13 @@ class StorageSchemaManager:
             end_ts REAL NOT NULL,
             summary_text TEXT NOT NULL,
             summary_json TEXT NOT NULL,
+            structured_payload_json TEXT,
+            primary_task_label TEXT,
+            primary_activity_type TEXT,
+            is_blocked INTEGER NOT NULL DEFAULT 0,
+            is_low_value INTEGER NOT NULL DEFAULT 0,
+            noise_reason TEXT,
+            confidence REAL,
             created_ts REAL NOT NULL,
             FOREIGN KEY(job_id) REFERENCES summary_jobs(id)
         );
@@ -188,7 +195,36 @@ class StorageSchemaManager:
             created_ts REAL NOT NULL,
             recap_text TEXT NOT NULL,
             recap_json TEXT,
-            source_batch_count INTEGER NOT NULL DEFAULT 0
+            source_batch_count INTEGER NOT NULL DEFAULT 0,
+            structured_payload_json TEXT,
+            generated_from_task_clusters INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS task_clusters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,
+            title TEXT NOT NULL,
+            normalized_title TEXT NOT NULL,
+            task_type TEXT,
+            status TEXT,
+            start_ts REAL,
+            end_ts REAL,
+            summary_text TEXT,
+            evidence_json TEXT,
+            confidence REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS summary_task_links (
+            summary_id INTEGER NOT NULL,
+            task_cluster_id INTEGER NOT NULL,
+            relation_type TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            confidence REAL,
+            PRIMARY KEY(summary_id, task_cluster_id),
+            FOREIGN KEY(summary_id) REFERENCES summaries(id),
+            FOREIGN KEY(task_cluster_id) REFERENCES task_clusters(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_active_intervals_time ON active_intervals(start_ts, end_ts);
@@ -200,12 +236,18 @@ class StorageSchemaManager:
         CREATE INDEX IF NOT EXISTS idx_screenshots_ts ON screenshots(ts);
         CREATE INDEX IF NOT EXISTS idx_summaries_created ON summaries(created_ts DESC);
         CREATE INDEX IF NOT EXISTS idx_summaries_start ON summaries(start_ts);
+        CREATE INDEX IF NOT EXISTS idx_summaries_day_time ON summaries(start_ts, end_ts);
+        CREATE INDEX IF NOT EXISTS idx_summaries_primary_task_label ON summaries(primary_task_label);
         CREATE INDEX IF NOT EXISTS idx_activity_entities_day ON activity_entities(day);
         CREATE INDEX IF NOT EXISTS idx_activity_entities_type ON activity_entities(entity_type);
         CREATE INDEX IF NOT EXISTS idx_activity_entities_normalized ON activity_entities(entity_normalized);
         CREATE INDEX IF NOT EXISTS idx_activity_entities_time ON activity_entities(start_ts, end_ts);
         CREATE INDEX IF NOT EXISTS idx_activity_entities_summary_id ON activity_entities(summary_id);
         CREATE INDEX IF NOT EXISTS idx_daily_summaries_day ON daily_summaries(day);
+        CREATE INDEX IF NOT EXISTS idx_task_clusters_day ON task_clusters(day);
+        CREATE INDEX IF NOT EXISTS idx_task_clusters_day_normalized_title ON task_clusters(day, normalized_title);
+        CREATE INDEX IF NOT EXISTS idx_summary_task_links_summary_id ON summary_task_links(summary_id);
+        CREATE INDEX IF NOT EXISTS idx_summary_task_links_task_cluster_id ON summary_task_links(task_cluster_id);
         CREATE INDEX IF NOT EXISTS idx_coalesced_summaries_day ON coalesced_summaries(day, start_ts);
         CREATE INDEX IF NOT EXISTS idx_semantic_merge_diagnostics_day ON semantic_merge_diagnostics(day, left_summary_id);
         """
@@ -214,6 +256,8 @@ class StorageSchemaManager:
             self._conn.executescript(schema)
             self.ensure_summary_jobs_schema()
             self.ensure_daily_summaries_schema()
+            self.ensure_event_summaries_schema()
+            self.ensure_task_clustering_schema()
             self.ensure_screenshots_schema()
             self.ensure_semantic_coalescing_schema()
             self._conn.commit()
@@ -334,6 +378,69 @@ class StorageSchemaManager:
             self._conn.execute(
                 "ALTER TABLE daily_summaries ADD COLUMN source_batch_count INTEGER NOT NULL DEFAULT 0"
             )
+        if "structured_payload_json" not in columns:
+            self._conn.execute("ALTER TABLE daily_summaries ADD COLUMN structured_payload_json TEXT")
+        if "generated_from_task_clusters" not in columns:
+            self._conn.execute(
+                "ALTER TABLE daily_summaries ADD COLUMN generated_from_task_clusters INTEGER NOT NULL DEFAULT 1"
+            )
+
+    def ensure_event_summaries_schema(self) -> None:
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'summaries'"
+        ).fetchone()
+        if row is None:
+            return
+        columns = {str(item["name"]) for item in self._conn.execute("PRAGMA table_info(summaries)").fetchall()}
+        if "structured_payload_json" not in columns:
+            self._conn.execute("ALTER TABLE summaries ADD COLUMN structured_payload_json TEXT")
+        if "primary_task_label" not in columns:
+            self._conn.execute("ALTER TABLE summaries ADD COLUMN primary_task_label TEXT")
+        if "primary_activity_type" not in columns:
+            self._conn.execute("ALTER TABLE summaries ADD COLUMN primary_activity_type TEXT")
+        if "is_blocked" not in columns:
+            self._conn.execute("ALTER TABLE summaries ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
+        if "is_low_value" not in columns:
+            self._conn.execute("ALTER TABLE summaries ADD COLUMN is_low_value INTEGER NOT NULL DEFAULT 0")
+        if "noise_reason" not in columns:
+            self._conn.execute("ALTER TABLE summaries ADD COLUMN noise_reason TEXT")
+        if "confidence" not in columns:
+            self._conn.execute("ALTER TABLE summaries ADD COLUMN confidence REAL")
+
+    def ensure_task_clustering_schema(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS task_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                task_type TEXT,
+                status TEXT,
+                start_ts REAL,
+                end_ts REAL,
+                summary_text TEXT,
+                evidence_json TEXT,
+                confidence REAL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS summary_task_links (
+                summary_id INTEGER NOT NULL,
+                task_cluster_id INTEGER NOT NULL,
+                relation_type TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                confidence REAL,
+                PRIMARY KEY(summary_id, task_cluster_id),
+                FOREIGN KEY(summary_id) REFERENCES summaries(id),
+                FOREIGN KEY(task_cluster_id) REFERENCES task_clusters(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_clusters_day ON task_clusters(day);
+            CREATE INDEX IF NOT EXISTS idx_task_clusters_day_normalized_title ON task_clusters(day, normalized_title);
+            CREATE INDEX IF NOT EXISTS idx_summary_task_links_summary_id ON summary_task_links(summary_id);
+            CREATE INDEX IF NOT EXISTS idx_summary_task_links_task_cluster_id ON summary_task_links(task_cluster_id);
+            """
+        )
 
     def ensure_summary_jobs_schema(self) -> None:
         row = self._conn.execute(

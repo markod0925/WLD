@@ -40,6 +40,14 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _validate_task_centric_bundle(path: Path) -> None:
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    tc = manifest.get("task_centric_export") or {}
+    assert tc.get("enabled") is True
+    for name in tc.get("files", []):
+        assert (path / name).exists()
+
+
 def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
     storage = SQLiteStorage(str(tmp_path / "wld.db"))
     day = date(2026, 4, 20)
@@ -60,6 +68,23 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
             ),
         )
         storage.create_daily_summary(day, "daily", {"metadata": {"schema": "worklog.daily"}}, 2)
+        storage.replace_task_clusters_for_day(
+            day=day,
+            clusters=[
+                {
+                    "title": "MATLAB genetic optimization",
+                    "normalized_title": "matlab genetic optimization",
+                    "task_type": "engineering_analysis",
+                    "status": "active",
+                    "start_ts": _ts(day, 9, 0),
+                    "end_ts": _ts(day, 10, 15),
+                    "summary_text": "Worked on MATLAB genetic optimization.",
+                    "evidence_json": {"files": ["Input_cases.m"], "linked_summary_ids": [sid1]},
+                    "confidence": 0.9,
+                }
+            ],
+            links=[{"summary_id": sid1, "cluster_normalized_title": "matlab genetic optimization", "relation_type": "primary", "weight": 1.0, "confidence": 0.9}],
+        )
         storage.replace_coalesced_summaries_for_day(
             day,
             [
@@ -107,6 +132,8 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
         assert (result.output_dir / "daily_summaries.jsonl").exists()
         assert (result.output_dir / "coalesced_summaries.jsonl").exists()
         assert (result.output_dir / "activity_entities.jsonl").exists()
+        assert (result.output_dir / "task_clusters.jsonl").exists()
+        assert (result.output_dir / "summary_task_links.jsonl").exists()
         assert (result.output_dir / "evidence_quality.jsonl").exists()
         assert (result.output_dir / "evidence_quality_summary.json").exists()
         assert (result.output_dir / "parser_coverage.jsonl").exists()
@@ -122,6 +149,8 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
         daily = _read_jsonl(result.output_dir / "daily_summaries.jsonl")
         coalesced = _read_jsonl(result.output_dir / "coalesced_summaries.jsonl")
         activity_entities = _read_jsonl(result.output_dir / "activity_entities.jsonl")
+        task_clusters = _read_jsonl(result.output_dir / "task_clusters.jsonl")
+        summary_task_links = _read_jsonl(result.output_dir / "summary_task_links.jsonl")
         evidence_quality = _read_jsonl(result.output_dir / "evidence_quality.jsonl")
         parser_coverage = _read_jsonl(result.output_dir / "parser_coverage.jsonl")
         unknown_apps = _read_jsonl(result.output_dir / "unknown_apps.jsonl")
@@ -135,6 +164,8 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
         assert manifest["counts"]["daily_summaries.jsonl"] == len(daily)
         assert manifest["counts"]["coalesced_summaries.jsonl"] == len(coalesced)
         assert manifest["counts"]["activity_entities.jsonl"] == len(activity_entities)
+        assert manifest["counts"]["task_clusters.jsonl"] == len(task_clusters)
+        assert manifest["counts"]["summary_task_links.jsonl"] == len(summary_task_links)
         assert manifest["counts"]["evidence_quality.jsonl"] == len(evidence_quality)
         assert manifest["counts"]["evidence_quality_summary.json"] == 1
         assert manifest["counts"]["parser_coverage.jsonl"] == len(parser_coverage)
@@ -151,6 +182,9 @@ def test_export_creates_jsonl_files_and_manifest_counts(tmp_path: Path) -> None:
         assert evidence_quality_summary["summary_count"] == len(evidence_quality)
         assert evidence_quality_summary["event_summary_count"] == len(summaries)
         assert "parser_coverage_by_process" in evidence_quality_summary
+        assert manifest["task_centric_export"]["enabled"] is True
+        assert "task_clusters.jsonl" in manifest["task_centric_export"]["files"]
+        _validate_task_centric_bundle(result.output_dir)
     finally:
         storage.close()
 
@@ -216,6 +250,8 @@ def test_export_empty_database_works(tmp_path: Path) -> None:
         assert _read_jsonl(result.output_dir / "summaries.jsonl") == []
         assert _read_jsonl(result.output_dir / "daily_summaries.jsonl") == []
         assert _read_jsonl(result.output_dir / "activity_entities.jsonl") == []
+        assert _read_jsonl(result.output_dir / "task_clusters.jsonl") == []
+        assert _read_jsonl(result.output_dir / "summary_task_links.jsonl") == []
         assert _read_jsonl(result.output_dir / "evidence_quality.jsonl") == []
         assert json.loads((result.output_dir / "evidence_quality_summary.json").read_text(encoding="utf-8"))["summary_count"] == 0
     finally:

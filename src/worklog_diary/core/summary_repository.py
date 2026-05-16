@@ -396,6 +396,46 @@ class SummaryRepository:
             self._conn.commit()
         self._log_db_query_timing("update_summary_record", started_at, rows=1)
 
+    def update_event_summary_structured_fields(
+        self,
+        summary_id: int,
+        *,
+        structured_payload_json: dict | None,
+        primary_task_label: str | None,
+        primary_activity_type: str | None,
+        is_blocked: bool,
+        is_low_value: bool,
+        noise_reason: str | None,
+        confidence: float | None,
+    ) -> None:
+        started_at = time.perf_counter()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE summaries
+                SET structured_payload_json = ?,
+                    primary_task_label = ?,
+                    primary_activity_type = ?,
+                    is_blocked = ?,
+                    is_low_value = ?,
+                    noise_reason = ?,
+                    confidence = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(structured_payload_json) if structured_payload_json is not None else None,
+                    primary_task_label,
+                    primary_activity_type,
+                    1 if is_blocked else 0,
+                    1 if is_low_value else 0,
+                    noise_reason,
+                    confidence,
+                    summary_id,
+                ),
+            )
+            self._conn.commit()
+        self._log_db_query_timing("update_event_summary_structured_fields", started_at, rows=1)
+
     def list_summaries(self, limit: int = 100) -> list[SummaryRecord]:
         started_at = time.perf_counter()
         with self._lock:
@@ -530,30 +570,79 @@ class SummaryRepository:
         self._log_db_query_timing("search_daily_summaries", started_at, rows=len(result))
         return result
 
+    def search_task_clusters(
+        self,
+        *,
+        query: str,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, object]]:
+        lowered_query = f"%{_escape_like_pattern(query.strip().lower())}%"
+        clauses = [
+            "(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(summary_text) LIKE ? ESCAPE '\\' OR LOWER(evidence_json) LIKE ? ESCAPE '\\')"
+        ]
+        values: list[object] = [lowered_query, lowered_query, lowered_query]
+        if start_day is not None:
+            clauses.append("day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("day < ?")
+            values.append(end_day_exclusive.isoformat())
+        values.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT id, day, title, summary_text, start_ts, end_ts, evidence_json
+                FROM task_clusters
+                WHERE {' AND '.join(clauses)}
+                ORDER BY day DESC, start_ts DESC, id DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def create_daily_summary(
         self,
         day: Day,
         recap_text: str,
         recap_json: dict | None,
         source_batch_count: int,
+        *,
+        structured_payload_json: dict | None = None,
+        generated_from_task_clusters: bool = True,
     ) -> tuple[DailySummaryRecord, bool]:
         day_key = day.isoformat()
         now = time.time()
         query_started_at = time.perf_counter()
         recap_json_str = json.dumps(recap_json) if recap_json is not None else None
+        structured_payload_str = json.dumps(structured_payload_json) if structured_payload_json is not None else None
         with self._lock:
             existing = self._conn.execute("SELECT id FROM daily_summaries WHERE day = ?", (day_key,)).fetchone()
             self._conn.execute(
                 """
-                INSERT INTO daily_summaries(day, created_ts, recap_text, recap_json, source_batch_count)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO daily_summaries(
+                    day, created_ts, recap_text, recap_json, source_batch_count, structured_payload_json, generated_from_task_clusters
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(day) DO UPDATE SET
                     created_ts = excluded.created_ts,
                     recap_text = excluded.recap_text,
                     recap_json = excluded.recap_json,
-                    source_batch_count = excluded.source_batch_count
+                    source_batch_count = excluded.source_batch_count,
+                    structured_payload_json = excluded.structured_payload_json,
+                    generated_from_task_clusters = excluded.generated_from_task_clusters
                 """,
-                (day_key, now, recap_text, recap_json_str, int(source_batch_count)),
+                (
+                    day_key,
+                    now,
+                    recap_text,
+                    recap_json_str,
+                    int(source_batch_count),
+                    structured_payload_str,
+                    1 if generated_from_task_clusters else 0,
+                ),
             )
             row = self._conn.execute(
                 """
@@ -853,6 +942,13 @@ class SummaryRepository:
                     s.end_ts,
                     s.summary_text,
                     s.summary_json,
+                    s.structured_payload_json,
+                    s.primary_task_label,
+                    s.primary_activity_type,
+                    s.is_blocked,
+                    s.is_low_value,
+                    s.noise_reason,
+                    s.confidence,
                     s.created_ts,
                     sj.job_type,
                     sj.target_day
@@ -873,6 +969,13 @@ class SummaryRepository:
                 "end_ts": float(row["end_ts"]),
                 "summary_text": str(row["summary_text"]),
                 "summary_json": json.loads(str(row["summary_json"])),
+                "structured_payload_json": json.loads(str(row["structured_payload_json"])) if row["structured_payload_json"] else None,
+                "primary_task_label": None if row["primary_task_label"] is None else str(row["primary_task_label"]),
+                "primary_activity_type": None if row["primary_activity_type"] is None else str(row["primary_activity_type"]),
+                "is_blocked": bool(int(row["is_blocked"])) if row["is_blocked"] is not None else False,
+                "is_low_value": bool(int(row["is_low_value"])) if row["is_low_value"] is not None else False,
+                "noise_reason": None if row["noise_reason"] is None else str(row["noise_reason"]),
+                "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
                 "created_ts": float(row["created_ts"]),
                 "job_type": None if row["job_type"] is None else str(row["job_type"]),
                 "target_day": None if row["target_day"] is None else str(row["target_day"]),
@@ -898,7 +1001,7 @@ class SummaryRepository:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, day, created_ts, recap_text, recap_json, source_batch_count
+                SELECT id, day, created_ts, recap_text, recap_json, source_batch_count, structured_payload_json, generated_from_task_clusters
                 FROM daily_summaries
                 """
                 + where_clause
@@ -914,10 +1017,71 @@ class SummaryRepository:
                 "created_ts": float(row["created_ts"]),
                 "recap_text": str(row["recap_text"]),
                 "recap_json": json.loads(str(row["recap_json"])) if row["recap_json"] else None,
+                "structured_payload_json": json.loads(str(row["structured_payload_json"])) if row["structured_payload_json"] else None,
+                "generated_from_task_clusters": bool(int(row["generated_from_task_clusters"])) if row["generated_from_task_clusters"] is not None else False,
                 "source_batch_count": int(row["source_batch_count"]),
             }
             for row in rows
         ]
+
+    def list_audit_task_clusters(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if start_day is not None:
+            clauses.append("day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("day < ?")
+            values.append(end_day_exclusive.isoformat())
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, day, title, normalized_title, task_type, status, start_ts, end_ts, summary_text, evidence_json, confidence, created_at, updated_at
+                FROM task_clusters
+                """
+                + where_clause
+                + """
+                ORDER BY day ASC, start_ts ASC, id ASC
+                """,
+                values,
+            ).fetchall()
+        return [{**dict(r), "evidence_json": json.loads(str(r["evidence_json"])) if r["evidence_json"] else {}} for r in rows]
+
+    def list_audit_summary_task_links(
+        self,
+        *,
+        start_day: Day | None = None,
+        end_day_exclusive: Day | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if start_day is not None:
+            clauses.append("tc.day >= ?")
+            values.append(start_day.isoformat())
+        if end_day_exclusive is not None:
+            clauses.append("tc.day < ?")
+            values.append(end_day_exclusive.isoformat())
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT stl.summary_id, stl.task_cluster_id, stl.relation_type, stl.weight, stl.confidence
+                FROM summary_task_links stl
+                INNER JOIN task_clusters tc ON tc.id = stl.task_cluster_id
+                """
+                + where_clause
+                + """
+                ORDER BY stl.summary_id ASC, stl.task_cluster_id ASC
+                """,
+                values,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def list_audit_coalesced_summaries(
         self,
@@ -1093,6 +1257,23 @@ class SummaryRepository:
         self._log_db_query_timing("add_activity_entities", query_started_at, rows=len(inserted_ids))
         return inserted_ids
 
+    def replace_activity_entities_for_summary(
+        self,
+        *,
+        day: Day | str,
+        start_ts: float,
+        end_ts: float,
+        summary_id: int,
+        entities: list[ActivityEntityDraft],
+    ) -> list[int]:
+        day_key = _normalize_day_key(day)
+        if day_key is None:
+            raise ValueError("day is required for activity entity persistence")
+        with self._lock:
+            self._conn.execute("DELETE FROM activity_entities WHERE summary_id = ?", (int(summary_id),))
+            self._conn.commit()
+        return self.add_activity_entities(day=day_key, start_ts=start_ts, end_ts=end_ts, summary_id=summary_id, entities=entities)
+
     def list_activity_entities_for_day(self, day: Day) -> list[ActivityEntityRecord]:
         day_key = day.isoformat()
         started_at = time.perf_counter()
@@ -1129,6 +1310,138 @@ class SummaryRepository:
         result = [_row_to_activity_entity_record(row) for row in rows]
         self._log_db_query_timing("list_activity_entities_for_summary", started_at, rows=len(result))
         return result
+
+    def replace_task_clusters_for_day(
+        self,
+        *,
+        day: Day,
+        clusters: list[dict[str, object]],
+        links: list[dict[str, object]],
+    ) -> tuple[int, int]:
+        day_key = day.isoformat()
+        now = time.time()
+        with self._lock:
+            existing = self._conn.execute("SELECT id FROM task_clusters WHERE day = ?", (day_key,)).fetchall()
+            existing_ids = [int(r["id"]) for r in existing]
+            if existing_ids:
+                marks = ",".join("?" for _ in existing_ids)
+                self._conn.execute(f"DELETE FROM summary_task_links WHERE task_cluster_id IN ({marks})", existing_ids)
+            self._conn.execute("DELETE FROM task_clusters WHERE day = ?", (day_key,))
+
+            id_by_title: dict[str, int] = {}
+            for item in clusters:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO task_clusters(
+                        day, title, normalized_title, task_type, status, start_ts, end_ts,
+                        summary_text, evidence_json, confidence, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        day_key,
+                        item["title"],
+                        item["normalized_title"],
+                        item.get("task_type"),
+                        item.get("status"),
+                        item.get("start_ts"),
+                        item.get("end_ts"),
+                        item.get("summary_text"),
+                        json.dumps(item.get("evidence_json", {})),
+                        item.get("confidence"),
+                        now,
+                        now,
+                    ),
+                )
+                id_by_title[str(item["normalized_title"])] = int(cursor.lastrowid)
+
+            inserted_links = 0
+            for link in links:
+                cluster_id = id_by_title.get(str(link["cluster_normalized_title"]))
+                if cluster_id is None:
+                    continue
+                self._conn.execute(
+                    """
+                    INSERT INTO summary_task_links(summary_id, task_cluster_id, relation_type, weight, confidence)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(link["summary_id"]),
+                        cluster_id,
+                        str(link["relation_type"]),
+                        float(link.get("weight", 1.0)),
+                        float(link.get("confidence", 0.5)),
+                    ),
+                )
+                inserted_links += 1
+            self._conn.commit()
+        return len(clusters), inserted_links
+
+    def list_task_clusters_for_day(self, day: Day) -> list[dict[str, object]]:
+        day_key = day.isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, day, title, normalized_title, task_type, status, start_ts, end_ts, summary_text, evidence_json, confidence
+                FROM task_clusters WHERE day = ? ORDER BY start_ts ASC, id ASC
+                """,
+                (day_key,),
+            ).fetchall()
+        return [{**dict(r), "evidence_json": json.loads(str(r["evidence_json"])) if r["evidence_json"] else {}} for r in rows]
+
+    def list_summary_task_links_for_day(self, day: Day) -> list[dict[str, object]]:
+        day_key = day.isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT stl.summary_id, stl.task_cluster_id, stl.relation_type, stl.weight, stl.confidence
+                FROM summary_task_links stl
+                INNER JOIN task_clusters tc ON tc.id = stl.task_cluster_id
+                WHERE tc.day = ?
+                ORDER BY stl.summary_id ASC, stl.task_cluster_id ASC
+                """,
+                (day_key,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_low_value_noise_reasons_for_day(self, day: Day) -> list[dict[str, object]]:
+        start_ts, end_ts = _day_epoch_bounds(day)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    is_low_value,
+                    is_blocked,
+                    noise_reason,
+                    summary_json
+                FROM summaries
+                WHERE start_ts >= ? AND start_ts < ?
+                """,
+                (start_ts, end_ts),
+            ).fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            db_low = bool(int(row["is_low_value"])) if row["is_low_value"] is not None else None
+            db_blocked = bool(int(row["is_blocked"])) if row["is_blocked"] is not None else None
+            db_reason = str(row["noise_reason"]).strip() if row["noise_reason"] is not None and str(row["noise_reason"]).strip() else None
+            payload: dict[str, object] = {}
+            try:
+                payload = json.loads(str(row["summary_json"])) if row["summary_json"] else {}
+            except Exception:
+                payload = {}
+            json_low = bool(payload.get("is_low_value")) if isinstance(payload, dict) else False
+            json_blocked = bool(payload.get("is_blocked")) if isinstance(payload, dict) else False
+            json_reason = None
+            if isinstance(payload, dict):
+                value = payload.get("noise_reason")
+                if isinstance(value, str) and value.strip():
+                    json_reason = value.strip()
+            is_low = db_low if db_low is not None else json_low
+            is_blocked = db_blocked if db_blocked is not None else json_blocked
+            reason = db_reason or json_reason
+            if is_low or is_blocked:
+                normalized = reason or ("blocked_content" if is_blocked else "low_value")
+                counts[normalized] = counts.get(normalized, 0) + 1
+        return [{"reason": key, "count": counts[key]} for key in sorted(counts)]
 
     def search_activity_entities(
         self,

@@ -84,6 +84,7 @@ def export_audit_bundle(
         )
         daily_rows = [_build_daily_summary_row(item) for item in daily_summaries]
         counts["daily_summaries.jsonl"] = _write_jsonl_atomic(bundle_dir / "daily_summaries.jsonl", daily_rows)
+        task_generated_daily_summaries_count = sum(1 for item in daily_summaries if bool(item.get("generated_from_task_clusters")))
 
         coalesced = storage.list_audit_coalesced_summaries(
             start_day=options.start_day,
@@ -104,6 +105,10 @@ def export_audit_bundle(
             bundle_dir / "activity_entities.jsonl",
             activity_entity_rows,
         )
+        task_clusters = storage.list_audit_task_clusters(start_day=options.start_day, end_day_exclusive=end_day_exclusive)
+        counts["task_clusters.jsonl"] = _write_jsonl_atomic(bundle_dir / "task_clusters.jsonl", task_clusters)
+        summary_task_links = storage.list_audit_summary_task_links(start_day=options.start_day, end_day_exclusive=end_day_exclusive)
+        counts["summary_task_links.jsonl"] = _write_jsonl_atomic(bundle_dir / "summary_task_links.jsonl", summary_task_links)
 
         activity_entities_by_summary_id = _index_activity_entities_by_summary_id(activity_entity_rows)
         parser_coverage_rows = _build_parser_coverage_rows(summaries)
@@ -170,6 +175,16 @@ def export_audit_bundle(
             "contains_raw_activity_data": False,
             "export_scope": "summaries_and_coalescing_diagnostics_and_activity_entities_and_parser_coverage_and_evidence_quality",
             "counts": counts,
+            "task_centric_export": {
+                "enabled": True,
+                "schema_version": 1,
+                "files": ["task_clusters.jsonl", "summary_task_links.jsonl", "activity_entities.jsonl"],
+                "task_clusters_count": len(task_clusters),
+                "summary_task_links_count": len(summary_task_links),
+                "activity_entities_count": len(activity_entity_rows),
+                "task_generated_daily_summaries_count": task_generated_daily_summaries_count,
+                "low_value_summary_count": sum(1 for item in summary_rows if bool(item.get("is_low_value"))),
+            },
             "evidence_quality_count": len(evidence_quality_rows),
             "evidence_quality_bucket_counts": evidence_quality_summary["bucket_counts"],
             "average_evidence_quality_score": evidence_quality_summary["average_score"],
@@ -217,6 +232,13 @@ def _build_summary_row(*, row: dict[str, Any], options: AuditExportOptions) -> d
         "prompt_name": prompt_metadata.get("schema"),
         "prompt_version": prompt_metadata.get("schema"),
         "model_name": summary_json.get("model_name"),
+        "structured_payload_json": row.get("structured_payload_json"),
+        "primary_task_label": row.get("primary_task_label"),
+        "primary_activity_type": row.get("primary_activity_type"),
+        "is_blocked": row.get("is_blocked"),
+        "is_low_value": row.get("is_low_value"),
+        "noise_reason": row.get("noise_reason"),
+        "confidence": row.get("confidence"),
         "created_at": float(row["created_ts"]),
     }
 
@@ -238,6 +260,8 @@ def _build_daily_summary_row(row: dict[str, Any]) -> dict[str, Any]:
         "prompt_name": metadata.get("schema"),
         "prompt_version": metadata.get("schema"),
         "model_name": recap_json.get("model_name"),
+        "structured_payload_json": row.get("structured_payload_json"),
+        "generated_from_task_clusters": bool(row.get("generated_from_task_clusters")),
         "created_at": float(row["created_ts"]),
     }
 
