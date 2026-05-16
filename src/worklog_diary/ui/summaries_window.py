@@ -37,6 +37,7 @@ from worklog_diary.core.summary_search import (
     SummarySearchScope,
     SummarySearchService,
     SummarySearchType,
+    coerce_search_scope,
 )
 
 from ..core.monitoring_components import DiagnosticsService
@@ -392,9 +393,7 @@ class SummariesWindow(QWidget):
             self._clear_search()
             return
 
-        scope = self.search_scope_combo.currentData()
-        if not isinstance(scope, SummarySearchScope):
-            scope = SummarySearchScope.DAY
+        scope = coerce_search_scope(self.search_scope_combo.currentData())
         anchor_day = _qdate_to_day(self.search_anchor_date.date())
         params = SummarySearchParams(query=query, scope=scope, anchor_day=anchor_day)
         results = self.search_service.search(params)
@@ -447,13 +446,13 @@ class SummariesWindow(QWidget):
         self.summary_cards_layout.addStretch(1)
 
     def _sync_search_anchor_visibility(self) -> None:
-        scope = self.search_scope_combo.currentData()
+        scope = coerce_search_scope(self.search_scope_combo.currentData())
         self.search_anchor_date.setVisible(scope != SummarySearchScope.ALL)
         self.search_anchor_label.setVisible(scope != SummarySearchScope.ALL)
         self._sync_search_anchor_label()
 
     def _sync_search_anchor_label(self, *_: object) -> None:
-        scope = self.search_scope_combo.currentData()
+        scope = coerce_search_scope(self.search_scope_combo.currentData())
         anchor_day = _qdate_to_day(self.search_anchor_date.date())
         if scope == SummarySearchScope.MONTH:
             self.search_anchor_label.setText(f"Anchor month: {anchor_day.strftime('%Y-%m')}")
@@ -667,3 +666,4 @@ def _qdate_to_day(value: QDate) -> date:
 
 def _day_to_qdate(value: date) -> QDate:
     return QDate(value.year, value.month, value.day)
+

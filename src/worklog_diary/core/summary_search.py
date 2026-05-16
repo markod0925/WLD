@@ -41,6 +41,17 @@ class _SearchBounds:
     day_end_exclusive: date | None
 
 
+def coerce_search_scope(value: object) -> SummarySearchScope:
+    if isinstance(value, SummarySearchScope):
+        return value
+    if isinstance(value, str):
+        try:
+            return SummarySearchScope(value)
+        except ValueError:
+            return SummarySearchScope.DAY
+    return SummarySearchScope.DAY
+
+
 class SummarySearchService:
     def __init__(self, storage: object) -> None:
         self.storage = storage
