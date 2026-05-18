@@ -954,12 +954,17 @@ class Summarizer:
         )
 
     def _log_admission_decision_locked(self, *, allowed: bool, reason: str, trigger: str) -> None:
+        manual_bypass_lock_gate = trigger in {"manual", "summary-window"}
         self.logger.info(
-            "event=summary_admission_decision allowed=%s reason=%s lock_state=%s trigger=%s",
+            "event=summary_admission_decision allowed=%s reason=%s lock_state=%s trigger=%s request_reason=%s admission_trigger=%s manual_bypass_lock_gate=%s process_backlog_only_while_locked=%s",
             allowed,
             reason,
             self._lock_state_label(),
             trigger,
+            trigger,
+            trigger,
+            manual_bypass_lock_gate,
+            self._process_backlog_only_while_locked,
         )
 
     def reconcile_missing_daily_summaries(
@@ -970,10 +975,19 @@ class Summarizer:
         max_days: int = 60,
         enabled: bool = True,
     ) -> dict[str, int | str | bool]:
+        lock_state = self._lock_state_label()
+        now = datetime.now()
         if not enabled:
+            self.logger.info(
+                "event=daily_summary_backfill_reconcile_started enabled=false request_reason=%s lock_state=%s min_age_hours=%s max_days=%s now_local=%s",
+                reason,
+                lock_state,
+                float(min_age_hours),
+                int(max_days),
+                now.isoformat(),
+            )
             self.logger.info("event=daily_summary_backfill_noop reason=disabled")
             return {"enabled": False, "scanned_days": 0, "missing_days": 0, "enqueued": 0}
-        now = datetime.now()
         today = now.date()
         cutoff_day = (now - timedelta(hours=max(0.0, min_age_hours))).date()
         candidate_days = [
@@ -981,10 +995,14 @@ class Summarizer:
             if day < today and day < cutoff_day
         ]
         self.logger.info(
-            "event=daily_summary_backfill_scan_started scanned_days=%s cutoff_day=%s max_days=%s",
+            "event=daily_summary_backfill_reconcile_started enabled=true request_reason=%s lock_state=%s min_age_hours=%s max_days=%s now_local=%s scanned_days=%s cutoff_day=%s",
+            reason,
+            lock_state,
+            float(min_age_hours),
+            int(max_days),
+            now.isoformat(),
             len(candidate_days),
             cutoff_day.isoformat(),
-            int(max_days),
         )
         enqueued = 0
         missing = 0
@@ -1002,13 +1020,35 @@ class Summarizer:
                 )
                 break
             if self.storage.get_daily_summary_for_day(day) is not None:
+                self.logger.info(
+                    "event=daily_summary_candidate_evaluated day=%s eligible=false reason=already_has_daily_summary blocked_by_lock_gate=false request_reason=%s",
+                    day.isoformat(),
+                    reason,
+                )
                 continue
             existing_job = self.storage.get_daily_summary_job_for_day(day)
             if existing_job is not None and str(existing_job["status"]) in {"queued", "running"}:
+                self.logger.info(
+                    "event=daily_summary_candidate_evaluated day=%s eligible=false reason=already_queued_or_running existing_status=%s blocked_by_lock_gate=false request_reason=%s",
+                    day.isoformat(),
+                    str(existing_job["status"]),
+                    reason,
+                )
                 continue
             summaries = self.storage.list_effective_summaries_for_day(day, use_coalesced=use_coalesced)
             if not summaries:
+                self.logger.info(
+                    "event=daily_summary_candidate_evaluated day=%s eligible=false reason=no_event_summaries has_event_summaries=false event_summary_count=0 blocked_by_lock_gate=false request_reason=%s",
+                    day.isoformat(),
+                    reason,
+                )
                 continue
+            self.logger.info(
+                "event=daily_summary_candidate_evaluated day=%s eligible=true reason=ready has_event_summaries=true event_summary_count=%s blocked_by_lock_gate=false request_reason=%s",
+                day.isoformat(),
+                len(summaries),
+                reason,
+            )
             missing += 1
             try:
                 summary_id, replaced = self.generate_daily_recap_for_day(day, reason=reason)

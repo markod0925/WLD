@@ -465,6 +465,21 @@ class FlushCoordinator:
             self._drain_cancel_event.clear()
             self.services.summarizer.clear_unrecoverable_error()
             start_counts = self.services.storage.get_summary_job_status_counts()
+            pending = self.services.storage.get_pending_counts()
+            start_runtime = self.services.summarizer.get_runtime_status()
+            self.logger.info(
+                "event=summary_flush_requested request_reason=%s source=FlushCoordinator.flush_now lock_state=%s process_backlog_only_while_locked=%s queued=%s running=%s llm_queue_queued=%s llm_queue_running=%s pending_text_segments=%s pending_screenshots=%s pending_intervals=%s",
+                reason,
+                "locked" if start_runtime.get("session_locked") is True else ("unlocked" if start_runtime.get("session_locked") is False else "unknown"),
+                start_runtime.get("process_backlog_only_while_locked"),
+                start_runtime.get("queued_jobs"),
+                start_runtime.get("running_jobs"),
+                start_runtime.get("llm_queue_queued_jobs"),
+                start_runtime.get("llm_queue_running_jobs"),
+                pending.get("text_segments", 0),
+                pending.get("screenshots", 0),
+                pending.get("intervals", 0),
+            )
 
             with self._status_lock:
                 self._drain_active = True
@@ -475,13 +490,20 @@ class FlushCoordinator:
                 self._last_request_reason = reason
 
             self.logger.info(
-                "event=summary_drain_started reason=%s max_concurrent_summary_llm_requests=%s",
+                "event=summary_drain_started reason=%s request_reason=%s admission_trigger=%s lock_state=%s manual_bypass_lock_gate=%s max_concurrent_summary_llm_requests=%s queued=%s running=%s",
                 reason,
+                reason,
+                reason,
+                "locked" if start_runtime.get("session_locked") is True else ("unlocked" if start_runtime.get("session_locked") is False else "unknown"),
+                reason in {"manual", "summary-window"},
                 self.services.summarizer.get_runtime_status()["max_concurrent_summary_llm_requests"],
+                start_runtime.get("queued_jobs"),
+                start_runtime.get("running_jobs"),
             )
 
             stop_reason = "empty"
             idle_rounds = 0
+            stalled_rounds = 0
 
             try:
                 self.lifecycle_manager.set_draining()
@@ -517,6 +539,22 @@ class FlushCoordinator:
                         pending["screenshots"],
                         pending["intervals"],
                     )
+                    if int(runtime["queued_jobs"]) > 0 and int(runtime["running_jobs"]) == 0 and int(dispatched) == 0:
+                        stalled_rounds += 1
+                    else:
+                        stalled_rounds = 0
+                    if stalled_rounds >= 1:
+                        self.logger.warning(
+                            "event=summary_drain_stalled reason=queued_without_running request_reason=%s queued=%s running=%s dispatched=%s pending_summary_jobs=%s pending_text_segments=%s pending_screenshots=%s pending_intervals=%s",
+                            reason,
+                            runtime["queued_jobs"],
+                            runtime["running_jobs"],
+                            dispatched,
+                            runtime["pending_summary_jobs"],
+                            pending["text_segments"],
+                            pending["screenshots"],
+                            pending["intervals"],
+                        )
 
                     if bool(runtime["has_unrecoverable_error"]):
                         self.services.summarizer.cancel_queued_jobs(reason="cancelled_after_failure")
