@@ -261,6 +261,14 @@ class MonitoringServices:
 
     def generate_daily_recap(self, day: date) -> dict[str, int | str | bool]:
         day_key = day.isoformat()
+        runtime = self.summarizer.get_runtime_status()
+        lock_state = "locked" if runtime.get("session_locked") is True else ("unlocked" if runtime.get("session_locked") is False else "unknown")
+        self.logger.info(
+            "event=daily_summary_manual_requested day=%s request_reason=manual_daily lock_state=%s process_backlog_only_while_locked=%s",
+            day_key,
+            lock_state,
+            runtime.get("process_backlog_only_while_locked"),
+        )
         self.logger.info("event=daily_recap_generation_started day=%s", day_key)
         try:
             summary_id, replaced = self.summarizer.generate_daily_recap_for_day(day, reason="manual")

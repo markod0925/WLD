@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from pathlib import Path
 
 from worklog_diary.core.batching import BatchBuilder
@@ -223,6 +224,31 @@ def test_manual_jobs_bypass_lock_gate_and_unknown_state_fail_open(tmp_path: Path
         assert summarizer.flush_pending(reason="manual", force_flush=True) is not None
         assert summarizer.cancel_queued_jobs(reason="cleanup") == 1
         assert summarizer.wait_for_idle(timeout_seconds=5.0)
+    finally:
+        summarizer.stop()
+        storage.close()
+
+
+def test_admission_logs_manual_bypass_fields(tmp_path: Path, caplog) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    _seed_segments(storage, count=1)
+    client = RecordingClient()
+    summarizer = Summarizer(
+        storage=storage,
+        batch_builder=BatchBuilder(storage=storage, max_text_segments=1, max_screenshots=1),
+        lm_client=client,
+        max_parallel_jobs=1,
+        process_backlog_only_while_locked=True,
+        app_data_dir=str(tmp_path),
+    )
+    caplog.set_level(logging.INFO)
+    try:
+        summarizer.handle_session_lock_state_change(False)
+        assert summarizer.dispatch_pending_jobs(reason="manual", force_flush=True) == 1
+        assert client.started.wait(timeout=2.0)
+        client.release.set()
+        assert summarizer.wait_for_idle(timeout_seconds=5.0)
+        assert any("event=summary_admission_decision" in r.message and "manual_bypass_lock_gate=True" in r.message and "request_reason=manual" in r.message for r in caplog.records)
     finally:
         summarizer.stop()
         storage.close()
