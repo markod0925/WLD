@@ -203,6 +203,8 @@ def _filter_evidence_for_task(task_label: str, summary: SummaryRecord, entities:
     raw = summary.summary_json if isinstance(summary.summary_json, dict) else {}
     summary_text = f"{summary.summary_text} {json.dumps(raw)}".lower()
     values = {"files": [], "windows": [], "apps": [], "concepts": [], "activity_types": []}
+    has_varie_file = any((e.entity_type == "file" and (e.entity_value or "").strip().lower().endswith("varie.xlsx")) for e in entities)
+    has_optimhistory_file = any((e.entity_type == "file" and (e.entity_value or "").strip().lower().startswith("optimhistory_")) for e in entities)
     matlab_context = any(k in summary_text for k in ["matlab", "smash", "optimization", "pareto", "genetic algorithm", "bode"])
     wld_context = any(k in summary_text for k in ["worklog diary", "wld", "summary", "search", "merge", "coalescing", "task cluster", "chatgpt"])
     email_context = any(k in summary_text for k in EMAIL_CONCEPT_PATTERNS + ["outlook"])
@@ -219,16 +221,16 @@ def _filter_evidence_for_task(task_label: str, summary: SummaryRecord, entities:
                     values["files"].append(val)
                 elif low.startswith("optimhistory_") and low.endswith(".txt"):
                     values["files"].append(val)
-                elif low.endswith("varie.xlsx") and matlab_context:
+                elif low.endswith("varie.xlsx"):
                     values["files"].append(val)
             elif e.entity_type == "window" and any(k in low for k in MATLAB_WINDOW_PATTERNS):
                 values["windows"].append(val)
             elif e.entity_type in {"app", "program"}:
                 if low in {"matlab.exe", "matlabwindow.exe"}:
                     values["apps"].append(low)
-                elif low == "notepad.exe" and any(f.lower().startswith("optimhistory_") for f in values["files"]):
+                elif low == "notepad.exe" and (has_optimhistory_file or any(f.lower().startswith("optimhistory_") for f in values["files"])):
                     values["apps"].append(low)
-                elif low == "excel.exe" and any(f.lower().endswith("varie.xlsx") for f in values["files"]):
+                elif low == "excel.exe" and (has_varie_file or any(f.lower().endswith("varie.xlsx") for f in values["files"])):
                     values["apps"].append(low)
                 elif low == "explorer.exe" and values["files"]:
                     values["apps"].append(low)

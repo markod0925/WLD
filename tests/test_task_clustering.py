@@ -100,3 +100,42 @@ def test_task_evidence_filtering_prevents_cross_task_bleed(tmp_path: Path) -> No
             assert "LFM_SMASH_plotAll.m" not in email.get("files", [])
     finally:
         storage.close()
+
+
+def test_varie_file_is_preserved_for_matlab_without_text_context(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "w.db"))
+    day = date(2026, 5, 5)
+    try:
+        st = _ts(day, 9, 1)
+        en = st + 30
+        job = storage.create_summary_job(start_ts=st, end_ts=en, status="succeeded")
+        sid = storage.insert_summary(
+            job_id=job,
+            start_ts=st,
+            end_ts=en,
+            summary_text="review",
+            summary_json={"source_context": {"process_name": "excel.exe", "window_title": "Varie.xlsx"}},
+        )
+        storage.update_event_summary_structured_fields(
+            sid,
+            structured_payload_json={"schema_version": 1},
+            primary_task_label="MATLAB genetic optimization",
+            primary_activity_type="file_review",
+            is_blocked=False,
+            is_low_value=False,
+            noise_reason=None,
+            confidence=0.8,
+        )
+        ents = [
+            type("E", (), dict(entity_type="app", entity_value="excel.exe", entity_normalized="excel.exe", source_kind="window_title", source_ref="Varie.xlsx", evidence_kind="observed", confidence=0.8, attributes={})),
+            type("E", (), dict(entity_type="file", entity_value="Varie.xlsx", entity_normalized="varie.xlsx", source_kind="window_title", source_ref="Varie.xlsx", evidence_kind="observed", confidence=0.8, attributes={})),
+        ]
+        storage.replace_activity_entities_for_summary(day=day, start_ts=st, end_ts=en, summary_id=sid, entities=ents)  # type: ignore[arg-type]
+        cluster_tasks_for_day(day, storage=storage)
+        clusters = {c["title"]: c for c in storage.list_task_clusters_for_day(day)}
+        matlab = clusters["MATLAB genetic optimization"]["evidence_json"]
+        assert "Varie.xlsx" in matlab.get("files", [])
+        assert "excel.exe" in matlab.get("apps", [])
+        assert "file_review" in matlab.get("activity_types", [])
+    finally:
+        storage.close()
