@@ -18,6 +18,29 @@ class TaskClusteringResult:
     link_count: int
 
 
+MATLAB_WINDOW_PATTERNS = [
+    "genetic algorithm",
+    "bode and eigenvalues",
+    "start: bode and eigenvalues",
+    "optimal solution selection",
+    "final results plots",
+    "boxplot of pareto solutions",
+    "boxplot of (actual) pareto solutions",
+    "desired optimal solution",
+    "matlab r2024b",
+]
+MATLAB_CONCEPT_PATTERNS = [
+    "genetic algorithm", "pareto", "pareto front", "pareto solutions", "fitness", "average spread",
+    "average distance", "objective", "bode", "eigenvalues", "body roll rate", "body pitch rate",
+    "optimal solution", "numerical optimization", "smash",
+]
+WLD_CONCEPT_PATTERNS = [
+    "worklog diary", "wld", "summary", "summaries", "daily summary", "search", "search defect", "merge",
+    "coalescing", "task representation", "task cluster", "audit export", "activity_entities",
+]
+EMAIL_CONCEPT_PATTERNS = ["email", "mail", "inbox", "posta in arrivo", "correspondence", "message", "reply", "sent mail"]
+
+
 def cluster_tasks_for_day(day: date, *, storage: SQLiteStorage) -> TaskClusteringResult:
     summaries = storage.list_summaries_for_day(day, limit=2000)
     entities = storage.list_activity_entities_for_day(day)
@@ -54,13 +77,13 @@ def build_task_clusters_for_day(
         if primary_score < 0.5:
             continue
         _ensure_cluster(clusters, primary_task)
-        _add_to_cluster(clusters[primary_task], s, by_summary.get(int(s.id or 0), []), primary=True, score=primary_score)
+        _add_to_cluster(clusters[primary_task], s, by_summary.get(int(s.id or 0), []), task_label=primary_task, primary=True, score=primary_score)
         links.append({"summary_id": int(s.id or 0), "cluster_normalized_title": _norm(primary_task), "relation_type": "primary", "weight": 0.75, "confidence": min(1.0, primary_score)})
 
         if len(ranked) > 1 and ranked[1][1] >= 0.35:
             sec_task, sec_score = ranked[1]
             _ensure_cluster(clusters, sec_task)
-            _add_to_cluster(clusters[sec_task], s, by_summary.get(int(s.id or 0), []), primary=False, score=sec_score)
+            _add_to_cluster(clusters[sec_task], s, by_summary.get(int(s.id or 0), []), task_label=sec_task, primary=False, score=sec_score)
             links.append({"summary_id": int(s.id or 0), "cluster_normalized_title": _norm(sec_task), "relation_type": "secondary", "weight": 0.25, "confidence": min(1.0, sec_score)})
 
     output_clusters: list[dict[str, object]] = []
@@ -139,7 +162,7 @@ def _ensure_cluster(clusters: dict[str, dict[str, Any]], title: str) -> None:
     }
 
 
-def _add_to_cluster(cluster: dict[str, Any], s: SummaryRecord, entities: list[ActivityEntityRecord], *, primary: bool, score: float) -> None:
+def _add_to_cluster(cluster: dict[str, Any], s: SummaryRecord, entities: list[ActivityEntityRecord], *, task_label: str, primary: bool, score: float) -> None:
     sid = int(s.id or 0)
     cluster["score_total"] += score
     cluster["count"] += 1
@@ -148,18 +171,14 @@ def _add_to_cluster(cluster: dict[str, Any], s: SummaryRecord, entities: list[Ac
     ev = cluster["evidence"]
     ev["linked_summary_ids"].append(sid)
     (ev["primary_summary_ids"] if primary else ev["secondary_summary_ids"]).append(sid)
-    for e in entities:
-        if e.entity_type == "file":
-            ev["files"].append(e.entity_value)
-        elif e.entity_type == "window":
-            ev["windows"].append(e.entity_value)
-        elif e.entity_type in {"app", "program"}:
-            ev["apps"].append(e.entity_value.lower())
-        elif e.entity_type == "concept":
-            ev["concepts"].append(e.entity_value)
+    filtered = _filter_evidence_for_task(task_label, s, entities)
+    ev["files"].extend(filtered["files"])
+    ev["windows"].extend(filtered["windows"])
+    ev["apps"].extend(filtered["apps"])
+    ev["concepts"].extend(filtered["concepts"])
     raw = s.summary_json if isinstance(s.summary_json, dict) else {}
     activity = getattr(s, "primary_activity_type", None) or raw.get("primary_activity_type")
-    if isinstance(activity, str) and activity:
+    if isinstance(activity, str) and activity and activity in filtered["activity_types"]:
         ev["activity_types"].append(activity)
     ev["time_range"]["start_ts"] = cluster["start_ts"]
     ev["time_range"]["end_ts"] = cluster["end_ts"]
@@ -178,3 +197,78 @@ def _cluster_text(title: str, evidence: dict[str, Any]) -> str:
 
 def _norm(v: str) -> str:
     return v.strip().lower()
+
+
+def _filter_evidence_for_task(task_label: str, summary: SummaryRecord, entities: list[ActivityEntityRecord]) -> dict[str, list[str]]:
+    raw = summary.summary_json if isinstance(summary.summary_json, dict) else {}
+    summary_text = f"{summary.summary_text} {json.dumps(raw)}".lower()
+    values = {"files": [], "windows": [], "apps": [], "concepts": [], "activity_types": []}
+    matlab_context = any(k in summary_text for k in ["matlab", "smash", "optimization", "pareto", "genetic algorithm", "bode"])
+    wld_context = any(k in summary_text for k in ["worklog diary", "wld", "summary", "search", "merge", "coalescing", "task cluster", "chatgpt"])
+    email_context = any(k in summary_text for k in EMAIL_CONCEPT_PATTERNS + ["outlook"])
+    for e in entities:
+        val = (e.entity_value or "").strip()
+        low = val.lower()
+        if not val:
+            continue
+        if task_label == TASK_MATLAB:
+            if e.entity_type == "file":
+                if low.endswith(".m") and matlab_context:
+                    values["files"].append(val)
+                elif ("lfm_smash" in low and low.endswith(".m")) or low.startswith("main.m"):
+                    values["files"].append(val)
+                elif low.startswith("optimhistory_") and low.endswith(".txt"):
+                    values["files"].append(val)
+                elif low.endswith("varie.xlsx") and matlab_context:
+                    values["files"].append(val)
+            elif e.entity_type == "window" and any(k in low for k in MATLAB_WINDOW_PATTERNS):
+                values["windows"].append(val)
+            elif e.entity_type in {"app", "program"}:
+                if low in {"matlab.exe", "matlabwindow.exe"}:
+                    values["apps"].append(low)
+                elif low == "notepad.exe" and any(f.lower().startswith("optimhistory_") for f in values["files"]):
+                    values["apps"].append(low)
+                elif low == "excel.exe" and any(f.lower().endswith("varie.xlsx") for f in values["files"]):
+                    values["apps"].append(low)
+                elif low == "explorer.exe" and values["files"]:
+                    values["apps"].append(low)
+            elif e.entity_type == "concept" and any(k in low for k in MATLAB_CONCEPT_PATTERNS):
+                values["concepts"].append(val)
+        elif task_label == TASK_WLD:
+            if e.entity_type == "file" and ("wld" in low or "worklog" in low):
+                values["files"].append(val)
+            elif e.entity_type == "window":
+                if any(k in low for k in ["worklog diary", "worklog diary summaries", "wld"]):
+                    values["windows"].append(val)
+                elif "chatgpt" in low and wld_context:
+                    values["windows"].append(val)
+                elif "lm studio" in low and wld_context:
+                    values["windows"].append(val)
+            elif e.entity_type in {"app", "program"}:
+                if low == "wld.exe":
+                    values["apps"].append(low)
+                elif low in {"chrome.exe", "msedge.exe"} and wld_context:
+                    values["apps"].append(low)
+                elif low == "lm studio.exe" and wld_context:
+                    values["apps"].append(low)
+            elif e.entity_type == "concept" and any(k in low for k in WLD_CONCEPT_PATTERNS):
+                values["concepts"].append(val)
+        elif task_label == TASK_EMAIL:
+            if e.entity_type == "window" and any(k in low for k in ["outlook", "posta in arrivo", "inbox", "email"]):
+                values["windows"].append(val)
+            elif e.entity_type in {"app", "program"} and low == "outlook.exe":
+                values["apps"].append(low)
+            elif e.entity_type == "concept" and any(k in low for k in EMAIL_CONCEPT_PATTERNS):
+                values["concepts"].append(val)
+    activity = str(getattr(summary, "primary_activity_type", None) or raw.get("primary_activity_type") or "")
+    if task_label == TASK_MATLAB and activity in {"optimization_run", "result_analysis", "plot_review", "code_editing", "file_review"}:
+        if activity != "file_review" or values["files"]:
+            values["activity_types"].append(activity)
+    elif task_label == TASK_WLD and activity in {"software_debugging", "analysis", "file_review"}:
+        if activity != "file_review" or values["files"]:
+            values["activity_types"].append(activity)
+    elif task_label == TASK_EMAIL and activity == "communication":
+        values["activity_types"].append(activity)
+    for k in values:
+        values[k] = sorted(set(values[k]))
+    return values

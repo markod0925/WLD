@@ -71,5 +71,16 @@ def test_task_centric_end_to_end(tmp_path: Path) -> None:
         assert len(lrows) >= 3
         assert drows[0]['generated_from_task_clusters'] is True
         assert isinstance(drows[0]['structured_payload_json'], dict)
+        by_title = {row["title"]: row for row in trows}
+        email_ev = by_title["Email handling"]["evidence_json"]
+        wld_ev = by_title["WLD summary/search review"]["evidence_json"]
+        matlab_ev = by_title["MATLAB genetic optimization"]["evidence_json"]
+        assert "LFM_SMASH_plotAll.m" not in email_ev.get("files", [])
+        assert "OptimHistory_110kts.txt" not in email_ev.get("files", [])
+        assert "Genetic Algorithm" not in email_ev.get("concepts", [])
+        assert "LFM_SMASH_plotAll.m" not in wld_ev.get("files", [])
+        assert "OptimHistory_110kts.txt" not in wld_ev.get("files", [])
+        assert "Final Results Plots" not in wld_ev.get("windows", [])
+        assert "outlook.exe" not in matlab_ev.get("apps", [])
     finally:
         storage.close()
