@@ -10,6 +10,7 @@ from typing import Any
 from ..core.internal_artifacts import is_internal_artifact_path
 
 from ..core.models import DailySummaryRecord, SummaryRecord
+from ..core.summary_search import SummarySearchResult, SummarySearchType
 from .semantic_diagnostics_view_model import CoalescedTraceabilityInfo
 
 
@@ -207,6 +208,10 @@ def _format_event_summary_text(payload: dict[str, Any]) -> str:
 
 def _format_daily_recap_text(daily_summary: DailySummaryRecord) -> str:
     payload = daily_summary.recap_json if isinstance(daily_summary.recap_json, dict) else {}
+    if bool(payload.get("generated_from_task_clusters")):
+        structured = _format_task_centric_daily_recap(payload)
+        if structured:
+            return structured
     sections: list[tuple[str, list[str]]] = [
         (
             "Workstreams / task candidates",
@@ -241,6 +246,109 @@ def _format_daily_recap_text(daily_summary: DailySummaryRecord) -> str:
     if rendered:
         return "\n".join(item for item in rendered).strip()
     return daily_summary.recap_text
+
+
+def build_search_summary_card_view(item: SummarySearchResult) -> SummaryCardView:
+    label = _search_type_label(item.summary_type)
+    day_text = item.day.isoformat()
+    if item.summary_type == SummarySearchType.TASK:
+        timestamp_label = f"Task cluster day: {day_text}"
+    elif item.summary_type == SummarySearchType.DAY:
+        timestamp_label = f"Daily recap day: {day_text}"
+    else:
+        timestamp_label = f"Event day: {day_text}"
+    summary_text = f"[{label}] {item.text}".strip()
+    if item.summary_type == SummarySearchType.TASK:
+        title, snippet = _split_task_text(item.text)
+        evidence = _task_evidence_lines(item.evidence_json if isinstance(item.evidence_json, dict) else {})
+        rendered = [f"[{label}] {title}"]
+        if snippet:
+            rendered.append("")
+            rendered.append(snippet)
+        if evidence:
+            rendered.append("")
+            rendered.append("Evidence:")
+            rendered.extend(f"- {line}" for line in evidence)
+        summary_text = "\n".join(rendered).strip()
+    return SummaryCardView(
+        summary_id=item.source_id,
+        time_range=timestamp_label,
+        summary_text=summary_text,
+        major_activities=[f"Type: {label}"],
+        blocked_notes=[],
+        uncertainty_notes=[],
+        is_coalesced=False,
+        coalesced_member_count=0,
+    )
+
+
+def _search_type_label(value: SummarySearchType) -> str:
+    if value == SummarySearchType.TASK:
+        return "Task"
+    if value == SummarySearchType.DAY:
+        return "Daily"
+    return "Event"
+
+
+def _format_task_centric_daily_recap(payload: dict[str, Any]) -> str:
+    try:
+        main_tasks = payload.get("main_tasks") if isinstance(payload.get("main_tasks"), list) else []
+        minor_tasks = payload.get("minor_tasks") if isinstance(payload.get("minor_tasks"), list) else []
+        ignored = payload.get("ignored_noise") if isinstance(payload.get("ignored_noise"), dict) else {}
+        rendered: list[str] = []
+        if main_tasks:
+            rendered.append("Main tasks")
+            rendered.append("")
+            for idx, task in enumerate(main_tasks[:6], start=1):
+                if not isinstance(task, dict):
+                    continue
+                title = str(task.get("title") or "Untitled task").strip()
+                rendered.append(f"{idx}. {title}")
+                outcome = _flatten_string_values(task.get("outcomes") or task.get("outcome"))
+                if outcome:
+                    rendered.append("   Outcome:")
+                    rendered.extend(f"   - {item}" for item in outcome[:3])
+                evidence_lines = _task_evidence_lines(task.get("evidence") if isinstance(task.get("evidence"), dict) else {})
+                if evidence_lines:
+                    rendered.append("   Evidence:")
+                    rendered.extend(f"   - {item}" for item in evidence_lines)
+                rendered.append("")
+        if minor_tasks:
+            rendered.append("Minor tasks")
+            rendered.append("")
+            for task in minor_tasks[:8]:
+                if isinstance(task, dict):
+                    title = str(task.get("title") or task.get("task") or "Untitled").strip()
+                    snippet = str(task.get("summary_text") or task.get("summary") or "").strip()
+                    rendered.append(f"- {title}: {snippet}".rstrip(": ").strip())
+                else:
+                    rendered.append(f"- {str(task).strip()}")
+            rendered.append("")
+        if ignored:
+            rendered.append("Ignored / low-value evidence")
+            rendered.append("")
+            for key, value in sorted(ignored.items()):
+                rendered.append(f"- {key}: {value}")
+            rendered.append("")
+        return "\n".join(line for line in rendered if line is not None).strip()
+    except Exception:
+        return ""
+
+
+def _task_evidence_lines(evidence: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for label, key in [("Files", "files"), ("Windows", "windows"), ("Concepts", "concepts")]:
+        values = [v for v in _flatten_string_values(evidence.get(key)) if "blocked" not in v.lower()][:3]
+        if values:
+            lines.append(f"{label}: {', '.join(values)}")
+    return lines
+
+
+def _split_task_text(value: str) -> tuple[str, str]:
+    if ":" not in value:
+        return value.strip(), ""
+    title, snippet = value.split(":", 1)
+    return title.strip(), snippet.strip()
 
 
 def _normalize_legacy_summary_text(text: str) -> str:

@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import date
 
 from worklog_diary.core.models import DailySummaryRecord, SummaryRecord
+from worklog_diary.core.summary_search import SummarySearchResult, SummarySearchType
 from worklog_diary.ui.summaries_view_model import (
     build_calendar_highlight_days,
     build_day_summary_view,
+    build_search_summary_card_view,
     build_summary_card_view,
 )
 from worklog_diary.ui.semantic_diagnostics_view_model import CoalescedTraceabilityInfo
@@ -202,3 +204,65 @@ def test_legacy_one_line_summary_is_normalized_and_internal_path_removed() -> No
     assert "matlab.exe" in card.summary_text
     assert "lm studio.exe" in card.summary_text
     assert "Content within LM Studio was blocked" in card.summary_text
+
+
+def test_search_result_kind_display_distinguishes_task_daily_event() -> None:
+    task = build_search_summary_card_view(
+        SummarySearchResult(summary_type=SummarySearchType.TASK, source_id=1, timestamp=1.0, day=date(2026, 5, 16), text="MATLAB genetic optimization: tuned GA")
+    )
+    daily = build_search_summary_card_view(
+        SummarySearchResult(summary_type=SummarySearchType.DAY, source_id=2, timestamp=1.0, day=date(2026, 5, 16), text="2026-05-16")
+    )
+    event = build_search_summary_card_view(
+        SummarySearchResult(summary_type=SummarySearchType.EVENT, source_id=3, timestamp=1.0, day=date(2026, 5, 16), text="matlab.exe / Genetic Algorithm")
+    )
+    assert task.summary_text.startswith("[Task]")
+    assert daily.summary_text.startswith("[Daily]")
+    assert event.summary_text.startswith("[Event]")
+
+
+def test_search_task_result_evidence_preview_is_compact() -> None:
+    card = build_search_summary_card_view(
+        SummarySearchResult(
+            summary_type=SummarySearchType.TASK,
+            source_id=10,
+            timestamp=1.0,
+            day=date(2026, 5, 16),
+            text="MATLAB genetic optimization: tuned Pareto and fitness evaluation",
+            evidence_json={"files": ["OptimHistory_110kts.txt"], "windows": ["Genetic Algorithm"], "concepts": ["Pareto", "Fitness"], "noise": ["blocked_content raw"]},
+        )
+    )
+    assert "Evidence:" in card.summary_text
+    assert "Files: OptimHistory_110kts.txt" in card.summary_text
+    assert "Windows: Genetic Algorithm" in card.summary_text
+    assert "Concepts: Pareto, Fitness" in card.summary_text
+    assert '"files"' not in card.summary_text
+    assert "blocked_content raw" not in card.summary_text
+
+
+def test_task_centric_daily_payload_rendering_and_fallback() -> None:
+    target_day = date(2026, 5, 16)
+    daily = DailySummaryRecord(
+        id=1,
+        day=target_day,
+        recap_text="fallback recap",
+        recap_json={
+            "generated_from_task_clusters": True,
+            "main_tasks": [{"title": "MATLAB genetic optimization", "outcomes": ["Improved convergence"], "evidence": {"files": ["a.m"], "windows": ["MATLAB"], "concepts": ["Pareto"]}}],
+            "minor_tasks": [{"title": "Email handling", "summary_text": "processed inbox"}],
+            "ignored_noise": {"blocked_content": 3, "searchhost": 1},
+        },
+        source_batch_count=2,
+        created_ts=140.0,
+    )
+    view = build_day_summary_view(day=target_day, summaries=[], daily_summary=daily)
+    assert "Main tasks" in str(view.daily_recap_text)
+    assert "Minor tasks" in str(view.daily_recap_text)
+    assert "Ignored / low-value evidence" in str(view.daily_recap_text)
+    assert "Files: a.m" in str(view.daily_recap_text)
+
+    invalid = DailySummaryRecord(
+        id=2, day=target_day, recap_text="legacy text", recap_json={"generated_from_task_clusters": True, "main_tasks": "bad"}, source_batch_count=1, created_ts=1.0
+    )
+    invalid_view = build_day_summary_view(day=target_day, summaries=[], daily_summary=invalid)
+    assert invalid_view.daily_recap_text == "legacy text"

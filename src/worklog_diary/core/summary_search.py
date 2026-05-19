@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
@@ -32,6 +33,7 @@ class SummarySearchResult:
     timestamp: float
     day: date
     text: str
+    evidence_json: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -113,6 +115,7 @@ class SummarySearchService:
                     timestamp=timestamp,
                     day=day,
                     text=f"{item.get('title', '')}: {item.get('summary_text', '')}".strip(),
+                    evidence_json=_coerce_evidence_json(item.get("evidence_json")),
                 )
             )
 
@@ -130,6 +133,19 @@ def _rank(item: SummarySearchResult, query: str) -> int:
     if item.summary_type == SummarySearchType.TASK and (".m" in q or ".txt" in q or ".xlsx" in q):
         base += 3
     return base
+
+
+def _coerce_evidence_json(value: object) -> dict[str, object] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _resolve_bounds(scope: SummarySearchScope, anchor_day: date) -> _SearchBounds:
