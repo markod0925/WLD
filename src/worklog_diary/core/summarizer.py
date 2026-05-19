@@ -1013,6 +1013,16 @@ class Summarizer:
                 break
             defer_reason = self._daily_recap_defer_reason(reason=reason)
             if defer_reason is not None:
+                pending = self.storage.get_pending_counts()
+                runtime = self.get_runtime_status()
+                self.logger.info(
+                    "event=daily_summary_backfill_blocked_by_event_backlog reason=%s target_day=%s pending_event_jobs=%s pending_intervals=%s pending_screenshots=%s strict_defer=true manual_daily_bypass=true",
+                    defer_reason,
+                    day.isoformat(),
+                    runtime.get("pending_summary_jobs"),
+                    pending.get("intervals", 0),
+                    pending.get("screenshots", 0),
+                )
                 self.logger.info(
                     "event=daily_summary_backfill_deferred reason=%s target_day=%s",
                     defer_reason,

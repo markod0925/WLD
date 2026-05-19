@@ -426,9 +426,12 @@ class FlushCoordinator:
         self._last_result: dict[str, int | str] | None = None
 
     def cancel_flush_drain(self) -> bool:
+        runtime = self.services.summarizer.get_runtime_status()
         if not self.is_drain_active:
+            self.logger.info("event=summary_flush_stop_requested source=FlushCoordinator.cancel_flush_drain active_drain_reason=none queued=%s running=%s result=no_active_drain", runtime.get("queued_jobs"), runtime.get("running_jobs"))
             return False
         self._drain_cancel_event.set()
+        self.logger.info("event=summary_flush_stop_requested source=FlushCoordinator.cancel_flush_drain active_drain_reason=%s queued=%s running=%s result=stopped", self.snapshot().get("drain_reason"), runtime.get("queued_jobs"), runtime.get("running_jobs"))
         self.logger.info("event=summary_drain_cancel_requested")
         return True
 
@@ -571,6 +574,23 @@ class FlushCoordinator:
                                 "event=summary_drain_stopped reason=scheduled_admission_paused queued=%s "
                                 "running=%s pending_summary_jobs=%s"
                             ),
+                            runtime["queued_jobs"],
+                            runtime["running_jobs"],
+                            runtime["pending_summary_jobs"],
+                        )
+                        stop_reason = "paused"
+                        break
+
+                    if (
+                        reason in {"lock", "scheduled"}
+                        and bool(runtime["summary_admission_paused"])
+                        and int(runtime["queued_jobs"]) > 0
+                        and int(runtime["running_jobs"]) == 0
+                        and int(dispatched) == 0
+                    ):
+                        self.logger.info(
+                            "event=summary_drain_stopped reason=admission_paused_after_unlock request_reason=%s queued=%s running=%s pending_summary_jobs=%s last_admission_reason=pc_unlocked",
+                            reason,
                             runtime["queued_jobs"],
                             runtime["running_jobs"],
                             runtime["pending_summary_jobs"],

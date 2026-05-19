@@ -94,6 +94,7 @@ class TrayController:
         threading.Thread(target=task, name="ManualFlushDrain", daemon=True).start()
 
     def _stop_flush_drain(self) -> None:
+        self.services.logger.info("event=summary_flush_stop_requested source=TrayController._stop_flush_drain")
         stopped = self.services.cancel_flush_drain()
         message = "Drain cancel requested." if stopped else "No active drain to cancel."
         self.tray.showMessage("WorkLog Diary", message)
@@ -152,6 +153,7 @@ class TrayController:
         else:
             status = self.services.get_status()
         snapshot = build_tray_status_snapshot(status)
+        self.services.logger.info("event=flush_overlay_state_changed active=%s reason=%s drain_reason=%s queued=%s running=%s stalled=%s", snapshot.flush_drain_active, snapshot.flush_state, status.get("flush_drain_reason"), status.get("summary_jobs", {}).get("queued"), status.get("summary_jobs", {}).get("running"), snapshot.flush_state == "running" and bool(status.get("summary_admission_paused")))
         self.tray.setIcon(self._select_tray_icon(status))
         self.tray.setToolTip(format_tray_tooltip(snapshot))
         self._rebuild_menu(snapshot)
