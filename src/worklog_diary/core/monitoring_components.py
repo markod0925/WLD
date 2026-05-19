@@ -426,9 +426,12 @@ class FlushCoordinator:
         self._last_result: dict[str, int | str] | None = None
 
     def cancel_flush_drain(self) -> bool:
+        runtime = self.services.summarizer.get_runtime_status()
         if not self.is_drain_active:
+            self.logger.info("event=summary_flush_stop_requested source=FlushCoordinator.cancel_flush_drain active_drain_reason=none queued=%s running=%s result=no_active_drain", runtime.get("queued_jobs"), runtime.get("running_jobs"))
             return False
         self._drain_cancel_event.set()
+        self.logger.info("event=summary_flush_stop_requested source=FlushCoordinator.cancel_flush_drain active_drain_reason=%s queued=%s running=%s result=stopped", self.snapshot().get("drain_reason"), runtime.get("queued_jobs"), runtime.get("running_jobs"))
         self.logger.info("event=summary_drain_cancel_requested")
         return True
 
@@ -574,6 +577,27 @@ class FlushCoordinator:
                             runtime["queued_jobs"],
                             runtime["running_jobs"],
                             runtime["pending_summary_jobs"],
+                        )
+                        stop_reason = "paused"
+                        break
+
+                    if (
+                        reason in {"lock", "scheduled"}
+                        and bool(runtime["summary_admission_paused"])
+                        and int(runtime["queued_jobs"]) > 0
+                        and int(runtime["running_jobs"]) == 0
+                        and int(dispatched) == 0
+                    ):
+                        cancelled = self.services.summarizer.cancel_queued_jobs(
+                            reason="cancelled_after_unlock_pause"
+                        )
+                        self.logger.info(
+                            "event=summary_drain_stopped reason=admission_paused_after_unlock request_reason=%s queued=%s running=%s pending_summary_jobs=%s cancelled=%s last_admission_reason=pc_unlocked",
+                            reason,
+                            runtime["queued_jobs"],
+                            runtime["running_jobs"],
+                            runtime["pending_summary_jobs"],
+                            cancelled,
                         )
                         stop_reason = "paused"
                         break

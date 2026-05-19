@@ -490,3 +490,81 @@ def test_late_scheduler_callback_after_shutdown_is_ignored(tmp_path: Path, caplo
         assert any("event=summary_flush_skipped reason=shutdown_in_progress" in rec.message for rec in caplog.records)
     finally:
         pass
+
+def test_lock_drain_stops_when_unlocked_admission_is_paused(caplog) -> None:
+    class _FakeStorage:
+        def __init__(self):
+            self._calls = 0
+        def get_summary_job_status_counts(self):
+            return {"completed": 0, "failed": 0, "cancelled": 0}
+        def get_pending_counts(self):
+            self._calls += 1
+            return {"text_segments": 0, "screenshots": 0, "intervals": 0, "key_events": 0, "processed_key_events": 0}
+        def count_unprocessed_key_events(self):
+            return 0
+
+    class _FakeState:
+        def set_flush_times(self, **_kwargs): ...
+
+    class _FakeLifecycle:
+        def set_draining(self): ...
+        def set_idle(self): ...
+
+    class _FakeKeyboard:
+        def flush_pending_events(self, reason: str): ...
+
+    class _FakeTextService:
+        def process_once(self, force_flush: bool = False): ...
+
+    class _FakeNotifier:
+        def resolve(self, _key: str): ...
+        def notify(self, *_args, **_kwargs): ...
+
+    class _PausedSummarizer:
+        def __init__(self):
+            self.cancel_calls: list[str] = []
+        def clear_unrecoverable_error(self): ...
+        def cancel_queued_jobs(self, reason: str = "") -> int:
+            self.cancel_calls.append(reason)
+            return 1
+        def dispatch_pending_jobs(self, reason: str = "") -> int: return 0
+        def wait_for_idle(self, timeout_seconds: float): ...
+        def wait_for_activity(self, timeout_seconds: float): ...
+        def get_runtime_status(self):
+            return {
+                "queued_jobs": 1,
+                "running_jobs": 0,
+                "pending_summary_jobs": 1,
+                "has_unrecoverable_error": False,
+                "summary_admission_paused": True,
+                "max_concurrent_summary_llm_requests": 1,
+                "llm_queue_running_jobs": 0,
+                "llm_queue_max_concurrent_jobs": 1,
+                "llm_queue_accepting_jobs": True,
+                "llm_queue_closing": False,
+                "llm_queue_closed": False,
+                "daily_recap_running_jobs": 0,
+                "lmstudio_state": "ok",
+                "lmstudio_last_error_message": None,
+                "session_locked": False,
+                "process_backlog_only_while_locked": True,
+                "llm_queue_queued_jobs": 0,
+            }
+
+    caplog.set_level(logging.INFO)
+    summarizer = _PausedSummarizer()
+    services = type("S", (), {
+        "shutdown_event": type("E", (), {"is_set": lambda self: False})(),
+        "summarizer": summarizer,
+        "storage": _FakeStorage(),
+        "state": _FakeState(),
+        "keyboard_capture": _FakeKeyboard(),
+        "text_service": _FakeTextService(),
+        "error_notifier": _FakeNotifier(),
+    })()
+    coordinator = FlushCoordinator(services, _FakeLifecycle(), 60, logging.getLogger(__name__))
+    result = coordinator.flush_now("lock")
+    assert result is not None
+    assert result.stop_reason == "paused"
+    assert summarizer.cancel_calls == ["cancelled_after_unlock_pause"]
+    assert any("event=summary_drain_stopped reason=admission_paused_after_unlock" in rec.message for rec in caplog.records)
