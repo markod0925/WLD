@@ -261,6 +261,34 @@ def test_task_results_rank_above_event_results(tmp_path: Path) -> None:
         storage.close()
 
 
+def test_task_cluster_evidence_json_string_is_parsed(tmp_path: Path) -> None:
+    storage = SQLiteStorage(str(tmp_path / "worklog.db"))
+    service = SummarySearchService(storage)
+    try:
+        day = date(2026, 5, 2)
+        storage.replace_task_clusters_for_day(
+            day=day,
+            clusters=[{
+                "title": "MATLAB genetic optimization",
+                "normalized_title": "matlab genetic optimization",
+                "task_type": "engineering_analysis",
+                "status": "active",
+                "start_ts": _ts(day, 9),
+                "end_ts": _ts(day, 11),
+                "summary_text": "Includes OptimHistory_110kts.txt and Pareto analysis",
+                "evidence_json": {"files": ["OptimHistory_110kts.txt"], "concepts": ["Pareto"]},
+                "confidence": 0.9,
+            }],
+            links=[],
+        )
+        results = service.search(SummarySearchParams(query="OptimHistory_110kts.txt", scope=SummarySearchScope.ALL, anchor_day=day))
+        task_results = [r for r in results if r.summary_type.value == "task"]
+        assert task_results
+        assert task_results[0].evidence_json == {"files": ["OptimHistory_110kts.txt"], "concepts": ["Pareto"]}
+    finally:
+        storage.close()
+
+
 def test_coerce_search_scope_handles_enum_and_supported_strings() -> None:
     assert coerce_search_scope(SummarySearchScope.DAY) == SummarySearchScope.DAY
     assert coerce_search_scope("day") == SummarySearchScope.DAY
