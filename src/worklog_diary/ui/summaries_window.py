@@ -36,7 +36,6 @@ from worklog_diary.core.summary_search import (
     SummarySearchResult,
     SummarySearchScope,
     SummarySearchService,
-    SummarySearchType,
     coerce_search_scope,
 )
 
@@ -47,6 +46,7 @@ from .summaries_view_model import (
     SummaryCardView,
     build_calendar_highlight_days,
     build_day_summary_view,
+    build_search_summary_card_view,
     format_summary_html,
 )
 from .semantic_diagnostics_view_model import build_semantic_diagnostics_rows
@@ -427,21 +427,7 @@ class SummariesWindow(QWidget):
             f'{len(results)} match(es) for "{query}" in {scope_label.lower()} scope anchored at {anchor_day.isoformat()}.'
         )
         for item in results:
-            summary_type = "event" if item.summary_type == SummarySearchType.EVENT else "day"
-            if summary_type == "event":
-                timestamp_label = f"Event day: {item.day.isoformat()}"
-            else:
-                timestamp_label = f"Daily recap day: {item.day.isoformat()}"
-            card = SummaryCardView(
-                summary_id=item.source_id,
-                time_range=timestamp_label,
-                summary_text=item.text,
-                major_activities=[f"Type: {summary_type}"],
-                blocked_notes=[],
-                uncertainty_notes=[],
-                is_coalesced=False,
-                coalesced_member_count=0,
-            )
+            card = build_search_summary_card_view(item)
             self.summary_cards_layout.addWidget(_build_summary_card_widget(card, highlight_query=query))
         self.summary_cards_layout.addStretch(1)
 
@@ -666,4 +652,3 @@ def _qdate_to_day(value: QDate) -> date:
 
 def _day_to_qdate(value: date) -> QDate:
     return QDate(value.year, value.month, value.day)
-

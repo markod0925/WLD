@@ -32,6 +32,7 @@ class SummarySearchResult:
     timestamp: float
     day: date
     text: str
+    evidence_json: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -113,6 +114,7 @@ class SummarySearchService:
                     timestamp=timestamp,
                     day=day,
                     text=f"{item.get('title', '')}: {item.get('summary_text', '')}".strip(),
+                    evidence_json=item.get("evidence_json") if isinstance(item.get("evidence_json"), dict) else None,
                 )
             )
 
