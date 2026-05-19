@@ -588,12 +588,16 @@ class FlushCoordinator:
                         and int(runtime["running_jobs"]) == 0
                         and int(dispatched) == 0
                     ):
+                        cancelled = self.services.summarizer.cancel_queued_jobs(
+                            reason="cancelled_after_unlock_pause"
+                        )
                         self.logger.info(
-                            "event=summary_drain_stopped reason=admission_paused_after_unlock request_reason=%s queued=%s running=%s pending_summary_jobs=%s last_admission_reason=pc_unlocked",
+                            "event=summary_drain_stopped reason=admission_paused_after_unlock request_reason=%s queued=%s running=%s pending_summary_jobs=%s cancelled=%s last_admission_reason=pc_unlocked",
                             reason,
                             runtime["queued_jobs"],
                             runtime["running_jobs"],
                             runtime["pending_summary_jobs"],
+                            cancelled,
                         )
                         stop_reason = "paused"
                         break

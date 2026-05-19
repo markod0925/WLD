@@ -521,8 +521,12 @@ def test_lock_drain_stops_when_unlocked_admission_is_paused(caplog) -> None:
         def notify(self, *_args, **_kwargs): ...
 
     class _PausedSummarizer:
+        def __init__(self):
+            self.cancel_calls: list[str] = []
         def clear_unrecoverable_error(self): ...
-        def cancel_queued_jobs(self, reason: str = "") -> int: return 0
+        def cancel_queued_jobs(self, reason: str = "") -> int:
+            self.cancel_calls.append(reason)
+            return 1
         def dispatch_pending_jobs(self, reason: str = "") -> int: return 0
         def wait_for_idle(self, timeout_seconds: float): ...
         def wait_for_activity(self, timeout_seconds: float): ...
@@ -548,9 +552,10 @@ def test_lock_drain_stops_when_unlocked_admission_is_paused(caplog) -> None:
             }
 
     caplog.set_level(logging.INFO)
+    summarizer = _PausedSummarizer()
     services = type("S", (), {
         "shutdown_event": type("E", (), {"is_set": lambda self: False})(),
-        "summarizer": _PausedSummarizer(),
+        "summarizer": summarizer,
         "storage": _FakeStorage(),
         "state": _FakeState(),
         "keyboard_capture": _FakeKeyboard(),
@@ -561,4 +566,5 @@ def test_lock_drain_stops_when_unlocked_admission_is_paused(caplog) -> None:
     result = coordinator.flush_now("lock")
     assert result is not None
     assert result.stop_reason == "paused"
+    assert summarizer.cancel_calls == ["cancelled_after_unlock_pause"]
     assert any("event=summary_drain_stopped reason=admission_paused_after_unlock" in rec.message for rec in caplog.records)
